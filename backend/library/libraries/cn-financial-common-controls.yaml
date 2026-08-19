@@ -1,0 +1,264 @@
+urn: urn:yydspanda:risk:library:cn-financial-common-controls
+locale: zh
+ref_id: cn-financial-common-controls
+name: 中国金融业基础合规控制库
+description: >-
+  面向银行、保险和金融科技机构的原创基础控制综合。该库不复制监管原文，
+  不替代法律适用性判断，也不构成合规或审计结论。
+copyright: Copyright 2026 yydspanda contributors
+version: 1
+publication_date: 2026-08-19
+provider: yydspanda
+packager: yydspanda
+objects:
+  reference_controls:
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:gov-01
+      ref_id: CNF-GOV-01
+      name: 董事会与高级管理层合规问责
+      category: policy
+      csf_function: govern
+      description: >-
+        建立经批准的治理章程、职责边界、风险偏好、重大事项升级和定期汇报机制，
+        明确董事会、专门委员会、高级管理层及控制职能的责任。
+      annotation: |-
+        内容类型：原创综合控制，不是监管原文。
+        初始状态：需要机构结合牌照、法人和治理结构确认适用性与责任人。
+      typical_evidence:
+        - 董事会或专门委员会批准的治理章程
+        - 会议纪要、决议和管理层定期报告
+        - 职责矩阵、授权矩阵和风险偏好声明
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:reg-01
+      ref_id: CNF-REG-01
+      name: 外部监管义务与适用性管理
+      category: process
+      csf_function: govern
+      description: >-
+        维护权威监管来源、不可覆写的版本记录、条款、原子义务、适用事实和人工确认记录，
+        区分草案、未来生效、现行、被替代和废止状态。
+      annotation: |-
+        内容类型：原创综合控制，不是监管原文。
+        未知适用事实必须产生“需要复核”，不得静默判定为不适用。
+      typical_evidence:
+        - 官方来源清单、抓取记录、许可范围内的原文快照和哈希
+        - 条款级义务台账及适用性决定
+        - 监管变更评估、复核和批准记录
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:pol-01
+      ref_id: CNF-POL-01
+      name: 外规到内规变更闭环
+      category: process
+      csf_function: govern
+      description: >-
+        将经确认的外部义务映射到内规条款、控制、责任人、证据和培训，
+        对缺失、部分覆盖、冲突及更严格内规形成可追溯的整改和审批闭环。
+      annotation: 内容类型：原创综合控制，不是监管原文。
+      typical_evidence:
+        - 外规义务到内规条款和控制的映射矩阵
+        - 内规版本、差异、会签、批准和发布记录
+        - 培训、宣导、实施检查及未闭环事项清单
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:rsk-01
+      ref_id: CNF-RSK-01
+      name: 统一风险评估与例外管理
+      category: process
+      csf_function: identify
+      description: >-
+        使用经批准的确定性评分规则识别、评估、处置和监测合规、操作、科技、
+        模型及第三方风险；例外必须具备理由、补偿控制、期限和独立批准。
+      annotation: |-
+        内容类型：原创综合控制，不是监管原文。
+        风险公式、等级和阈值由代码或决策表计算，不由大模型决定。
+      typical_evidence:
+        - 风险方法、参数、决策表和版本记录
+        - 风险台账、处置计划和监测指标
+        - 例外申请、补偿控制、审批和到期复核
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:aud-01
+      ref_id: CNF-AUD-01
+      name: 独立审计、证据、发现与整改
+      category: process
+      csf_function: govern
+      description: >-
+        建立风险导向审计计划、独立测试、版本化证据、发现确认、责任分配、
+        整改验证和独立关闭机制，保持三道防线职责分离。
+      annotation: 内容类型：原创综合控制，不是监管原文。
+      typical_evidence:
+        - 审计宇宙、年度计划、范围和抽样依据
+        - 带哈希、版本、所有者和有效期的证据
+        - 审计底稿、发现、整改、复测和关闭批准
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:dat-01
+      ref_id: CNF-DAT-01
+      name: 数据资产、分类分级与血缘管理
+      category: process
+      csf_function: identify
+      description: >-
+        维护数据资产、处理目的、来源、系统、责任人、分类分级、敏感性、
+        流向、接收方、质量、留存和销毁信息，并对重要变更持续更新。
+      annotation: 内容类型：原创综合控制，不是监管原文。
+      typical_evidence:
+        - 数据资产目录、分类分级目录和责任人
+        - 系统及字段级血缘、数据流图和接口清单
+        - 分类复核、质量监测和变更记录
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:prv-01
+      ref_id: CNF-PRV-01
+      name: 个人信息处理活动与权利管理
+      category: process
+      csf_function: govern
+      description: >-
+        记录个人信息处理目的、范围、合法基础、告知同意、敏感信息、受托和共同处理、
+        对外提供、个人权利、影响评估、泄露响应及定期合规审计。
+      annotation: 内容类型：原创综合控制，不是监管原文。
+      typical_evidence:
+        - 个人信息处理活动记录和数据流图
+        - 隐私通知、同意矩阵及敏感信息处理依据
+        - 个人权利请求、影响评估、审计和事件记录
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:xbr-01
+      ref_id: CNF-XBR-01
+      name: 数据跨境传输评估与持续监测
+      category: process
+      csf_function: govern
+      description: >-
+        识别直接和间接数据出境，维护接收方、数据类别、规模和累计人数事实，
+        通过确定性规则形成机制建议，并由隐私、法律和安全人员批准及持续监测。
+      annotation: |-
+        内容类型：原创综合控制，不是监管原文。
+        机制豁免不等于免除告知、单独同意、影响评估和接收方约束等基础义务。
+      typical_evidence:
+        - 跨境数据流和境外接收方清单
+        - 人数、敏感数据、重要数据和关基事实快照
+        - 安全评估、标准合同、认证或豁免分析及批准
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:sec-01
+      ref_id: CNF-SEC-01
+      name: 等级保护与网络安全基线
+      category: technical
+      csf_function: protect
+      description: >-
+        对信息系统和网络资产开展安全定级候选分析、备案及测评协同、基线配置、
+        漏洞管理、供应链安全、日志、监测和持续整改。
+      annotation: |-
+        内容类型：原创综合控制，不是监管原文。
+        系统自评不能替代法定定级、备案、测评或关键信息基础设施认定。
+      typical_evidence:
+        - 资产及系统清单、定级材料、备案和测评报告
+        - 配置基线、漏洞扫描、渗透测试和整改记录
+        - 安全监测、日志留存和供应链/SBOM记录
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:inc-01
+      ref_id: CNF-INC-01
+      name: 事件响应与多监管报告
+      category: procedure
+      csf_function: respond
+      description: >-
+        建立统一事件识别、分级、遏制、取证、恢复和复盘流程，对同一事件按法人、
+        牌照和监管领域计算并行报告义务、最严时限和审批路径。
+      annotation: 内容类型：原创综合控制，不是监管原文。
+      typical_evidence:
+        - 事件响应和危机管理预案
+        - 事件时间线、分级依据、取证和处置记录
+        - 监管报告路由、时限计算、报送审批及回执
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:tpr-01
+      ref_id: CNF-TPR-01
+      name: 外包、供应商与云服务全生命周期治理
+      category: process
+      csf_function: govern
+      description: >-
+        对第三方和科技外包实施尽调、风险分级、数据与安全条款、分包和集中度管理、
+        持续监测、事件协作、审计权、业务连续性及可验证退出安排。
+      annotation: 内容类型：原创综合控制，不是监管原文。
+      typical_evidence:
+        - 供应商和外包服务台账、分级及尽调报告
+        - 合同、安全与数据条款、SLA和审计权
+        - 持续监测、集中度分析、退出和迁移演练
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:bcm-01
+      ref_id: CNF-BCM-01
+      name: 业务连续性、灾备与运营韧性
+      category: process
+      csf_function: recover
+      description: >-
+        基于业务影响和场景分析确定关键服务、依赖、恢复目标、替代安排和沟通机制，
+        定期开展灾备切换、业务连续性及第三方联合演练并整改。
+      annotation: 内容类型：原创综合控制，不是监管原文。
+      typical_evidence:
+        - 业务影响分析、关键服务和依赖关系
+        - 连续性、灾备、危机沟通及恢复计划
+        - 演练方案、结果、问题整改和管理层复核
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:mod-01
+      ref_id: CNF-MOD-01
+      name: 模型、算法与Agent全生命周期治理
+      category: process
+      csf_function: govern
+      description: >-
+        维护模型、算法、数据、Prompt、工具、提供商和使用场景台账，实施风险分级、
+        上线审批、授权和质量验证、偏差与安全测试、人工复核、监测、退出和应急接管。
+      annotation: |-
+        内容类型：原创综合控制，不是监管原文。
+        高风险模型或Agent不得审批自己、绕过权限或对客户重大权益作出无人终局决定。
+      typical_evidence:
+        - 模型及Agent台账、模型卡、数据和工具来源记录
+        - 风险分级、上线审批、偏差/鲁棒性/安全/解释性测试
+        - 运行监测、漂移、事件、人工接管、退出和回滚记录
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:cst-01
+      ref_id: CNF-CST-01
+      name: 科技成本、预算、采购与费用异常控制
+      category: process
+      csf_function: govern
+      description: >-
+        建立预算、采购、合同、费用、云资源和模型调用的全成本视图，监测超支、重复发票、
+        拆单采购、闲置资源和异常费率，并保持授权、职责分离和会计证据。
+      annotation: |-
+        内容类型：原创综合控制，不是监管原文。
+        成本优化不得绕过安全、隐私、消费者保护、会计或法定审批控制。
+      typical_evidence:
+        - 预算、采购申请、比价、合同和审批记录
+        - 发票、付款、费用和资产对账结果
+        - 云及模型成本分摊、异常检测和优化跟踪
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:acc-01
+      ref_id: CNF-ACC-01
+      name: 身份、最小权限与职责分离
+      category: technical
+      csf_function: protect
+      description: >-
+        对人员、服务和Agent身份实施唯一标识、最小权限、短期凭据、强认证、
+        特权访问管理、职责冲突检查、定期复核及及时撤权。
+      annotation: 内容类型：原创综合控制，不是监管原文。
+      typical_evidence:
+        - 身份源、角色权限和职责冲突规则
+        - 访问申请、批准、特权会话和短期凭据记录
+        - 定期访问复核、离调转撤权和异常访问调查
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:ret-01
+      ref_id: CNF-RET-01
+      name: 记录留存、销毁与法律保全
+      category: procedure
+      csf_function: govern
+      description: >-
+        按数据、记录、证据、交易、模型、审计和监管要求维护可执行的留存规则，
+        实施到期销毁、暂停销毁、法律保全、完整性校验和销毁证明。
+      annotation: 内容类型：原创综合控制，不是监管原文。
+      typical_evidence:
+        - 记录分类和留存期限表
+        - 法律保全、到期复核和暂停销毁记录
+        - 销毁批准、执行日志和完整性/销毁证明
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:aml-01
+      ref_id: CNF-AML-01
+      name: 客户尽调、受益所有人与可疑交易治理
+      category: process
+      csf_function: identify
+      description: >-
+        基于风险开展客户身份识别、受益所有人识别、持续尽调、名单与交易监测、
+        人工分析、升级、报告、记录保存和质量保障。
+      annotation: |-
+        内容类型：原创综合控制，不是监管原文。
+        智能手段可提供线索，但可疑交易的最终识别和报送必须按适用规则由具名人员完成。
+      typical_evidence:
+        - 客户及受益所有人尽调档案和风险评级
+        - 名单筛查、交易监测、预警处置和人工分析记录
+        - 报告、回执、保密控制、质量检查和留存记录
+    - urn: urn:yydspanda:risk:reference_control:cn-financial-common-controls:cus-01
+      ref_id: CNF-CUS-01
+      name: 产品治理、适当性与客户权益保护
+      category: process
+      csf_function: govern
+      description: >-
+        对产品设计、目标客户、风险分级、适当性、营销、费用与综合融资成本披露、
+        销售过程、投诉和客户重大权益决定实施全生命周期控制与人工监督。
+      annotation: 内容类型：原创综合控制，不是监管原文。
+      typical_evidence:
+        - 产品准入、目标市场、风险评级和审批材料
+        - 客户评估、匹配、销售录音录像及披露记录
+        - 费用计算、营销审查、投诉和客户权益复核记录

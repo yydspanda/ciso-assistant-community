@@ -1,0 +1,286 @@
+urn: urn:yydspanda:risk:library:cn-financial-baseline
+locale: zh
+ref_id: cn-financial-baseline
+name: 中国金融业合规基础能力基线
+description: >-
+  面向银行、保险和金融科技机构的高层能力评估基线，依赖中国金融业基础合规控制库。
+  本基线是原创控制综合和实施起点，不复制法规原文，不替代逐法人、逐牌照、逐业务的法律适用性分析。
+copyright: Copyright 2026 yydspanda contributors
+version: 1
+publication_date: 2026-08-19
+provider: yydspanda
+packager: yydspanda
+dependencies:
+  - urn:yydspanda:risk:library:cn-financial-common-controls
+objects:
+  frameworks:
+    - urn: urn:yydspanda:risk:framework:cn-financial-baseline
+      ref_id: CNF-BASELINE
+      name: 中国金融业合规基础能力基线
+      description: >-
+        用于确认组织是否建立可审计的治理、监管义务、金融业务、数据隐私、安全、
+        AI、审计和成本控制能力。每项结果均需结合官方来源和机构事实复核。
+      implementation_groups_definition:
+        - ref_id: COMMON
+          name: 通用
+          description: 适用于纳入本基线范围的所有法人或组织单元，仍需逐项适用性确认。
+          default_selected: true
+        - ref_id: BANK
+          name: 银行
+          description: 银行业务和银行牌照相关范围。
+        - ref_id: INSURANCE
+          name: 保险
+          description: 保险业务和保险牌照相关范围。
+        - ref_id: FINTECH
+          name: 金融科技
+          description: >-
+            金融科技、支付、技术服务和数字化业务相关范围；须按持牌、受托和实际业务角色选择，
+            不表示所有纯技术服务商均适用每项金融业务要求。
+      requirement_nodes:
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:gov
+          ref_id: GOV
+          name: 治理、合规与风险
+          assessable: false
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:gov.01
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:gov
+          ref_id: GOV.01
+          name: 建立董事会与高级管理层合规问责机制
+          description: >-
+            明确治理机构、控制职能和业务管理层责任，形成风险偏好、重大事项升级、
+            资源保障和定期监督机制。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 治理章程；授权和职责矩阵；风险偏好；会议纪要；管理报告。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:gov-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:gov.02
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:gov
+          ref_id: GOV.02
+          name: 使用确定性方法管理风险和例外
+          description: >-
+            风险计算、等级、阈值、路由和例外到期由经批准的规则执行，例外具有补偿控制、
+            独立批准和持续监测。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 风险方法和决策表；风险台账；例外、补偿控制、批准和到期复核。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:rsk-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:reg
+          ref_id: REG
+          name: 外规、内规与监管变更
+          assessable: false
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:reg.01
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:reg
+          ref_id: REG.01
+          name: 维护权威、版本化且可追溯的监管义务台账
+          description: >-
+            保存官方来源、原文版本、条款锚点、义务、状态、有效时间、适用事实、
+            责任人和复核记录；未知事实进入人工复核。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 官方来源清单；许可范围内的原文快照和哈希；条款义务台账；适用性决定。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:reg-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:reg.02
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:reg
+          ref_id: REG.02
+          name: 将监管变化映射并闭环到内规、控制与证据
+          description: >-
+            对外规与内规进行条款级映射，保留完整版本和引用，对缺口、冲突、
+            部分覆盖及更严格内规执行会签、整改、发布和培训。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 条款映射；差距分析；内规会签和版本；整改、培训及验证记录。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:pol-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:fin
+          ref_id: FIN
+          name: 银行、保险与金融科技业务
+          assessable: false
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:fin.01
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:fin
+          ref_id: FIN.01
+          name: 在适用情况下实施基于风险的客户尽调和可疑交易治理
+          description: >-
+            对客户、受益所有人、名单和交易风险实施持续识别、监测、人工分析、
+            报告、质量保障和记录保存。
+          assessable: true
+          implementation_groups: [BANK, INSURANCE, FINTECH]
+          typical_evidence: 尽调档案；风险评级；筛查和交易预警；人工分析；报送和质量记录。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:aml-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:fin.02
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:fin
+          ref_id: FIN.02
+          name: 在适用情况下对产品、适当性、营销、费用和客户权益实施全生命周期控制
+          description: >-
+            产品设计、目标客户、风险分级、销售匹配、营销话术、费用披露、投诉和重大客户权益
+            决定具有经批准的标准、留痕和人工监督。
+          assessable: true
+          implementation_groups: [BANK, INSURANCE, FINTECH]
+          typical_evidence: 产品准入和评级；客户匹配；销售留痕；营销审查；费用计算；投诉记录。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:cus-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:data
+          ref_id: DATA
+          name: 数据安全、隐私与跨境
+          assessable: false
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:data.01
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:data
+          ref_id: DATA.01
+          name: 建立数据资产、分类分级、责任和血缘事实底座
+          description: >-
+            数据处理目的、来源、分类、敏感性、系统、责任人、质量、流向、接收方、
+            留存和销毁均可发现、可更新和可审计。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 数据目录；分类分级；数据流和血缘；责任人；质量和变更记录。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:dat-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:data.02
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:data
+          ref_id: DATA.02
+          name: 管理个人信息处理活动、影响评估和个人权利
+          description: >-
+            处理目的、合法基础、告知同意、敏感信息、接收方、权利请求、影响评估、
+            泄露响应和合规审计具有明确流程和证据。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 处理活动记录；通知同意；影响评估；权利请求；审计及事件材料。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:prv-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:data.03
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:data
+          ref_id: DATA.03
+          name: 对所有数据出境路径执行事实核验、机制判断和人工批准
+          description: >-
+            识别数据库、云服务、模型Prompt、遥测和远程访问等出境路径，按数据类别、
+            人数、重要数据和关基事实使用确定性规则形成建议并持续监测。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 出境数据流；人数和分类事实；机制或豁免分析；影响评估；批准和监测。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:xbr-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:security
+          ref_id: SECURITY
+          name: 网络安全、外包与运营韧性
+          assessable: false
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:security.01
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:security
+          ref_id: SECURITY.01
+          name: 建立等级保护、安全基线、漏洞和供应链持续控制
+          description: >-
+            系统资产、候选定级、备案测评、配置、漏洞、日志、监测、软件供应链和整改状态
+            具有明确责任和持续证据。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 系统清单；定级备案测评；基线；漏洞和整改；日志；SBOM和供应链记录。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:sec-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:security.02
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:security
+          ref_id: SECURITY.02
+          name: 对事件进行统一响应并路由并行监管报告
+          description: >-
+            对网络、数据、隐私、操作和第三方事件统一分级、取证、遏制、恢复、复盘，
+            按法人和牌照计算多监管时限及审批。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 事件预案和演练；事件时间线；取证；时限规则；报送审批、报告和回执。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:inc-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:security.03
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:security
+          ref_id: SECURITY.03
+          name: 管理外包、供应商和云服务的集中度、持续风险与退出
+          description: >-
+            第三方尽调、合同、数据和安全条款、分包、SLA、集中度、事件、审计权、
+            连续性和退出安排得到持续管理。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 第三方台账；尽调；合同条款；SLA；集中度；监测；退出和迁移演练。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:tpr-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:security.04
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:security
+          ref_id: SECURITY.04
+          name: 对关键服务实施连续性、灾备和恢复验证
+          description: >-
+            基于业务影响识别关键服务和依赖，定义恢复目标、替代安排和危机沟通，
+            定期通过技术及业务演练验证。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 业务影响分析；关键服务依赖；连续性和灾备方案；演练和整改记录。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:bcm-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:ai
+          ref_id: AI
+          name: 模型、算法与Agent治理
+          assessable: false
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:ai.01
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:ai
+          ref_id: AI.01
+          name: 对模型、算法和Agent执行风险分级、上线审批、监测和人工接管
+          description: >-
+            维护完整台账，验证数据授权、质量、偏差、鲁棒性、安全、解释性和漂移，
+            对高风险及客户权益场景实施人工复核、退出、回滚和应急接管。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 台账和模型卡；风险分级；审批；测试；运行监测；人工复核；退出和接管记录。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:mod-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:assurance
+          ref_id: ASSURANCE
+          name: 审计、证据、身份与记录
+          assessable: false
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:assurance.01
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:assurance
+          ref_id: ASSURANCE.01
+          name: 通过独立审计、版本化证据和整改复测形成闭环
+          description: >-
+            审计范围、样本、测试、证据、发现、责任、期限、复测和关闭均可追溯，
+            且控制执行与独立审计身份分离。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 审计计划和底稿；证据版本和哈希；发现和整改；独立复测和关闭。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:aud-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:assurance.02
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:assurance
+          ref_id: ASSURANCE.02
+          name: 对人员、服务和Agent实施最小权限及职责分离
+          description: >-
+            唯一身份、短期凭据、强认证、特权访问、职责冲突、访问复核和撤权机制
+            覆盖人工用户及工作负载。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 角色和职责冲突规则；访问申请批准；特权会话；复核和撤权记录。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:acc-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:assurance.03
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:assurance
+          ref_id: ASSURANCE.03
+          name: 管理监管、交易、证据、模型和审计记录的留存与销毁
+          description: >-
+            建立可执行的留存规则、完整性保护、到期复核、法律保全、暂停销毁和销毁证明。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 留存期限表；法律保全；到期复核；销毁批准、日志和证明。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:ret-01
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:cost
+          ref_id: COST
+          name: 成本、预算与采购控制
+          assessable: false
+        - urn: urn:yydspanda:risk:req_node:cn-financial-baseline:cost.01
+          parent_urn: urn:yydspanda:risk:req_node:cn-financial-baseline:cost
+          ref_id: COST.01
+          name: 在不削弱法定控制的前提下管理科技和Agent全成本
+          description: >-
+            对预算、采购、合同、发票、付款、云资源和模型调用实施授权、分摊、异常分析和优化，
+            识别超支、重复、拆单和闲置且保留会计及审批证据。
+          assessable: true
+          implementation_groups: [COMMON, BANK, INSURANCE, FINTECH]
+          typical_evidence: 预算和采购审批；合同、发票与付款；成本分摊；异常检测和优化跟踪。
+          reference_controls:
+            - urn:yydspanda:risk:reference_control:cn-financial-common-controls:cst-01

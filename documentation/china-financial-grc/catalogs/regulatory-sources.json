@@ -1,0 +1,1335 @@
+{
+  "schema_version": "2.0.0-draft.1",
+  "contract_status": "draft",
+  "generated_at": "2026-08-20T00:00:00+08:00",
+  "description": "Draft seed metadata register assembled from official China financial GRC links. It is not exhaustive, stores no redistributed legal text, and has not received institution-specific legal or applicability review.",
+  "documents": [
+    {
+      "id": "CN-NPC-DSL-2021",
+      "title_zh": "中华人民共和国数据安全法",
+      "issuer": "全国人民代表大会常务委员会",
+      "authority_level": "law",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "cross_sector"
+      ],
+      "domains": [
+        "data_security",
+        "cross_border_data"
+      ]
+    },
+    {
+      "id": "CN-NPC-PIPL-2021",
+      "title_zh": "中华人民共和国个人信息保护法",
+      "issuer": "全国人民代表大会常务委员会",
+      "authority_level": "law",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "cross_sector"
+      ],
+      "domains": [
+        "privacy",
+        "cross_border_data",
+        "ai_model_governance"
+      ]
+    },
+    {
+      "id": "CN-NPC-CSL-2025-REV",
+      "title_zh": "中华人民共和国网络安全法",
+      "issuer": "全国人民代表大会常务委员会",
+      "authority_level": "law",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "cross_sector"
+      ],
+      "domains": [
+        "cybersecurity",
+        "mlps",
+        "critical_infrastructure"
+      ]
+    },
+    {
+      "id": "CN-SC-NETWORK-DATA-2024",
+      "title_zh": "网络数据安全管理条例",
+      "issuer": "国务院",
+      "authority_level": "administrative_regulation",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "cross_sector"
+      ],
+      "domains": [
+        "data_security",
+        "privacy",
+        "cross_border_data",
+        "cybersecurity"
+      ]
+    },
+    {
+      "id": "CN-CAC-CROSS-BORDER-2024",
+      "title_zh": "促进和规范数据跨境流动规定",
+      "issuer": "国家互联网信息办公室",
+      "authority_level": "departmental_rule",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "cross_sector"
+      ],
+      "domains": [
+        "privacy",
+        "data_security",
+        "cross_border_data"
+      ]
+    },
+    {
+      "id": "CN-CAC-PI-AUDIT-2025",
+      "title_zh": "个人信息保护合规审计管理办法",
+      "issuer": "国家互联网信息办公室",
+      "authority_level": "departmental_rule",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "cross_sector"
+      ],
+      "domains": [
+        "privacy",
+        "audit"
+      ]
+    },
+    {
+      "id": "CN-CAC-CYBER-INCIDENT-2025",
+      "title_zh": "国家网络安全事件报告管理办法",
+      "issuer": "国家互联网信息办公室",
+      "authority_level": "regulatory_normative_document",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "cross_sector"
+      ],
+      "domains": [
+        "cybersecurity",
+        "operational_resilience"
+      ]
+    },
+    {
+      "id": "CN-CAC-GENAI-2023",
+      "title_zh": "生成式人工智能服务管理暂行办法",
+      "issuer": "国家互联网信息办公室、国家发展和改革委员会、教育部、科学技术部、工业和信息化部、公安部、国家广播电视总局",
+      "authority_level": "departmental_rule",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "public_generative_ai_service"
+      ],
+      "domains": [
+        "ai_model_governance",
+        "data_security",
+        "privacy",
+        "cybersecurity"
+      ]
+    },
+    {
+      "id": "CN-CAC-AI-LABELLING-2025",
+      "title_zh": "人工智能生成合成内容标识办法",
+      "issuer": "国家互联网信息办公室、工业和信息化部、公安部、国家广播电视总局",
+      "authority_level": "regulatory_normative_document",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "ai_generated_synthetic_content_service"
+      ],
+      "domains": [
+        "ai_model_governance",
+        "consumer_protection"
+      ]
+    },
+    {
+      "id": "CN-NPC-AML-2024",
+      "title_zh": "中华人民共和国反洗钱法",
+      "issuer": "全国人民代表大会常务委员会",
+      "authority_level": "law",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "financial_institution",
+        "designated_nonfinancial_business"
+      ],
+      "domains": [
+        "aml_kyc",
+        "banking",
+        "insurance",
+        "fintech"
+      ]
+    },
+    {
+      "id": "CN-PBOC-CDD-2025",
+      "title_zh": "金融机构客户尽职调查和客户身份资料及交易记录保存管理办法",
+      "issuer": "中国人民银行、国家金融监督管理总局、中国证券监督管理委员会",
+      "authority_level": "departmental_rule",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "financial_institution"
+      ],
+      "domains": [
+        "aml_kyc",
+        "banking",
+        "insurance",
+        "fintech"
+      ]
+    },
+    {
+      "id": "CN-NFRA-COMPLIANCE-2024",
+      "title_zh": "金融机构合规管理办法",
+      "issuer": "国家金融监督管理总局",
+      "authority_level": "departmental_rule",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "nfra_regulated_financial_institution"
+      ],
+      "domains": [
+        "governance",
+        "compliance",
+        "banking",
+        "insurance",
+        "fintech"
+      ]
+    },
+    {
+      "id": "CN-NFRA-DATA-SECURITY-2024",
+      "title_zh": "银行保险机构数据安全管理办法",
+      "issuer": "国家金融监督管理总局",
+      "authority_level": "regulatory_normative_document",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "bank",
+        "insurance_institution"
+      ],
+      "domains": [
+        "banking",
+        "insurance",
+        "data_security",
+        "privacy",
+        "ai_model_governance"
+      ]
+    },
+    {
+      "id": "CN-PBOC-DATA-SECURITY-2025",
+      "title_zh": "中国人民银行业务领域数据安全管理办法",
+      "issuer": "中国人民银行",
+      "authority_level": "departmental_rule",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "pboc_business_domain"
+      ],
+      "domains": [
+        "fintech",
+        "data_security",
+        "privacy",
+        "cross_border_data"
+      ]
+    },
+    {
+      "id": "CN-PBOC-CYBER-INCIDENT-2025",
+      "title_zh": "中国人民银行业务领域网络安全事件报告管理办法",
+      "issuer": "中国人民银行",
+      "authority_level": "departmental_rule",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "pboc_business_domain"
+      ],
+      "domains": [
+        "fintech",
+        "cybersecurity",
+        "operational_resilience"
+      ]
+    },
+    {
+      "id": "CN-NFRA-OPERATIONAL-RISK-2023",
+      "title_zh": "银行保险机构操作风险管理办法",
+      "issuer": "国家金融监督管理总局",
+      "authority_level": "departmental_rule",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "bank",
+        "insurance_institution"
+      ],
+      "domains": [
+        "banking",
+        "insurance",
+        "operational_resilience",
+        "governance"
+      ]
+    },
+    {
+      "id": "CN-NFRA-IT-OUTSOURCING-2021",
+      "title_zh": "银行保险机构信息科技外包风险监管办法",
+      "issuer": "中国银行保险监督管理委员会办公厅",
+      "authority_level": "regulatory_normative_document",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "bank",
+        "insurance_institution"
+      ],
+      "domains": [
+        "banking",
+        "insurance",
+        "outsourcing",
+        "operational_resilience",
+        "cybersecurity"
+      ]
+    },
+    {
+      "id": "CN-NFRA-CORP-GOVERNANCE-2021",
+      "title_zh": "银行保险机构公司治理准则",
+      "issuer": "中国银行保险监督管理委员会",
+      "authority_level": "regulatory_normative_document",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "bank",
+        "insurance_institution"
+      ],
+      "domains": [
+        "banking",
+        "insurance",
+        "governance",
+        "audit",
+        "internal_control"
+      ]
+    },
+    {
+      "id": "CN-NFRA-SUITABILITY-2025",
+      "title_zh": "金融机构产品适当性管理办法",
+      "issuer": "国家金融监督管理总局",
+      "authority_level": "departmental_rule",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "financial_product_provider",
+        "financial_product_distributor"
+      ],
+      "domains": [
+        "banking",
+        "insurance",
+        "fintech",
+        "consumer_protection"
+      ]
+    },
+    {
+      "id": "CN-NFRA-AI-SECURITY-2026",
+      "title_zh": "国家金融监督管理总局关于银行业保险业人工智能安全开发应用的指导意见",
+      "issuer": "国家金融监督管理总局",
+      "authority_level": "regulatory_normative_document",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "bank",
+        "insurance_institution"
+      ],
+      "domains": [
+        "banking",
+        "insurance",
+        "ai_model_governance",
+        "data_security",
+        "consumer_protection"
+      ]
+    },
+    {
+      "id": "CN-NFRA-LOAN-COST-DISCLOSURE-2026",
+      "title_zh": "个人贷款业务明示综合融资成本规定",
+      "issuer": "国家金融监督管理总局、中国人民银行",
+      "authority_level": "regulatory_normative_document",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "personal_lending"
+      ],
+      "domains": [
+        "banking",
+        "fintech",
+        "consumer_protection"
+      ]
+    },
+    {
+      "id": "CN-NFRA-ONLINE-MARKETING-2026",
+      "title_zh": "金融产品网络营销管理办法",
+      "issuer": "中国人民银行、工业和信息化部、国家市场监督管理总局、国家金融监督管理总局、中国证券监督管理委员会、国家知识产权局、国家互联网信息办公室、国家外汇管理局",
+      "authority_level": "regulatory_normative_document",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "online_financial_product_marketing"
+      ],
+      "domains": [
+        "banking",
+        "insurance",
+        "fintech",
+        "consumer_protection"
+      ]
+    },
+    {
+      "id": "CN-NPC-COMPANY-LAW-2023",
+      "title_zh": "中华人民共和国公司法",
+      "issuer": "全国人民代表大会常务委员会",
+      "authority_level": "law",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "company"
+      ],
+      "domains": [
+        "governance",
+        "internal_control",
+        "audit"
+      ]
+    },
+    {
+      "id": "CN-MOF-INTERNAL-CONTROL-2008",
+      "title_zh": "企业内部控制基本规范",
+      "issuer": "财政部、中国证券监督管理委员会、审计署、中国银行业监督管理委员会、中国保险监督管理委员会",
+      "authority_level": "regulatory_normative_document",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "listed_company",
+        "nonlisted_large_or_medium_enterprise_encouraged"
+      ],
+      "domains": [
+        "governance",
+        "internal_control",
+        "audit",
+        "cost_control"
+      ]
+    }
+  ],
+  "document_versions": [
+    {
+      "id": "CN-NPC-DSL-2021-v1",
+      "document_id": "CN-NPC-DSL-2021",
+      "version_label": "2021-06-10 official text",
+      "document_no": "中华人民共和国主席令第八十四号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2021-06-10",
+      "published_date": "2021-06-10",
+      "effective_date": "2021-09-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.npc.gov.cn/npc/c2/c30834/202106/t20210610_311888.html",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "Official NPC source.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2021-09-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-NPC-PIPL-2021-v1",
+      "document_id": "CN-NPC-PIPL-2021",
+      "version_label": "2021-08-20 official text",
+      "document_no": "中华人民共和国主席令第九十一号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2021-08-20",
+      "published_date": "2021-08-20",
+      "effective_date": "2021-11-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.npc.gov.cn/npc/c2/c30834/202108/t20210820_313088.html",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "Article 24 is a cross-sector baseline for automated decision-making.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2021-11-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-NPC-CSL-2025-REV-v1",
+      "document_id": "CN-NPC-CSL-2025-REV",
+      "version_label": "2025 amended text",
+      "document_no": null,
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2025-10-28",
+      "published_date": "2025-10-28",
+      "effective_date": "2026-01-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://flk.npc.gov.cn/detail?fileId=&id=021e7d7684474107b8f3febbb1c4f8b5&title=%E4%B8%AD%E5%8D%8E%E4%BA%BA%E6%B0%91%E5%85%B1%E5%92%8C%E5%9B%BD%E7%BD%91%E7%BB%9C%E5%AE%89%E5%85%A8%E6%B3%95&type=",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "Use the revised effective text and preserve supersession metadata when ingesting versions. The 2025 amendment was promulgated by the President Order No. 61. Model the amending instrument and prior text as separate related records before production use.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2026-01-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-SC-NETWORK-DATA-2024-v1",
+      "document_id": "CN-SC-NETWORK-DATA-2024",
+      "version_label": "2024-09-24 official text",
+      "document_no": "中华人民共和国国务院令第790号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2024-09-24",
+      "published_date": "2024-09-30",
+      "effective_date": "2025-01-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.cac.gov.cn/2024-09/30/c_1729384452307680.htm",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2025-01-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-CAC-CROSS-BORDER-2024-v1",
+      "document_id": "CN-CAC-CROSS-BORDER-2024",
+      "version_label": "2024-03-22 official text",
+      "document_no": "国家互联网信息办公室令第16号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "publication_clause",
+      "issued_date": "2024-03-22",
+      "published_date": "2024-03-22",
+      "effective_date": "2024-03-22",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.cac.gov.cn/2024-03/22/c_1712776611775634.htm",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "Mechanism exemptions do not remove underlying PIPL duties; applicability requires facts and human review.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2024-03-22",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-CAC-PI-AUDIT-2025-v1",
+      "document_id": "CN-CAC-PI-AUDIT-2025",
+      "version_label": "2025-02-12 official text",
+      "document_no": "国家互联网信息办公室令第18号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2025-02-12",
+      "published_date": "2025-02-14",
+      "effective_date": "2025-05-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.cac.gov.cn/2025-02/14/c_1741233507681519.htm",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2025-05-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-CAC-CYBER-INCIDENT-2025-v1",
+      "document_id": "CN-CAC-CYBER-INCIDENT-2025",
+      "version_label": "2025-09-11 official text",
+      "document_no": null,
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2025-09-11",
+      "published_date": "2025-09-15",
+      "effective_date": "2025-11-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.cac.gov.cn/2025-09/15/c_1759583017717009.htm",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "Financial institutions may have parallel sector reporting duties; route one incident to all applicable regimes.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2025-11-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-CAC-GENAI-2023-v1",
+      "document_id": "CN-CAC-GENAI-2023",
+      "version_label": "2023-07-10 official text",
+      "document_no": "国家互联网信息办公室等七部门令第15号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2023-07-10",
+      "published_date": "2023-07-13",
+      "effective_date": "2023-08-15",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.cac.gov.cn/2023-07/13/c_1690898327029107.htm",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "Direct scope is not identical to internal enterprise R&D/use; other data, privacy, cyber, and financial requirements may still apply.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2023-08-15",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-CAC-AI-LABELLING-2025-v1",
+      "document_id": "CN-CAC-AI-LABELLING-2025",
+      "version_label": "2025-03-07 official text",
+      "document_no": "国信办通字〔2025〕2号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2025-03-07",
+      "published_date": "2025-03-14",
+      "effective_date": "2025-09-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.cac.gov.cn/2025-03/14/c_1743654684782215.htm",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "Attachment to the notice on issuing the Measures for Labelling AI-Generated and Synthetic Content.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2025-09-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-NPC-AML-2024-v1",
+      "document_id": "CN-NPC-AML-2024",
+      "version_label": "2024 revised text",
+      "document_no": "中华人民共和国主席令第三十八号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2024-11-08",
+      "published_date": "2024-11-08",
+      "effective_date": "2025-01-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.npc.gov.cn/npc/c2/c30834/202411/t20241108_440887.html",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "Prior legal versions are omitted from this non-exhaustive seed; the empty supersedes list is not a no-predecessor assertion.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2025-01-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-PBOC-CDD-2025-v1",
+      "document_id": "CN-PBOC-CDD-2025",
+      "version_label": "2025-10-31 official text",
+      "document_no": "中国人民银行、国家金融监督管理总局、中国证券监督管理委员会令〔2025〕第11号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2025-10-31",
+      "published_date": null,
+      "effective_date": "2026-01-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.pbc.gov.cn/zhengwugongkai/attachDir/2025/12/2025122909264498909.pdf",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "The first official publication date was not strictly confirmed; the date embedded in the PDF path is not treated as publication evidence.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "partial",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2026-01-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-NFRA-COMPLIANCE-2024-v1",
+      "document_id": "CN-NFRA-COMPLIANCE-2024",
+      "version_label": "2024-12-25 official text",
+      "document_no": "国家金融监督管理总局令2024年第7号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2024-12-25",
+      "published_date": "2024-12-27",
+      "effective_date": "2025-03-01",
+      "transition_end": "2026-03-01",
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.nfra.gov.cn/cn/view/pages/ItemDetail.html?docId=1192220&generaltype=0&itemId=928",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "The transition period ended on 2026-03-01.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2025-03-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-NFRA-DATA-SECURITY-2024-v1",
+      "document_id": "CN-NFRA-DATA-SECURITY-2024",
+      "version_label": "2024-12-27 official text",
+      "document_no": "金规〔2024〕24号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "publication_clause",
+      "issued_date": "2024-12-27",
+      "published_date": "2024-12-27",
+      "effective_date": "2024-12-27",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.nfra.gov.cn/cn/view/pages/governmentDetail.html?docId=1192311&generaltype=1&itemId=861",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "The catalog title is the attachment title; the promulgating instrument is the NFRA notice issuing the measures.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2024-12-27",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-PBOC-DATA-SECURITY-2025-v1",
+      "document_id": "CN-PBOC-DATA-SECURITY-2025",
+      "version_label": "2025-05-01 official text",
+      "document_no": "中国人民银行令〔2025〕第3号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2025-05-01",
+      "published_date": null,
+      "effective_date": "2025-06-30",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.pbc.gov.cn/zhengwugongkai/attachDir/2025/11/2025111915275027791.pdf",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "A candidate first-publication date exists, but it was not strictly confirmed from an accessible original HTML source.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "partial",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2025-06-30",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-PBOC-CYBER-INCIDENT-2025-v1",
+      "document_id": "CN-PBOC-CYBER-INCIDENT-2025",
+      "version_label": "2025-05-23 official text",
+      "document_no": "中国人民银行令〔2025〕第4号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2025-05-23",
+      "published_date": "2025-05-30",
+      "effective_date": "2025-08-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://xining.pbc.gov.cn/tiaofasi/144941/144957/5729954/index.html",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "Use deterministic multi-regulator routing and deadline calculations.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2025-08-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-NFRA-OPERATIONAL-RISK-2023-v1",
+      "document_id": "CN-NFRA-OPERATIONAL-RISK-2023",
+      "version_label": "2023-12-27 official text",
+      "document_no": "国家金融监督管理总局令2023年第5号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2023-12-27",
+      "published_date": "2023-12-29",
+      "effective_date": "2024-07-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.nfra.gov.cn/cn/view/pages/ItemDetail.html?docId=1144382&generaltype=1&itemId=4214",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "Article 50 contains different one- and two-year transition periods for specified institution categories. The scalar transition_end is deliberately null to avoid presenting the outer date as universal; encode the exact category and deadline from the official provision as a reviewed rule before operational use.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2024-07-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-NFRA-IT-OUTSOURCING-2021-v1",
+      "document_id": "CN-NFRA-IT-OUTSOURCING-2021",
+      "version_label": "2021-12-30 official text",
+      "document_no": "银保监办发〔2021〕141号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "publication_clause",
+      "issued_date": "2021-12-30",
+      "published_date": "2021-12-31",
+      "effective_date": "2021-12-30",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.nfra.gov.cn/cn/view/pages/ItemDetail.html?docId=1029035&generaltype=0&itemId=928",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "The attachment states implementation from publication; preserve the original clause when ingesting the text.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2021-12-30",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-NFRA-CORP-GOVERNANCE-2021-v1",
+      "document_id": "CN-NFRA-CORP-GOVERNANCE-2021",
+      "version_label": "2021-06-02 official text",
+      "document_no": "银保监发〔2021〕14号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "publication_clause",
+      "issued_date": "2021-06-02",
+      "published_date": "2021-06-08",
+      "effective_date": "2021-06-02",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.nfra.gov.cn/cn/view/pages/ItemDetail.html?docId=989061&itemId=928",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "Track later company-law alignment instruments as explicit modification relationships.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2021-06-02",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-NFRA-SUITABILITY-2025-v1",
+      "document_id": "CN-NFRA-SUITABILITY-2025",
+      "version_label": "2025-07-11 official text",
+      "document_no": "国家金融监督管理总局令2025年第7号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2025-07-11",
+      "published_date": "2025-07-11",
+      "effective_date": "2026-02-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.nfra.gov.cn/cn/view/pages/ItemDetail.html?docId=1217183&generaltype=0&itemId=928",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2026-02-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-NFRA-AI-SECURITY-2026-v1",
+      "document_id": "CN-NFRA-AI-SECURITY-2026",
+      "version_label": "2026-06-18 official text",
+      "document_no": "金发〔2026〕8号",
+      "status": "active_no_explicit_commencement",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "no_explicit_commencement_clause",
+      "issued_date": "2026-06-18",
+      "published_date": "2026-06-18",
+      "effective_date": null,
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.nfra.gov.cn/cn/view/pages/governmentDetail.html?docId=1261784&generaltype=1&itemId=861",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "High-risk uses, human review, explainability, inventory, monitoring, logging, reporting, exit, and takeover require institution-specific implementation review. The official text contains no explicit commencement date; no effective date is inferred.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": null,
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-NFRA-LOAN-COST-DISCLOSURE-2026-v1",
+      "document_id": "CN-NFRA-LOAN-COST-DISCLOSURE-2026",
+      "version_label": "2026-03-03 official text",
+      "document_no": "金规〔2026〕2号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2026-03-03",
+      "published_date": "2026-03-15",
+      "effective_date": "2026-08-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.nfra.gov.cn/cn/view/pages/governmentDetail.html?docId=1251479&generaltype=1&itemId=861",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "The catalog title is the attachment title to the joint promulgating notice.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2026-08-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-NFRA-ONLINE-MARKETING-2026-v1",
+      "document_id": "CN-NFRA-ONLINE-MARKETING-2026",
+      "version_label": "2026-04-21 official text",
+      "document_no": "中国人民银行等八部门公告〔2026〕第9号",
+      "status": "published_future_effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2026-04-21",
+      "published_date": "2026-04-24",
+      "effective_date": "2026-09-30",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.nfra.gov.cn/cn/view/pages/governmentDetail.html?docId=1255778&generaltype=1&itemId=861",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "Future-effective at the baseline date; it may create preparation tasks but not a current breach finding. The catalog title is the attachment title to the joint announcement. Official-channel classifications are inconsistent, so the conservative regulatory-normative-document level remains subject to legal review.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "partial",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2026-09-30",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-NPC-COMPANY-LAW-2023-v1",
+      "document_id": "CN-NPC-COMPANY-LAW-2023",
+      "version_label": "2023 revised text",
+      "document_no": "中华人民共和国主席令第十五号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2023-12-29",
+      "published_date": "2023-12-29",
+      "effective_date": "2024-07-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.npc.gov.cn/npc/c2/c30834/202312/t20231229_433967.html",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "Prior legal versions are omitted from this non-exhaustive seed; the empty supersedes list is not a no-predecessor assertion.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2024-07-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-MOF-INTERNAL-CONTROL-2008-v1",
+      "document_id": "CN-MOF-INTERNAL-CONTROL-2008",
+      "version_label": "2008-05-22 official text",
+      "document_no": "财会〔2008〕7号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2008-05-22",
+      "published_date": "2008-07-04",
+      "effective_date": "2009-07-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://kjs.mof.gov.cn/zhengcefabu/200807/t20080704_55982.htm",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "Mandatory from 2009-07-01 for listed companies; other large and medium-sized non-listed enterprises were encouraged to implement it. Applicability must not be generalized to every enterprise.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2009-07-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:source-register-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    }
+  ],
+  "provisions": [],
+  "obligations": [],
+  "applicability_rules": [],
+  "applicability_decisions": [],
+  "control_mappings": [],
+  "decision_records": []
+}
