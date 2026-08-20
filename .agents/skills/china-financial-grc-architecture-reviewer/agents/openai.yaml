@@ -1,0 +1,6 @@
+interface:
+  display_name: "China Financial GRC Architecture Reviewer"
+  short_description: "Review regulated GRC architecture and authority boundaries"
+  default_prompt: "Use $china-financial-grc-architecture-reviewer to review this China financial GRC architecture change, contracts, authority boundaries, and verification."
+policy:
+  allow_implicit_invocation: true
