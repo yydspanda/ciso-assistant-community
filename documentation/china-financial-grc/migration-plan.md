@@ -42,7 +42,9 @@ Deliver:
 
 - target architecture and governance boundaries;
 - regulatory interchange JSON Schema;
-- official-source seed register;
+- 76-record common, banking, insurance, and fintech/data/AI official-source
+  metadata register;
+- a controlled registry of 56 applicability facts;
 - loadable high-level China financial control foundation;
 - artifact validator and documented licensing/source policy.
 
@@ -105,11 +107,12 @@ Exit criteria:
 - replay/duplicate/partial-failure tests pass;
 - high-risk and reserved actions remain human-only.
 
-### Phase 5 — continuous evidence and domain expansion
+### Phase 5 — continuous evidence and reviewed domain depth
 
 Integrate data catalog/privacy tooling, security evidence collectors, supplier
-systems, audit feeds, and cost systems. Extend from the pilot entity to banking,
-insurance, and fintech packs only after the core model proves stable.
+systems, audit feeds, and cost systems. Promote selected banking, insurance,
+and fintech source metadata to provision-indexed and human-reviewed obligations
+only after the core model proves stable.
 
 Exit criteria:
 

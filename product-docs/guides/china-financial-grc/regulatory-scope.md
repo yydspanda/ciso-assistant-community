@@ -4,11 +4,12 @@ description: Proposed authority, applicability, and domain boundaries for the Ch
 
 # Regulatory scope
 
-> **Proposed design:** The initial 24-record source baseline was link-checked as
-> of 2026-08-20 and is intentionally non-exhaustive. Its legal-review state is
-> `unreviewed`; unresolved publication dates remain explicit. Applicability
-> must be confirmed for each legal entity, licence, product, process, data
-> flow, system, and AI use case.
+> **Proposed design:** The 76-record common, banking, insurance, and
+> fintech/data/AI source packs were metadata-checked as of 2026-08-20 and are
+> intentionally non-exhaustive. Their legal-review state is `unreviewed`;
+> unresolved metadata remains explicit. Applicability must be confirmed for
+> each legal entity, licence, product, process, data flow, system, and AI use
+> case.
 
 ## Authority levels
 
@@ -55,12 +56,13 @@ The system must capture, not guess:
 - AI use, autonomy, explainability, customer/financial impact, and deployment;
 - outsourcing role, materiality, concentration, continuity, and exit.
 
-Missing facts return `needs_review`, never an implicit `not_applicable`.
+The current controlled registry defines 56 such facts. Missing facts return
+`needs_review`, never an implicit `not_applicable`.
 
-The initial seed does not yet model the specialised 2026 rules for public
-anthropomorphic interaction services. A later AI pack must capture sustained
-emotional-interaction facts and must not automatically classify an ordinary
-customer-service, knowledge-answering, or work assistant as such a service.
+The fintech/data/AI pack includes the specialised 2026 rules for public
+anthropomorphic interaction services. Applicability requires facts such as a
+simulated persona and sustained emotional interaction; an ordinary customer-
+service, knowledge-answering, or work assistant is not automatically in scope.
 
 ## Source policy
 

@@ -32,14 +32,22 @@ a governed system of record with bounded AI capabilities:
 - [Target architecture](architecture.md)
 - [Domain model](domain-model.md)
 - [Regulatory scope and source policy](regulatory-scope.md)
+- [Financial regulatory source packs](regulatory-source-packs.md)
 - [Agent governance](agent-governance.md)
 - [Migration and delivery plan](migration-plan.md)
 - [Open-source decisions](open-source-decisions.md)
 - [`schemas/regulatory-record.schema.json`](schemas/regulatory-record.schema.json):
   the proposed `2.0.0-draft.1` interchange contract for regulatory knowledge
-- [`catalogs/regulatory-sources.json`](catalogs/regulatory-sources.json):
-  a 24-record official-source seed register, link-checked as of 2026-08-20;
+- [`catalogs/regulatory-sources.json`](catalogs/regulatory-sources.json) and the
+  [domain source packs](regulatory-source-packs.md): 76 official-source
+  document records and 76 version records, metadata-checked as of 2026-08-20;
   legal review remains explicitly `unreviewed`
+- [`catalogs/applicability-facts.json`](catalogs/applicability-facts.json):
+  56 controlled fact definitions used to scope banking, insurance, payment,
+  data, cybersecurity, cloud, and AI rules without guessing missing facts
+- [`catalogs/regulatory-pack-index.json`](catalogs/regulatory-pack-index.json):
+  hashed pack inventory and discovery-profile composition for common, bank,
+  insurance, fintech, and payment views
 - [`examples/regulatory-record.example.json`](examples/regulatory-record.example.json):
   an end-to-end example from provision to control mapping
 
@@ -72,11 +80,14 @@ From the repository root, with the backend dependencies available:
 python tools/china_financial_grc/validate_artifacts.py
 ```
 
-The validator checks the JSON Schema, typed and temporal references, source
-catalog, example record, CISO Assistant library structure, implementation
-groups, URN uniqueness, parent relationships, and one-to-one starter-control
-coverage. Full application loading remains covered by the backend library tests
-and should be run before merging later implementation changes.
+The validator checks the regulatory, fact, and pack-index JSON Schemas; source-
+pack hashes; global typed-ID uniqueness; official-source hosts; source-check
+dates; controlled fact types and evidence; deterministic three-value
+applicability results; temporal and approval-chain invariants; the example
+record; CISO Assistant library structure; implementation groups; URN
+uniqueness; parent relationships; and one-to-one starter-control coverage.
+Full application loading remains covered by the backend library tests and
+should be run before merging later implementation changes.
 
 It does not fetch source URLs, establish legal status or applicability, verify
 dates against an authority, or turn illustrative hashes into legal evidence.

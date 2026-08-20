@@ -126,6 +126,7 @@
 * Solution blueprints
   * [China financial GRC](guides/china-financial-grc/README.md)
     * [Regulatory scope](guides/china-financial-grc/regulatory-scope.md)
+    * [Regulatory source packs](guides/china-financial-grc/regulatory-source-packs.md)
     * [Reference architecture](guides/china-financial-grc/reference-architecture.md)
     * [Domain model](guides/china-financial-grc/domain-model.md)
     * [Agent governance and boundaries](guides/china-financial-grc/agent-governance.md)

@@ -145,7 +145,7 @@
           "value": true
         },
         {
-          "fact": "decision.major_impact_on_individual_rights",
+          "fact": "technology.customer_rights_impact",
           "operator": "eq",
           "value": true
         }
@@ -196,7 +196,7 @@
           "observed_at": "2026-08-20T00:00:00+08:00"
         },
         {
-          "fact": "decision.major_impact_on_individual_rights",
+          "fact": "technology.customer_rights_impact",
           "known": false,
           "source_refs": [],
           "observed_at": null

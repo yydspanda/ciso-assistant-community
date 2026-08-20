@@ -28,7 +28,8 @@ applicability conclusion.
 | Folder-scoped IAM and validation flows | Upstream capability | Continue to enforce server-side IAM; UI filtering is not authorisation |
 | Embedded AI proposals | Upstream capability | Preserve the existing proposals-not-actions boundary |
 | China financial common controls and baseline | Added in this fork | High-level original control summaries; not legal text or a compliance opinion |
-| Regulatory JSON Schema and official-source seed register | Added in this fork | Explicitly draft contract; 24 link-checked metadata records remain legally unreviewed |
+| Regulatory JSON Schemas and official-source registers | Added in this fork | Explicitly draft contract; 76 metadata records across four packs remain legally unreviewed |
+| Controlled applicability-fact registry | Added in this fork | 56 fact definitions; unknown values route to review rather than non-applicability |
 | Temporal regulatory Django models and APIs | Proposed | Required before regulations become authoritative application records |
 | Reviewed regulatory-to-library projection | Proposed | Projects approved obligations into frameworks and requirements |
 | Deterministic applicability and action policy | Proposed | Unknown facts must route to review |
@@ -37,6 +38,7 @@ applicability conclusion.
 ## Blueprint pages
 
 - [Regulatory scope](regulatory-scope.md)
+- [Regulatory source packs](regulatory-source-packs.md)
 - [Reference architecture](reference-architecture.md)
 - [Domain model](domain-model.md)
 - [Agent governance and boundaries](agent-governance.md)

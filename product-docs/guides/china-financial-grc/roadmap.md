@@ -10,7 +10,8 @@ description: Incremental delivery roadmap and exit criteria for the China financ
 ## Phase 0 — foundation
 
 - architecture, threat boundaries, source policy, and agent prohibitions;
-- regulatory interchange Schema and official-source seed register;
+- regulatory interchange Schemas, four official-source packs, and controlled
+  applicability facts;
 - loadable China financial common controls and assessment baseline;
 - artifact and loader tests.
 
@@ -50,10 +51,11 @@ idempotency, execution, and rollback.
 Exit: no write bypass exists; replay, duplicate, partial-failure, and permission
 revocation tests pass; red actions remain human-only.
 
-## Phase 5 — continuous evidence and expansion
+## Phase 5 — continuous evidence and reviewed domain depth
 
-Integrate data, privacy, security, supplier, audit, and cost evidence. Expand
-from the pilot to additional banking, insurance, and fintech packs.
+Integrate data, privacy, security, supplier, audit, and cost evidence. Promote
+selected pack sources from metadata to indexed provisions and reviewed
+obligations for additional entities and use cases.
 
 Exit: connectors remain evidence providers, three-lines independence is
 preserved, evidence freshness/retention is known, and cost optimisation cannot

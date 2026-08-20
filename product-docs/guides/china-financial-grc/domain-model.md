@@ -32,6 +32,9 @@ RegulatoryDocument
   has a new record ID and an explicit predecessor.
 - `ApplicabilityDecision` stores facts, rule version, result, rationale,
   evidence, and accountable confirmation.
+- Applicability evaluation uses three-value logic: false can short-circuit AND,
+  true can short-circuit OR, and an unresolved outcome becomes `needs_review`.
+  Known facts must match the controlled type and carry evidence and time.
 - `ControlMapping` links a reviewed obligation to a reusable control with
   coverage, rationale, owner, reviewer, test, and evidence expectations.
 

@@ -109,6 +109,15 @@ Unknown facts referenced by the rule must never silently become
 `not_applicable`. A draft or machine proposal is not a legal applicability
 conclusion.
 
+Evaluation uses three-value logic. A missing or explicitly unknown fact is
+`unknown`; AND returns false when any input is false before propagating unknown,
+and OR returns true when any input is true before propagating unknown. When a
+rule contains both groups, every `all` condition and at least one `any`
+condition must hold. The computed states map only to `applicable`,
+`not_applicable`, and `needs_review`; a supplied result is rejected when it
+does not match recomputation. Known facts require registered types, evidence,
+and observation time.
+
 ### ControlMapping
 
 Reviewed relationship between an obligation and a reference control.

@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:yydspanda:risk:schema:cn-financial-regulatory-pack-index:1.0.0-draft.1",
+  "title": "China financial regulatory source-pack index (draft)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "contract_status", "generated_at", "packs", "profiles"],
+  "properties": {
+    "schema_version": {"const": "1.0.0-draft.1"},
+    "contract_status": {"const": "draft"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "description": {"type": "string", "minLength": 1, "maxLength": 4000},
+    "packs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "catalog_file", "catalog_sha256", "minimum_documents", "description"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z][a-z0-9-]{1,79}$"},
+          "catalog_file": {"type": "string", "pattern": "^[a-z0-9-]+-sources\\.json$"},
+          "catalog_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "minimum_documents": {"type": "integer", "minimum": 1},
+          "description": {"type": "string", "minLength": 1, "maxLength": 1000}
+        }
+      }
+    },
+    "profiles": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "pack_ids", "description"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{1,79}$"},
+          "pack_ids": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {"type": "string", "pattern": "^[a-z][a-z0-9-]{1,79}$"}
+          },
+          "description": {"type": "string", "minLength": 1, "maxLength": 1000}
+        }
+      }
+    }
+  }
+}

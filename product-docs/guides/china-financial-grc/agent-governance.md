@@ -39,6 +39,11 @@ The initiating agent cannot be an approver. High-risk actions require different
 maker and checker identities. An agent or service account cannot replace a
 named accountable decision owner.
 
+The draft repository validator also recomputes a canonical subject-payload
+digest, requires a named human checker, rejects maker/checker identity reuse,
+and checks the active approval chain from reviewed source and provision to the
+dependent obligation, rule, applicability decision, or control mapping.
+
 ## Tool and MCP controls
 
 - default to read-only tools;

@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:yydspanda:risk:schema:cn-financial-applicability-facts:1.0.0-draft.1",
+  "title": "China financial GRC applicability fact registry (draft)",
+  "description": "A controlled vocabulary for facts used by deterministic applicability rules. Facts require evidence and unknown values route to review.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "contract_status", "generated_at", "facts"],
+  "properties": {
+    "schema_version": {"const": "1.0.0-draft.1"},
+    "contract_status": {"const": "draft"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "description": {"type": "string", "maxLength": 4000},
+    "facts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/factDefinition"}
+    }
+  },
+  "$defs": {
+    "factDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "title_zh",
+        "value_type",
+        "description",
+        "evidence_examples",
+        "owner_role",
+        "sensitivity",
+        "unknown_result"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.]{2,159}$"
+        },
+        "title_zh": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "value_type": {
+          "type": "string",
+          "enum": ["boolean", "string", "integer", "decimal", "date", "set"]
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "allowed_values": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 300}
+        },
+        "evidence_examples": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 500}
+        },
+        "owner_role": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{2,99}$"
+        },
+        "sensitivity": {
+          "type": "string",
+          "enum": ["public", "internal", "confidential", "restricted"]
+        },
+        "unknown_result": {"const": "needs_review"}
+      }
+    }
+  }
+}

@@ -165,6 +165,36 @@
           },
           "uniqueItems": true
         },
+        "coverage_priority": {
+          "type": "string",
+          "enum": ["P0", "P1", "P2"],
+          "description": "Collection and review priority only; it is not an authority or applicability ranking."
+        },
+        "coverage_stage": {
+          "type": "string",
+          "enum": [
+            "source_metadata",
+            "provision_indexed",
+            "obligations_proposed",
+            "obligations_reviewed"
+          ],
+          "description": "Highest completed knowledge-production stage. Source metadata alone is not an operational obligation."
+        },
+        "applicability_fact_keys": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "Candidate fact keys needed for later deterministic applicability analysis. Their presence does not establish that the instrument applies.",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.]{2,159}$"
+          }
+        },
+        "selection_rationale": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
         "domains": {
           "type": "array",
           "minItems": 1,
@@ -177,6 +207,16 @@
               "banking",
               "insurance",
               "fintech",
+              "licensing",
+              "prudential_capital",
+              "liquidity_risk",
+              "credit_risk",
+              "market_risk",
+              "insurance_solvency",
+              "actuarial_reserving",
+              "insurance_funds",
+              "payment_services",
+              "regulatory_reporting",
               "aml_kyc",
               "consumer_protection",
               "data_security",
@@ -275,6 +315,7 @@
           ]
         },
         "published_date": {
+          "description": "Official promulgation or public-release date evidenced by the cited authority source. It is not inferred from a URL path and may be null when the first official publication date is unresolved.",
           "oneOf": [
             {"$ref": "#/$defs/date"},
             {"type": "null"}
@@ -803,12 +844,26 @@
             "required": ["known"]
           },
           "then": {
-            "required": ["value"]
+            "required": ["value"],
+            "properties": {
+              "source_refs": {"minItems": 1},
+              "observed_at": {"$ref": "#/$defs/dateTime"}
+            }
           },
           "else": {
-            "not": {
-              "required": ["value"]
-            }
+            "allOf": [
+              {
+                "not": {
+                  "required": ["value"]
+                }
+              },
+              {
+                "properties": {
+                  "source_refs": {"maxItems": 0},
+                  "observed_at": {"type": "null"}
+                }
+              }
+            ]
           }
         }
       ]
@@ -911,6 +966,12 @@
             "properties": {
               "confirmed_by": {"type": "string", "minLength": 1},
               "confirmed_at": {"$ref": "#/$defs/dateTime"}
+            }
+          },
+          "else": {
+            "properties": {
+              "confirmed_by": {"type": "null"},
+              "confirmed_at": {"type": "null"}
             }
           }
         }
@@ -1064,6 +1125,10 @@
           "minLength": 1,
           "maxLength": 300
         },
+        "decided_by_kind": {
+          "type": "string",
+          "enum": ["human", "workload"]
+        },
         "role": {
           "type": "string",
           "minLength": 1,
@@ -1090,6 +1155,9 @@
         },
         "payload_sha256": {
           "$ref": "#/$defs/sha256"
+        },
+        "payload_digest_profile": {
+          "const": "cn-financial-grc-canonical-json-v1"
         }
       }
     }

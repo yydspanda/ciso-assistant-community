@@ -70,6 +70,18 @@ Every amber proposal includes:
 The UI displays a field-level diff and citations. Confirmation signs the exact
 payload digest; changing the proposal invalidates the approval.
 
+The draft interchange profile
+`cn-financial-grc-canonical-json-v1` binds an approval to an envelope containing
+the profile, schema version, subject type, subject ID, and subject payload. It
+uses UTF-8 JSON with lexicographically sorted object keys, no insignificant
+whitespace, unescaped Unicode, preserved array order, and rejection of
+NaN/Infinity. Approval-derived status, reviewer, confirmation, and close-time
+fields are excluded so that applying an approval does not invalidate its own
+digest; all substantive, provenance, fact, source, and valid-time fields remain
+bound. Any cross-language implementation must pass shared conformance vectors;
+a later canonicalisation change must mint a new profile rather than silently
+changing this one.
+
 ## Approval rules
 
 - The initiating agent is never an approver.
@@ -77,6 +89,9 @@ payload digest; changing the proposal invalidates the approval.
   privacy, security, finance, or business decision owner.
 - Maker and checker are different identities for high-risk actions.
 - Approval records include role, scope, reason, conditions, and expiry.
+- Binding decisions require a named human checker, a recomputed payload digest,
+  and an active prerequisite chain from reviewed source version and provision
+  through obligation, applicability rule/decision, or control mapping.
 - A stale proposal or changed source version requires re-review.
 - Emergency access is time-bound, independently approved, and reviewed after
   use.

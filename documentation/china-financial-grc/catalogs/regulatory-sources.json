@@ -193,6 +193,59 @@
       ]
     },
     {
+      "id": "CN-PBOC-BENEFICIAL-OWNER-2025",
+      "title_zh": "金融机构客户受益所有人识别管理办法",
+      "issuer": "中国人民银行",
+      "authority_level": "departmental_rule",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "financial_institution"
+      ],
+      "coverage_priority": "P0",
+      "coverage_stage": "source_metadata",
+      "applicability_fact_keys": [
+        "entity.institution_type",
+        "entity.licence_types"
+      ],
+      "selection_rationale": "Current risk-based beneficial-owner identification and verification rule for institutions subject to customer due-diligence duties; automation cannot replace necessary risk judgment.",
+      "domains": [
+        "aml_kyc",
+        "banking",
+        "insurance",
+        "fintech"
+      ]
+    },
+    {
+      "id": "CN-PBOC-AML-AMENDMENT-2025",
+      "title_zh": "中国人民银行关于修改和废止部分规章的决定",
+      "issuer": "中国人民银行",
+      "authority_level": "departmental_rule",
+      "territories": [
+        "CN"
+      ],
+      "regulated_entity_scopes": [
+        "financial_institution",
+        "specified_aml_obliged_entity"
+      ],
+      "coverage_priority": "P0",
+      "coverage_stage": "source_metadata",
+      "applicability_fact_keys": [
+        "entity.institution_type",
+        "entity.licence_types"
+      ],
+      "selection_rationale": "Current amendment overlay for large and suspicious transaction reporting and AML supervision, including mandatory human analysis and longer record retention.",
+      "domains": [
+        "aml_kyc",
+        "banking",
+        "insurance",
+        "fintech",
+        "audit",
+        "regulatory_reporting"
+      ]
+    },
+    {
       "id": "CN-NFRA-COMPLIANCE-2024",
       "title_zh": "金融机构合规管理办法",
       "issuer": "国家金融监督管理总局",
@@ -354,7 +407,9 @@
       ],
       "regulated_entity_scopes": [
         "bank",
-        "insurance_institution"
+        "insurance_institution",
+        "specified_nonbank_financial_institution",
+        "financial_holding_company"
       ],
       "domains": [
         "banking",
@@ -842,6 +897,80 @@
         "model": null,
         "prompt_version": null,
         "retrieval_version": "official-source-link-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-PBOC-BENEFICIAL-OWNER-2025-v1",
+      "document_id": "CN-PBOC-BENEFICIAL-OWNER-2025",
+      "version_label": "2025-12-19 official text",
+      "document_no": "中国人民银行令〔2025〕第12号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2025-12-19",
+      "published_date": null,
+      "effective_date": "2026-01-20",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.pbc.gov.cn/zhengwugongkai/attachDir/2025/12/2025122909330031237.pdf",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "The first official web-publication date was not strictly confirmed; the PDF path date is not used as publication evidence. The rule prohibits relying only on a registry query or replacing necessary risk judgment with batch automation.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "partial",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2026-01-20",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "phase1:common-financial-source-pack-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-common-financial-source-review@2026-08-20"
+      }
+    },
+    {
+      "id": "CN-PBOC-AML-AMENDMENT-2025-v1",
+      "document_id": "CN-PBOC-AML-AMENDMENT-2025",
+      "version_label": "2025-09-30 official text",
+      "document_no": "中国人民银行令〔2025〕第10号",
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2025-09-30",
+      "published_date": "2025-10-11",
+      "effective_date": "2025-12-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.pbc.gov.cn/tiaofasi/144941/144957/5863650/index.html",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "This amends the large and suspicious transaction reporting and AML supervision rules and repeals the 2006 AML provisions. Suspicious-transaction alerts require recorded human analysis; reporting and analysis records are retained for at least ten years under the amended text.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2025-12-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "phase1:common-financial-source-pack-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-common-financial-source-review@2026-08-20"
       }
     },
     {

@@ -2,15 +2,14 @@
 
 Official-link and source-metadata review date: **2026-08-20**.
 
-The machine-readable seed list is maintained in
-[`catalogs/regulatory-sources.json`](catalogs/regulatory-sources.json). This
-document defines how sources are classified and used. The 24 seed records are
-all marked `legal_review_status: unreviewed`. Two records deliberately retain a
-`null` publication date because the first official publication date could not
-be strictly confirmed. The future online-marketing measure is also marked
-`metadata_confidence: partial` because official channels classify its authority
-level inconsistently. Link review is not legal review or an applicability
-conclusion.
+The machine-readable source register is split across a common catalog and the
+[banking, insurance, and fintech/data/AI packs](regulatory-source-packs.md).
+Together they contain 76 documents and 76 version records. Every record is
+marked `legal_review_status: unreviewed`. Six versions retain
+`metadata_confidence: partial`, including unresolved publication metadata and
+an instrument whose authority classification differs across official channels;
+unknown values are not guessed. Metadata and link review are not legal review
+or an applicability conclusion.
 
 ## Authority hierarchy
 
@@ -132,12 +131,12 @@ The control pack covers:
 An agent cannot review or approve its own model, grant itself an exception, or
 change its audit history.
 
-The non-exhaustive seed does not yet include the 2026
-[Interim Measures for AI Anthropomorphic Interaction Services](https://www.cac.gov.cn/2026-04/10/c_1777558395078289.htm).
-A later public-facing AI pack must capture whether a service simulates a persona
-and sustains emotional interaction. It must not assume that an ordinary customer
-service, knowledge-answering, or work assistant falls into that specialised
-scope.
+The fintech/data/AI pack includes the 2026
+[Interim Measures for AI Anthropomorphic Interaction Services](https://www.cac.gov.cn/2026-04/10/c_1777558395078289.htm)
+as conditional source metadata. Its applicability depends on facts such as a
+public-facing service, simulated persona, and sustained emotional interaction.
+An ordinary customer-service, knowledge-answering, or work assistant must not
+be automatically placed in that specialised scope.
 
 ## Source acceptance policy
 
