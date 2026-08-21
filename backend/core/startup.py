@@ -1850,6 +1850,31 @@ ADMINISTRATOR_PERMISSIONS_LIST = [
     "delete_agentaction",
 ]
 
+# The Phase 1 regulatory API is read-only. Ingest and review transitions remain
+# explicit domain-service permissions and are not generic model CRUD rights.
+REGULATORY_READ_PERMISSIONS = ["view_regulatorydocument"]
+REGULATORY_SERVICE_PERMISSIONS = [
+    "ingest_regulatoryrecord",
+    "transition_regulatoryobligation",
+]
+REGULATORY_LEGAL_REVIEW_PERMISSIONS = [
+    "legal_review_regulatoryobligation",
+]
+
+READER_PERMISSIONS_LIST += REGULATORY_READ_PERMISSIONS
+APPROVER_PERMISSIONS_LIST += (
+    REGULATORY_READ_PERMISSIONS + REGULATORY_LEGAL_REVIEW_PERMISSIONS
+)
+ANALYST_PERMISSIONS_LIST += REGULATORY_READ_PERMISSIONS + REGULATORY_SERVICE_PERMISSIONS
+DOMAIN_MANAGER_PERMISSIONS_LIST += (
+    REGULATORY_READ_PERMISSIONS + REGULATORY_SERVICE_PERMISSIONS
+)
+ADMINISTRATOR_PERMISSIONS_LIST += (
+    REGULATORY_READ_PERMISSIONS
+    + REGULATORY_SERVICE_PERMISSIONS
+    + REGULATORY_LEGAL_REVIEW_PERMISSIONS
+)
+
 THIRD_PARTY_RESPONDENT_PERMISSIONS_LIST = [
     "view_complianceassessment",
     "view_requirementassessment",

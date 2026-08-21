@@ -30,7 +30,7 @@ applicability conclusion.
 | China financial common controls and baseline | Added in this fork | High-level original control summaries; not legal text or a compliance opinion |
 | Regulatory JSON Schemas and official-source registers | Added in this fork | Explicitly draft contract; 76 metadata records across four packs remain legally unreviewed |
 | Controlled applicability-fact registry | Added in this fork | 56 fact definitions; unknown values route to review rather than non-applicability |
-| Temporal regulatory Django models and APIs | Proposed | Required before regulations become authoritative application records |
+| Temporal regulatory Django models and APIs | First bounded slice added | Synthetic, metadata-only current chain; read-only `/api/regulatory/v1/`; non-binding human review only |
 | Reviewed regulatory-to-library projection | Proposed | Projects approved obligations into frameworks and requirements |
 | Deterministic applicability and action policy | Proposed | Unknown facts must route to review |
 | Continuous evidence and privacy/data integrations | Proposed external integration | Evidence providers must not become competing GRC masters |

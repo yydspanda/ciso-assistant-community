@@ -36,6 +36,7 @@ a governed system of record with bounded AI capabilities:
 - [Agent governance](agent-governance.md)
 - [Migration and delivery plan](migration-plan.md)
 - [Open-source decisions](open-source-decisions.md)
+- [ADR 0001: bounded regulatory persistence](adr/0001-regulatory-persistence-boundary.md)
 - [`schemas/regulatory-record.schema.json`](schemas/regulatory-record.schema.json):
   the proposed `2.0.0-draft.1` interchange contract for regulatory knowledge
 - [`catalogs/regulatory-sources.json`](catalogs/regulatory-sources.json) and the
@@ -96,8 +97,10 @@ process.
 
 ## Implementation boundary
 
-This branch establishes the contract and a loadable control library before
-introducing Django models or migrations. That order is intentional: flattening
-regulations directly into `Framework` and `RequirementNode` would lose legal
-version, applicability, provenance, and effective-time semantics. The proposed
-regulatory models will be added behind a library bridge in a subsequent phase.
+Phase 1 now adds a bounded, read-only first persistence slice behind
+`/api/regulatory/v1/`. It stores only a synthetic-entity
+Document -> Version -> Provision -> Obligation chain and non-binding review
+events. It does not implement applicability decisions, approvals, publication,
+real-institution data, a library bridge, or an agent. Flattening regulatory
+history into `Framework` and `RequirementNode` remains prohibited; those
+objects receive only reviewed projections in a later gated phase.

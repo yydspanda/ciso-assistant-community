@@ -1,9 +1,9 @@
 # China Financial GRC Progress Ledger / 中国金融 GRC 进度台账
 
 > Status: **Authoritative execution record / 权威执行记录**
-> Updated: **2026-08-20**
+> Updated: **2026-08-21**
 > Branch: `agent/china-financial-grc-foundation`
-> Current phase: **Phase 1 — architecture and ownership gate**
+> Current phase: **Phase 1 — temporal regulatory persistence**
 
 This file records verified current state, evidence, blockers, and the next
 action. It contains no private institution data, internal policy content,
@@ -20,7 +20,7 @@ live in `delivery-roadmap.md`.
 | Official-source metadata packs | Complete for the current non-exhaustive seed; legal review remains unreviewed |
 | Applicability fact registry and deterministic artifact validation | Complete for draft interchange artifacts |
 | Project-level `AGENTS.md`, product skill, architecture skill, roadmap, and progress ledger | Complete and independently forward-tested in this change |
-| Django regulatory persistence, migrations, APIs, and reviewer workflow | Not implemented |
+| Django regulatory persistence, migrations, APIs, and reviewer workflow | First synthetic current-chain slice implemented and tested; correction, applicability, binding decisions, and UI remain open |
 | Reviewed provisions and obligations from the source packs | Not implemented; the end-to-end record is illustrative only |
 | Private internal-policy ingestion and mapping | Not implemented |
 | Read-only production agent, proposal writes, or continuous evidence connectors | Not implemented |
@@ -115,12 +115,44 @@ repository's fixed shared SQLite test database produced an environmental I/O/WAL
 conflict during an earlier direct pytest attempt; the isolated loader assertions
 passed and no user database was modified.
 
+Phase 1 first-persistence-slice verification:
+
+```text
+backend/.venv/bin/python manage.py check
+  PASS — no system-check issues
+
+backend/.venv/bin/python manage.py makemigrations regulatory --check --dry-run
+  PASS — no migration drift
+
+backend/.venv/bin/pytest regulatory/tests -q --create-db
+  PASS — 17 migration-backed focused tests at the final schema boundary
+
+backend/.venv/bin/pytest regulatory/tests -q --nomigrations --create-db --reuse-db
+  PASS — 19 final model, transaction, IAM, state, API, and constraint tests
+
+isolated SQLite full project base + final regulatory zero -> 0001 reapply
+  PASS — initial migration is reversible and reapplies without touching user data
+
+regulatory router introspection
+  PASS — list/detail only; inherited batch, object, and cascade actions absent
+```
+
+Independent model and security reviews identified and drove fail-closed fixes
+for non-current ingestion, binding-state DB bypass, source-text storage,
+caller-mutated or revoked authority objects, service-account review,
+analyst/legal permission separation, aggregate child folders, entity metadata
+disclosure, and inherited generic actions. The final static review found no
+remaining merge blocker.
+
 ## Current limitations and risks
 
 1. **Metadata is not reviewed law.** Source records are metadata-only discovery
    entries; included legal-review statuses remain `unreviewed`.
-2. **No application persistence.** The temporal regulatory contract is not yet a
-   Django model, migration, API, or user workflow.
+2. **Persistence remains deliberately narrow.** The application stores one
+   current synthetic Document/Version/Provision/Obligation chain and non-binding
+   review events. It has no correction/supersession service, as-of history API,
+   applicability records, binding DecisionRecord, reviewer UI, or real source
+   ingestion.
 3. **No pilot entity facts.** Public artifacts cannot decide applicability for a
    real institution, licence, product, customer, data flow, or system.
 4. **No gold set or baseline.** Extraction, mapping, reviewer effort, latency,
@@ -133,43 +165,57 @@ passed and no user database was modified.
 7. **External model use is not authorised for regulated data.** Local provider
    connectivity does not satisfy privacy, secrecy, security, data-transfer, or
    retention requirements.
+8. **Append-mostly is not WORM.** The supported service/API path and local DB
+   constraints fail closed, but privileged SQL and unsupported ORM bulk/M2M
+   operations still require production database-role, trigger, or tamper-
+   evident-storage decisions.
+9. **Production database evidence is pending.** Final focused tests use the
+   project's SQLite path; PostgreSQL apply/rollback, concurrency, lock, and
+   query-plan evidence remains a later release gate.
 
 ## Current next action
 
-Run `$china-financial-grc-architecture-reviewer` in implementation-planning mode
-for the Phase 1 ownership gate, then implement the first database-backed vertical
-slice.
-
-The architecture decision must establish:
-
-- whether a bounded new Django app owns regulatory records;
-- exact reuse of folder/domain IAM, validation flows, audit, library, evidence,
-  and findings;
-- model names, keys, uniqueness, valid/recorded time, supersession, and
-  append-only behavior;
-- transaction ownership, migration/rollback, API versioning, and review states;
-- which current JSON contract fields enter persistence now and which remain
-  target-only;
-- focused model, migration, permission, temporal, and approval tests.
-
-The first implementation slice is complete only when a synthetic entity can
-persist and retrieve one document/version/provision/obligation chain, preserve
-its source and bitemporal identity, reject invalid state transitions, and pass
-focused migration and permission tests. It must not publish a legal conclusion.
+Implement the next bounded temporal-correction slice: lock one current
+DocumentVersion/Provision/Obligation revision set, close only its recorded
+interval through an auditable domain operation, create validated successor
+revisions, and add recorded-time `as_of` retrieval plus apply/rollback and stale-
+write tests. Do not add applicability, approval, publication, real institution
+data, source text, or an agent in that slice.
 
 ## Near-term backlog
 
 | Priority | Slice | Dependency | State |
 | --- | --- | --- | --- |
-| P0 | Phase 1 architecture/ownership decision | Current repository model and IAM review | Next |
-| P0 | Regulatory Django models and initial migration | Accepted ownership decision | Pending |
-| P0 | Read-only API plus review-state service | Models, permissions, transaction design | Pending |
+| P0 | Phase 1 architecture/ownership decision | Current repository model and IAM review | Complete |
+| P0 | First regulatory chain models and initial migration | Accepted ownership decision | Complete for current synthetic slice |
+| P0 | Read-only API plus non-binding review-state service | Models, permissions, transaction design | Complete for current synthetic slice |
+| P0 | Controlled correction/supersession and `as_of` retrieval | First current-chain slice | Next |
+| P0 | Applicability fact/rule/decision persistence | Stable bitemporal correction semantics | Pending |
 | P0 | Small human-reviewed pilot source set | Named reviewer and source rights | Blocked on external ownership |
 | P1 | Reviewer UI/admin workflow | Stable API and review contract | Pending |
 | P1 | Internal-policy/private overlay model | Published obligation model and privacy design | Later Phase 2 |
 | P1 | Read-only source/explanation agent evaluation | Reviewed knowledge and gold set | Later Phase 3 |
 
 ## Activity log
+
+### 2026-08-21 — First database-backed regulatory chain
+
+- Accepted ADR 0001 and created the bounded `backend/regulatory` owner instead
+  of flattening legal facts into mutable library or document models.
+- Added the initial migration and an atomic, idempotent synthetic chain service
+  for Document -> Version -> Provision -> Obligation, preserving portable IDs,
+  source identity, valid/recorded time, provenance, and the authenticated
+  ingester identity.
+- Added folder-scoped, read-only list/detail APIs and an append-only proposal
+  review service. Analyst and legal review use separate permissions and named
+  humans; no route or state can approve or publish a legal conclusion.
+- Added database constraints for unpublished/current metadata-only records,
+  no source text, lifecycle consistency, machine-proposal initial state, and
+  exactly the two non-binding review edges.
+- Verified IAM isolation, caller-object reloading, idempotency, atomic rollback,
+  invalid lifecycle/state rejection, service-account exclusion, hidden generic
+  actions, migration reversibility, and fail-closed aggregate serialization on
+  synthetic data only.
 
 ### 2026-08-20 — Project-agent operating model
 

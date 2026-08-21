@@ -1,0 +1,91 @@
+from typing import Any, NotRequired, TypedDict
+
+
+class RegulatoryDocumentPayload(TypedDict):
+    id: str
+    title_zh: str
+    issuer: str
+    authority_level: str
+    territories: list[str]
+    regulated_entity_scopes: list[str]
+    domains: list[str]
+    title_en: NotRequired[str]
+    coverage_priority: NotRequired[str]
+    coverage_stage: NotRequired[str]
+    applicability_fact_keys: NotRequired[list[str]]
+    selection_rationale: NotRequired[str]
+
+
+class RegulatoryDocumentVersionPayload(TypedDict):
+    id: str
+    document_id: str
+    version_label: str
+    document_no: str | None
+    status: str
+    status_as_of: str
+    effective_basis: str
+    issued_date: str | None
+    published_date: str | None
+    effective_date: str | None
+    transition_end: str | None
+    repeal_date: str | None
+    supersedes_version_ids: list[str]
+    source_url: str
+    source_hash: str | None
+    content_storage_policy: str
+    source_checked_on: str
+    metadata_confidence: str
+    legal_review_status: str
+    legal_reviewed_at: str | None
+    legal_reviewed_by: str | None
+    valid_from: str | None
+    valid_to: str | None
+    recorded_from: str
+    recorded_to: str | None
+    provenance: dict[str, Any]
+    notes: NotRequired[str]
+
+
+class RegulatoryProvisionPayload(TypedDict):
+    id: str
+    document_id: str
+    version_id: str
+    article: str
+    source_locator: dict[str, str]
+    content_hash: str
+    recorded_from: str
+    recorded_to: str | None
+    provenance: dict[str, Any]
+    heading: NotRequired[str | None]
+    text: NotRequired[str | None]
+
+
+class RegulatoryObligationPayload(TypedDict):
+    id: str
+    title_zh: str
+    provision_ids: list[str]
+    authority_level: str
+    modality: str
+    subject: str
+    action: str
+    conditions: list[str]
+    deadline: dict[str, Any]
+    valid_from: str | None
+    valid_to: str | None
+    recorded_from: str
+    recorded_to: str | None
+    review_status: str
+    confidence: float
+    provenance: dict[str, Any]
+    object: NotRequired[str | None]
+    exceptions: NotRequired[list[str]]
+    expected_evidence: NotRequired[list[str]]
+    penalty_or_consequence: NotRequired[str | None]
+    uncertainties: NotRequired[list[str]]
+
+
+class RegulatoryChainPayload(TypedDict):
+    document: RegulatoryDocumentPayload
+    document_version: RegulatoryDocumentVersionPayload
+    provision: RegulatoryProvisionPayload
+    obligation: RegulatoryObligationPayload
