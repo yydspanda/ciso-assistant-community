@@ -200,6 +200,7 @@ data, source text, or an agent in that slice.
 
 ### 2026-08-21 — First database-backed regulatory chain
 
+- Implementation commit: `c52bffb26` — `add first regulatory persistence slice`.
 - Accepted ADR 0001 and created the bounded `backend/regulatory` owner instead
   of flattening legal facts into mutable library or document models.
 - Added the initial migration and an atomic, idempotent synthetic chain service
