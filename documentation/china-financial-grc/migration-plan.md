@@ -81,6 +81,10 @@ criteria:
 - `regulatory.0003_regulatoryapplicabilitydecision` additively creates one
   append-only synthetic applicability-decision table, its constraints and
   separate view/record permissions, with no data backfill;
+- `regulatory.0004_regulatoryapplicabilityreviewdisposition` additively creates
+  the exact-decision human disposition stream, selection index, separate
+  view/review permissions, portable constraints, and populated-history reverse
+  guard, with no data backfill;
 - one atomic domain service closes the exact current three-row revision set and
   appends linked successors at a server-owned cutoff; the successor obligation
   resets to `machine_proposed`;
@@ -135,12 +139,13 @@ Implemented bounded applicability increment:
   0002.
 
 The additive migration contains no data backfill and no real or sample
-institution facts. The full regulatory SQLite suite passes all 41 tests both
-with migrations disabled and through the real project migration graph. An
-independent full-project SQLite database rehearsal verified 0003 apply,
-empty-history rollback and reapply, and refusal to reverse 0003 after inserting
-a synthetic decision. Django system checks, migration-drift checks, and an
-independent review reporting no critical, high, or medium findings also pass.
+institution facts. At the ADR 0003 delivery gate, all 41 then-existing
+regulatory tests passed both with migrations disabled and through the real
+project migration graph. An independent full-project SQLite database rehearsal
+verified 0003 apply, empty-history rollback and reapply, and refusal to reverse
+0003 after inserting a synthetic decision. Django system checks,
+migration-drift checks, and an independent review reporting no critical, high,
+or medium findings also passed.
 
 Retaining or archiving populated rows before any future schema removal requires
 a separate reviewed forward migration. PostgreSQL apply, two-connection folder
@@ -149,8 +154,7 @@ database-role enforcement, and audit-retention evidence remain external
 deployment gates. See
 [ADR 0003](adr/0003-bounded-synthetic-applicability-persistence.md).
 
-Accepted next increment, with implementation and migration verification still
-pending:
+Implemented bounded applicability review-disposition increment:
 
 - add one independent append-only
   `RegulatoryApplicabilityReviewDisposition` stream bound to the exact physical
@@ -170,19 +174,19 @@ pending:
 - expose only a separate entity-scoped read action while keeping all review
   mutation inside an atomic named-human domain service.
 
-The accepted additive migration `0004` will create the disposition table,
+The additive migration `0004` creates the disposition table,
 selection index, event-chain/idempotency/digest/non-binding constraints, and
 permissions without altering or backfilling 0001 through 0003. Existing
 decisions remain `not_reviewed` by absence. Empty-history rollback should remove
-only the new schema; a reverse guard must refuse to discard any recorded
+only the new schema; the reverse guard refuses to discard any recorded
 disposition history.
 
-Before this increment can be described as implemented, focused and full SQLite
-tests must cover exact decision/digest CAS, disposition correction, self-review
-and service-account rejection, permission and cross-entity/folder isolation,
-decision and obligation correction boundaries, recorded-time selection and
-clock rollback, API method hiding, constraints, migration drift, empty
-rollback/reapply, and populated reverse refusal. PostgreSQL migration,
+The model, atomic internal recording service, permission mapping, related-User
+masking, and recorded-time read action are implemented. All 72 regulatory tests
+pass both without migrations and through the real project migration graph. An
+isolated full-project SQLite rehearsal verified 0004 apply, empty
+rollback/reapply, populated reverse refusal, and post-refusal preservation.
+PostgreSQL migration,
 two-connection locking, query plans, backup/restore, database-role enforcement,
 and audit retention remain external production gates. See
 [ADR 0004](adr/0004-bounded-synthetic-applicability-review-disposition.md).

@@ -30,6 +30,14 @@ from .validators import (
 CORRECTION_DIGEST_SCHEMA = "regulatory-chain-correction/v1"
 APPLICABILITY_DIGEST_SCHEMA = "regulatory-applicability-evaluation/v1"
 APPLICABILITY_EVALUATOR_PROFILE = "synthetic-single-condition/v1"
+APPLICABILITY_REVIEW_DISPOSITION_DIGEST_PROFILE = (
+    "regulatory-applicability-review-disposition/v1"
+)
+APPLICABILITY_REVIEW_PERSISTED_DISPOSITIONS = (
+    "no_correction_requested",
+    "correction_requested",
+    "unable_to_complete",
+)
 PILOT_APPLICABILITY_SCOPE_TYPE = "legal_entity"
 PILOT_APPLICABILITY_FACT_KEY = "entity.institution_type"
 PILOT_APPLICABILITY_EXPECTED_VALUE = "bank"
@@ -1547,6 +1555,474 @@ class RegulatoryApplicabilityDecision(TemporalRevisionMixin, RegulatoryFolderMod
         return self.fact_snapshot
 
 
+class RegulatoryApplicabilityReviewDisposition(RegulatoryFolderModel):
+    """Append-only named-human review of one exact applicability revision."""
+
+    class Disposition(models.TextChoices):
+        NOT_REVIEWED = "not_reviewed", _("Not reviewed")
+        NO_CORRECTION_REQUESTED = (
+            "no_correction_requested",
+            _("No correction requested"),
+        )
+        CORRECTION_REQUESTED = "correction_requested", _("Correction requested")
+        UNABLE_TO_COMPLETE = "unable_to_complete", _("Unable to complete")
+
+    class ReasonCode(models.TextChoices):
+        REVIEW_COMPLETED = "review_completed", _("Review completed")
+        FACT_CORRECTION_REQUIRED = (
+            "fact_correction_required",
+            _("Fact correction required"),
+        )
+        EVIDENCE_CORRECTION_REQUIRED = (
+            "evidence_correction_required",
+            _("Evidence correction required"),
+        )
+        PROVENANCE_CORRECTION_REQUIRED = (
+            "provenance_correction_required",
+            _("Provenance correction required"),
+        )
+        SCOPE_OR_PARENT_CORRECTION_REQUIRED = (
+            "scope_or_parent_correction_required",
+            _("Scope or parent correction required"),
+        )
+        OTHER_CORRECTION_REQUIRED = (
+            "other_correction_required",
+            _("Other correction required"),
+        )
+        INSUFFICIENT_EVIDENCE = "insufficient_evidence", _("Insufficient evidence")
+        CONFLICTING_INFORMATION = (
+            "conflicting_information",
+            _("Conflicting information"),
+        )
+        INSUFFICIENT_AUTHORITY_OR_SCOPE = (
+            "insufficient_authority_or_scope",
+            _("Insufficient authority or scope"),
+        )
+        OTHER_UNRESOLVED = "other_unresolved", _("Other unresolved")
+
+    decision = models.ForeignKey(
+        RegulatoryApplicabilityDecision,
+        on_delete=models.PROTECT,
+        related_name="review_dispositions",
+    )
+    decision_semantic_payload_sha256 = models.CharField(
+        max_length=64,
+        validators=[validate_sha256],
+    )
+    decision_recorded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="regulatory_applicability_reviews_as_decision_recorder",
+    )
+    reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="regulatory_applicability_reviews_as_reviewer",
+    )
+    sequence = models.PositiveIntegerField()
+    previous_disposition = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        db_index=False,
+        on_delete=models.PROTECT,
+        related_name="successor_dispositions",
+    )
+    from_disposition = models.CharField(
+        max_length=32,
+        choices=Disposition.choices,
+    )
+    to_disposition = models.CharField(
+        max_length=32,
+        choices=Disposition.choices,
+    )
+    reason_code = models.CharField(max_length=48, choices=ReasonCode.choices)
+    rationale = models.TextField(max_length=4000)
+    occurred_at = models.DateTimeField(editable=False)
+    digest_profile = models.CharField(
+        max_length=64,
+        default=APPLICABILITY_REVIEW_DISPOSITION_DIGEST_PROFILE,
+        editable=False,
+    )
+    event_payload_sha256 = models.CharField(
+        max_length=64,
+        validators=[validate_sha256],
+    )
+    request_sha256 = models.CharField(
+        max_length=64,
+        validators=[validate_sha256],
+    )
+    idempotency_key = models.CharField(max_length=200)
+    is_binding = models.BooleanField(default=False, editable=False)
+
+    class Meta:
+        default_permissions = ("view",)
+        permissions = [
+            (
+                "review_regulatoryapplicability",
+                "Can review an exact regulatory applicability evaluation",
+            )
+        ]
+        ordering = ["decision_id", "sequence"]
+        indexes = [
+            models.Index(
+                fields=["folder", "decision", "occurred_at"],
+                name="reg_app_rev_dec_time_idx",
+            )
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["decision", "sequence"],
+                name="reg_app_rev_dec_seq_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["decision"],
+                condition=Q(previous_disposition__isnull=True),
+                name="reg_app_rev_one_root",
+            ),
+            models.UniqueConstraint(
+                fields=["previous_disposition"],
+                name="reg_app_rev_prev_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["folder", "idempotency_key"],
+                name="reg_app_rev_idem_uniq",
+            ),
+            models.CheckConstraint(
+                condition=Q(sequence__gte=1),
+                name="reg_app_rev_seq_pos",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        sequence=1,
+                        previous_disposition__isnull=True,
+                        from_disposition="not_reviewed",
+                    )
+                    | (
+                        Q(sequence__gte=2, previous_disposition__isnull=False)
+                        & Q(
+                            from_disposition__in=(
+                                APPLICABILITY_REVIEW_PERSISTED_DISPOSITIONS
+                            )
+                        )
+                    )
+                ),
+                name="reg_app_rev_root_succ",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        to_disposition="no_correction_requested",
+                        reason_code="review_completed",
+                    )
+                    | Q(
+                        to_disposition="correction_requested",
+                        reason_code__in=(
+                            "fact_correction_required",
+                            "evidence_correction_required",
+                            "provenance_correction_required",
+                            "scope_or_parent_correction_required",
+                            "other_correction_required",
+                        ),
+                    )
+                    | Q(
+                        to_disposition="unable_to_complete",
+                        reason_code__in=(
+                            "insufficient_evidence",
+                            "conflicting_information",
+                            "insufficient_authority_or_scope",
+                            "other_unresolved",
+                        ),
+                    )
+                ),
+                name="reg_app_rev_reason_target",
+            ),
+            models.CheckConstraint(
+                condition=~Q(rationale=""),
+                name="reg_app_rev_rationale",
+            ),
+            models.CheckConstraint(
+                condition=~Q(idempotency_key=""),
+                name="reg_app_rev_idem_present",
+            ),
+            models.CheckConstraint(
+                condition=Q(
+                    digest_profile=APPLICABILITY_REVIEW_DISPOSITION_DIGEST_PROFILE
+                ),
+                name="reg_app_rev_digest_profile",
+            ),
+            models.CheckConstraint(
+                condition=Q(is_binding=False),
+                name="reg_app_rev_nonbinding",
+            ),
+            models.CheckConstraint(
+                condition=Q(is_published=False),
+                name="reg_app_rev_not_published",
+            ),
+            models.CheckConstraint(
+                condition=~Q(reviewer=F("decision_recorded_by")),
+                name="reg_app_rev_actor_separate",
+            ),
+            models.CheckConstraint(
+                condition=~Q(previous_disposition=F("id")),
+                name="reg_app_rev_prev_not_self",
+            ),
+        ]
+
+    def review_disposition_event_payload(self) -> dict:
+        registration = self.decision.registration
+        previous = self.previous_disposition
+        return {
+            "digest_profile": APPLICABILITY_REVIEW_DISPOSITION_DIGEST_PROFILE,
+            "scope": {
+                "folder_id": str(self.folder_id),
+                "registration_id": str(self.decision.registration_id),
+                "entity_id": str(registration.entity_id),
+                "document_id": str(registration.document_id),
+            },
+            "reviewer_id": str(self.reviewer_id),
+            "decision_recorded_by_id": str(self.decision_recorded_by_id),
+            "decision": {
+                "physical_id": str(self.decision_id),
+                "record_id": self.decision.record_id,
+                "revision": self.decision.revision,
+                "semantic_payload_sha256": (self.decision_semantic_payload_sha256),
+            },
+            "sequence": self.sequence,
+            "previous_disposition": (
+                {
+                    "physical_id": str(previous.id),
+                    "event_payload_sha256": previous.event_payload_sha256,
+                }
+                if previous is not None
+                else None
+            ),
+            "from_disposition": self.from_disposition,
+            "to_disposition": self.to_disposition,
+            "reason_code": self.reason_code,
+            "rationale": self.rationale,
+            "occurred_at": _canonical_temporal_value(self.occurred_at),
+            "is_binding": False,
+            "is_published": False,
+        }
+
+    def review_disposition_request_payload(self) -> dict:
+        """Canonical reviewer-bound command reconstructed from the stored event."""
+
+        registration = self.decision.registration
+        previous = self.previous_disposition
+        return {
+            "digest_profile": APPLICABILITY_REVIEW_DISPOSITION_DIGEST_PROFILE,
+            "kind": "request",
+            "reviewer_id": str(self.reviewer_id),
+            "scope": {
+                "folder_id": str(self.folder_id),
+                "registration_id": str(self.decision.registration_id),
+                "entity_id": str(registration.entity_id),
+                "document_id": str(registration.document_id),
+            },
+            "decision": {
+                "physical_id": str(self.decision_id),
+                "record_id": self.decision.record_id,
+                "revision": self.decision.revision,
+                "semantic_payload_sha256": (self.decision_semantic_payload_sha256),
+            },
+            "expected_head": (
+                {
+                    "physical_id": str(previous.id),
+                    "sequence": previous.sequence,
+                    "disposition": previous.to_disposition,
+                    "event_payload_sha256": previous.event_payload_sha256,
+                }
+                if previous is not None
+                else None
+            ),
+            "target_disposition": self.to_disposition,
+            "reason_code": self.reason_code,
+            "rationale": self.rationale,
+        }
+
+    def clean(self) -> None:
+        errors: dict[str, str] = {}
+        decision = self.decision if self.decision_id else None
+        previous = self.previous_disposition if self.previous_disposition_id else None
+        occurred_at_is_aware = self.occurred_at is not None and timezone.is_aware(
+            self.occurred_at
+        )
+
+        if self.occurred_at is not None and not occurred_at_is_aware:
+            errors["occurred_at"] = "A timezone-aware event time is required."
+
+        if decision is not None:
+            if decision.folder_id != self.folder_id:
+                errors["decision"] = "The decision must be in the review folder."
+            elif decision.registration.folder_id != self.folder_id:
+                errors["decision"] = (
+                    "The decision registration must be in the review folder."
+                )
+            try:
+                expected_decision_digest = _canonical_json_sha256(
+                    decision.applicability_semantic_payload()
+                )
+            except (TypeError, ValueError):
+                expected_decision_digest = None
+            if decision.semantic_payload_sha256 != expected_decision_digest:
+                errors["decision"] = (
+                    "The exact decision semantic digest is inconsistent."
+                )
+            if self.decision_semantic_payload_sha256 != (
+                decision.semantic_payload_sha256
+            ):
+                errors["decision_semantic_payload_sha256"] = (
+                    "The copied semantic digest must match the exact decision."
+                )
+            if self.decision_recorded_by_id != decision.recorded_by_id:
+                errors["decision_recorded_by"] = (
+                    "The copied decision recorder must match the exact decision."
+                )
+            if occurred_at_is_aware and self.occurred_at <= decision.recorded_from:
+                errors["occurred_at"] = (
+                    "The review event must occur strictly after its decision."
+                )
+            elif (
+                occurred_at_is_aware
+                and decision.recorded_to is not None
+                and self.occurred_at >= decision.recorded_to
+            ):
+                errors["occurred_at"] = (
+                    "The review event must precede the decision's recorded close."
+                )
+
+        if (
+            self.reviewer_id
+            and self.decision_recorded_by_id
+            and self.reviewer_id == self.decision_recorded_by_id
+        ):
+            errors["reviewer"] = "The decision recorder cannot review that revision."
+
+        if previous is None:
+            if (
+                self.sequence != 1
+                or self.from_disposition != self.Disposition.NOT_REVIEWED
+            ):
+                errors["previous_disposition"] = (
+                    "The first event must start at not_reviewed with sequence 1."
+                )
+        else:
+            if previous.pk == self.pk:
+                errors["previous_disposition"] = "An event cannot precede itself."
+            elif previous.folder_id != self.folder_id:
+                errors["previous_disposition"] = (
+                    "The predecessor must be in the review folder."
+                )
+            elif previous.decision_id != self.decision_id:
+                errors["previous_disposition"] = (
+                    "The predecessor must review the same decision."
+                )
+            elif decision is not None and (
+                previous.decision_recorded_by_id != decision.recorded_by_id
+                or previous.decision_semantic_payload_sha256
+                != decision.semantic_payload_sha256
+            ):
+                errors["previous_disposition"] = (
+                    "The predecessor must bind the same decision maker and digest."
+                )
+            elif self.sequence != previous.sequence + 1:
+                errors["sequence"] = "Sequence must increment its predecessor by one."
+            elif self.from_disposition != previous.to_disposition:
+                errors["from_disposition"] = (
+                    "The event must start at its predecessor disposition."
+                )
+            elif occurred_at_is_aware and previous.occurred_at >= self.occurred_at:
+                errors["occurred_at"] = (
+                    "The event must occur strictly after its predecessor."
+                )
+            elif previous.event_payload_sha256 != _canonical_json_sha256(
+                previous.review_disposition_event_payload()
+            ):
+                errors["previous_disposition"] = (
+                    "The predecessor event digest is inconsistent."
+                )
+            elif (
+                self.to_disposition == previous.to_disposition
+                and self.reason_code == previous.reason_code
+                and (self.rationale or "").strip() == (previous.rationale or "").strip()
+            ):
+                errors["to_disposition"] = (
+                    "A same-disposition successor must materially change its reason "
+                    "or rationale."
+                )
+
+        allowed_reason_codes = {
+            self.Disposition.NO_CORRECTION_REQUESTED: {
+                self.ReasonCode.REVIEW_COMPLETED,
+            },
+            self.Disposition.CORRECTION_REQUESTED: {
+                self.ReasonCode.FACT_CORRECTION_REQUIRED,
+                self.ReasonCode.EVIDENCE_CORRECTION_REQUIRED,
+                self.ReasonCode.PROVENANCE_CORRECTION_REQUIRED,
+                self.ReasonCode.SCOPE_OR_PARENT_CORRECTION_REQUIRED,
+                self.ReasonCode.OTHER_CORRECTION_REQUIRED,
+            },
+            self.Disposition.UNABLE_TO_COMPLETE: {
+                self.ReasonCode.INSUFFICIENT_EVIDENCE,
+                self.ReasonCode.CONFLICTING_INFORMATION,
+                self.ReasonCode.INSUFFICIENT_AUTHORITY_OR_SCOPE,
+                self.ReasonCode.OTHER_UNRESOLVED,
+            },
+        }
+        if self.reason_code not in allowed_reason_codes.get(self.to_disposition, set()):
+            errors["reason_code"] = (
+                "The reason code is not enabled for the target disposition."
+            )
+        normalized_rationale = (self.rationale or "").strip()
+        if not normalized_rationale:
+            errors["rationale"] = "A non-empty human rationale is required."
+        elif self.rationale != normalized_rationale:
+            errors["rationale"] = "The human rationale must be whitespace-normalized."
+        normalized_idempotency_key = (self.idempotency_key or "").strip()
+        if not normalized_idempotency_key:
+            errors["idempotency_key"] = "A non-empty idempotency key is required."
+        elif self.idempotency_key != normalized_idempotency_key:
+            errors["idempotency_key"] = (
+                "The idempotency key must be whitespace-normalized."
+            )
+        if self.digest_profile != APPLICABILITY_REVIEW_DISPOSITION_DIGEST_PROFILE:
+            errors["digest_profile"] = "The review digest profile is fixed."
+        if self.is_binding:
+            errors["is_binding"] = "Applicability review is non-binding."
+
+        if decision is not None and self.reviewer_id and self.occurred_at is not None:
+            try:
+                expected_event_digest = _canonical_json_sha256(
+                    self.review_disposition_event_payload()
+                )
+            except (TypeError, ValueError):
+                expected_event_digest = None
+            if self.event_payload_sha256 != expected_event_digest:
+                errors["event_payload_sha256"] = (
+                    "The event digest must match the exact review payload."
+                )
+            try:
+                expected_request_digest = _canonical_json_sha256(
+                    self.review_disposition_request_payload()
+                )
+            except (TypeError, ValueError):
+                expected_request_digest = None
+            if self.request_sha256 != expected_request_digest:
+                errors["request_sha256"] = (
+                    "The request digest must match the reviewer-bound command."
+                )
+
+        if errors:
+            raise ValidationError(errors)
+        super().clean()
+
+    def __str__(self) -> str:
+        return f"{self.decision_id} review {self.sequence}: {self.to_disposition}"
+
+
 class RegulatoryChainCorrectionEvent(RegulatoryFolderModel):
     """Auditable boundary for one atomic recorded-time chain correction."""
 
@@ -1824,4 +2300,8 @@ auditlog.register(RegulatoryObligation, exclude_fields=common_exclude)
 auditlog.register(RegulatoryObligationProvision, exclude_fields=common_exclude)
 auditlog.register(RegulatoryObligationReviewEvent, exclude_fields=common_exclude)
 auditlog.register(RegulatoryApplicabilityDecision, exclude_fields=common_exclude)
+auditlog.register(
+    RegulatoryApplicabilityReviewDisposition,
+    exclude_fields=common_exclude,
+)
 auditlog.register(RegulatoryChainCorrectionEvent, exclude_fields=common_exclude)

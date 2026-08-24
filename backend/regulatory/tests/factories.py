@@ -43,7 +43,7 @@ def make_user_with_permissions(
     )
     role.permissions.set(
         Permission.objects.filter(
-            content_type__app_label__in=("regulatory", "tprm"),
+            content_type__app_label__in=("regulatory", "tprm", "iam"),
             codename__in=codenames,
         )
     )
@@ -261,4 +261,56 @@ def applicability_payload(
             "prompt_version": None,
             "retrieval_version": "test-entity-register-v1",
         },
+    }
+
+
+def applicability_review_payload(
+    suffix: str,
+    *,
+    decision,
+    expected_disposition=None,
+    to_disposition: str = "no_correction_requested",
+    reason_code: str | None = None,
+    rationale: str | None = None,
+) -> dict:
+    """Build one strict exact-decision/exact-head review CAS command."""
+
+    default_reason_codes = {
+        "no_correction_requested": "review_completed",
+        "correction_requested": "fact_correction_required",
+        "unable_to_complete": "insufficient_evidence",
+    }
+    return {
+        "expected_decision": {
+            "physical_id": str(decision.id),
+            "record_id": decision.record_id,
+            "revision": decision.revision,
+            "semantic_payload_sha256": decision.semantic_payload_sha256,
+        },
+        "expected_current_disposition": (
+            {
+                "physical_id": str(expected_disposition.id),
+                "sequence": expected_disposition.sequence,
+                "disposition": expected_disposition.to_disposition,
+                "event_payload_sha256": (expected_disposition.event_payload_sha256),
+            }
+            if expected_disposition is not None
+            else {
+                "physical_id": None,
+                "sequence": None,
+                "disposition": None,
+                "event_payload_sha256": None,
+            }
+        ),
+        "to_disposition": to_disposition,
+        "reason_code": (
+            default_reason_codes.get(to_disposition, "review_completed")
+            if reason_code is None
+            else reason_code
+        ),
+        "rationale": (
+            f"Synthetic applicability review {suffix}"
+            if rationale is None
+            else rationale
+        ),
     }

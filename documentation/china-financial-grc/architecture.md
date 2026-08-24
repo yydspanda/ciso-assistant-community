@@ -167,20 +167,21 @@ successor decision itself retains its direct predecessor, server cutoff, actor,
 rationale, idempotency binding, and canonical digests. See
 [ADR 0003](adr/0003-bounded-synthetic-applicability-persistence.md).
 
-The full regulatory SQLite suite passes all 41 tests both with migrations
-disabled and through the real project migration graph.
-An independent full-project SQLite migration rehearsal verified 0003 apply,
-empty-history rollback and reapply, and the populated-history reverse guard.
+At the preceding ADR 0003 delivery gate, the full regulatory SQLite suite
+passed all 41 then-existing tests both with migrations disabled and through the
+real project migration graph. An independent full-project SQLite migration
+rehearsal verified 0003 apply, empty-history rollback and reapply, and the
+populated-history reverse guard.
 Django system checks, migration-drift checks, and an independent review
 reporting no critical, high, or medium findings also pass. PostgreSQL apply,
 two-connection lock evidence, representative query plans, backup/restore,
 database-role enforcement, and audit-retention evidence remain external
 production gates.
 
-## Accepted bounded applicability review boundary
+## Implemented bounded applicability review boundary
 
-The accepted next Phase 1 design remains owned by `backend/regulatory` and adds
-no implemented capability yet. It defines an independent append-only
+The bounded Phase 1 implementation remains owned by `backend/regulatory`.
+Additive migration `regulatory.0004` creates an independent append-only
 `RegulatoryApplicabilityReviewDisposition` event stream for a named human to
 review one exact physical `RegulatoryApplicabilityDecision` revision and its
 server-recomputed semantic digest.
@@ -212,7 +213,7 @@ separate view permission and remain entity/folder scoped.
 Reviewer identity additionally follows related-User object IAM; without it the
 read contract masks the actor and discloses no UUID, name, or email.
 
-The accepted transaction reuses the immutable registration folder as its
+The implemented transaction reuses the immutable registration folder as its
 historical IAM boundary and locks:
 
 ```text
@@ -227,15 +228,15 @@ the current coherent chain. Exact idempotent retries may return a historical
 event after later correction or entity movement, but new events require the
 entity to remain in its live synthetic scope.
 
-The document recorded-time floor will include disposition event time. A
+The document recorded-time floor includes disposition event time. A
 decision correction therefore starts after its review history even under host
 clock rollback. Decision d1 dispositions remain on d1; decision d2 derives
 `not_reviewed`. Obligation r1 dispositions cannot appear on r2 because the read
 first selects the exact applicability decision through the physical
 obligation.
 
-The accepted design includes no public review write route. A later
-implementation may add only a separate entity-scoped read action:
+The implementation includes no public review write route. It adds only this
+separate entity-scoped read action:
 
 ```text
 GET /api/regulatory/v1/documents/{uuid}/applicability-review/
@@ -248,8 +249,15 @@ human disposition are returned as separate non-binding fields. The existing
 applicability endpoint remains backward compatible and does not disclose review
 history to custom roles lacking the new disposition-view permission.
 
-The accepted additive migration design, implementation, tests, and PostgreSQL
-evidence remain pending. The durable alternatives, permission matrix, digest/CAS
+The additive migration, internal service, read action, IAM mapping, SQLite
+tests, and empty/populated-history rollback contract are implemented. With
+ADR 0004 included, all 72 regulatory tests pass both with migrations disabled
+and through the real project migration graph. An isolated full-project SQLite
+rehearsal verified 0004 apply, empty rollback/reapply, populated-history reverse
+refusal, and preservation of the applied migration and event after that refusal.
+The PostgreSQL migration, two-connection locking, query-plan, backup/restore,
+least-privilege database-role, and tamper-evident audit evidence remain external
+production gates. The durable alternatives, permission matrix, digest/CAS
 contract, rollback guard, and negative verification cases are in
 [ADR 0004](adr/0004-bounded-synthetic-applicability-review-disposition.md).
 

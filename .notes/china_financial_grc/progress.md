@@ -20,7 +20,7 @@ live in `delivery-roadmap.md`.
 | Official-source metadata packs | Complete for the current non-exhaustive seed; legal review remains unreviewed |
 | Applicability fact registry and deterministic artifact validation | Complete for draft interchange artifacts |
 | Project-level `AGENTS.md`, product skill, architecture skill, roadmap, and progress ledger | Complete and independently forward-tested in this change |
-| Django regulatory persistence, migrations, APIs, and reviewer workflow | Synthetic metadata-only chain, non-binding obligation review, controlled recorded-time correction, current/historical detail retrieval, and one fixed-rule non-binding applicability aggregate implemented and SQLite-tested; independent applicability review-disposition architecture accepted but implementation, source/legal supersession, binding decisions, and UI remain open |
+| Django regulatory persistence, migrations, APIs, and reviewer workflow | Synthetic metadata-only chain, non-binding obligation review, controlled recorded-time correction, current/historical detail retrieval, one fixed-rule non-binding applicability aggregate, and its independent named-human review-disposition stream implemented and SQLite-tested; source/legal supersession, binding decisions, and UI remain open |
 | Reviewed provisions and obligations from the source packs | Not implemented; the end-to-end record is illustrative only |
 | Private internal-policy ingestion and mapping | Not implemented |
 | Read-only production agent, proposal writes, or continuous evidence connectors | Not implemented |
@@ -237,6 +237,55 @@ This gate changed documentation only. No model, migration, service, API, or
 Python source changed, so no backend runtime or migration result is claimed for
 ADR 0004.
 
+Phase 1 bounded applicability review-disposition implementation verification:
+
+```text
+backend/.venv/bin/python backend/manage.py check
+  PASS — no system-check issues
+
+backend/.venv/bin/python backend/manage.py makemigrations regulatory --check --dry-run
+  PASS — no migration drift
+
+backend/.venv/bin/pytest backend/regulatory/tests/test_applicability_review.py \
+  backend/regulatory/tests/test_applicability_review_api.py \
+  backend/regulatory/tests/test_migration_contract.py -q --create-db --no-migrations
+  PASS — 33 focused tests in 173.29 seconds after final formatting
+
+backend/.venv/bin/pytest backend/regulatory/tests -q --create-db --no-migrations
+  PASS — 72 full regulatory model/service/API regression tests in 179.42 seconds
+
+backend/.venv/bin/pytest backend/regulatory/tests -q --create-db
+  PASS — 72 tests against the real migration graph through 0004 in 398.90 seconds
+
+isolated full-project SQLite database: regulatory 0004
+  PASS — fresh apply; empty-history rollback to 0003; reapply to 0004;
+  populated-history reverse refusal; 0004 and its event preserved after refusal
+
+backend/.venv/bin/python tools/china_financial_grc/validate_artifacts.py
+  PASS — 56 facts; 76 documents; 76 versions
+
+backend/.venv/bin/python -m pytest tools/china_financial_grc/tests/test_validate_artifacts.py -q
+  PASS — 25 tests and 12 subtests
+
+scoped pre-commit and Ruff check on changed regulatory files
+  PASS — formatting/whitespace hooks pass; changed regulatory Python has no
+  lint finding (unrelated pre-existing startup.py warnings remain outside scope)
+
+targeted credential, private-path, provider-config, and real-data scan
+  PASS — no key, external-provider config, private local path, messaging-app
+  path, or real
+  institution/customer data in the candidate changes
+
+post-fix independent architecture/security, test/migration, and documentation reviews
+  PASS — no remaining Critical, High, Medium, or Low finding
+```
+
+The implementation adds migration 0004, a full-digest append-only disposition
+stream, exact-head CAS and reviewer-bound idempotency, maker/checker and
+named-human enforcement, a document-wide monotonic recorded-time floor, and an
+entity-scoped read-only action with related-User masking. All local close-out
+gates above pass; PostgreSQL and operations evidence remains external.
+
 ## Current limitations and risks
 
 1. **Metadata is not reviewed law.** Source records are metadata-only discovery
@@ -245,11 +294,11 @@ ADR 0004.
    synthetic metadata-only Document/Version/Provision/Obligation chain,
    non-binding obligation review events, controlled recorded-time correction,
    coherent current/historical detail retrieval, and one append-only fixed-rule
-   applicability aggregate. The applicability result is draft and non-binding;
-   its independent named-human review-disposition design is accepted but has no
-   model, migration, service, or API yet. There is still no source/legal-version
-   supersession, binding DecisionRecord, reviewer UI, approval/publication,
-   source-text intake, or real source ingestion.
+   applicability aggregate plus its independent append-only named-human review
+   dispositions. Both remain synthetic, draft/non-binding, internal-write-only,
+   and unpublished. There is still no source/legal-version supersession,
+   binding DecisionRecord, reviewer UI, approval/publication, source-text
+   intake, or real source ingestion.
 3. **No real pilot entity facts.** Only bounded synthetic entity facts have been
    exercised. Public artifacts cannot decide applicability for a real
    institution, licence, product, customer, data flow, or system.
@@ -276,15 +325,15 @@ ADR 0004.
 
 ## Current next action
 
-Implement the accepted ADR 0004 bounded
-`RegulatoryApplicabilityReviewDisposition` persistence, atomic named-human
-transition service, permissions, additive migration, and separate entity-
-scoped read-only action. Preserve exact decision/digest CAS, append-only event
-history, maker/checker separation, immutable folder IAM, related-user masking,
-recorded-time isolation, and populated-history reverse refusal. Do not add
-publication, a binding DecisionRecord, real institution facts, source text,
-public mutation APIs, a reviewer UI, source/legal supersession, library
-projection, or an agent in that implementation slice.
+Complete the external database and operations acceptance for the bounded ADR
+0004 implementation: PostgreSQL migration, two-connection lock linearisation,
+representative current/history query plans, backup/restore, least-privilege
+database roles, tamper-evident retention, and explicit audit-export privacy for
+reviewer identity and rationale. Do not start a real-fact pilot until named
+business/legal owners, source rights, a gold set, and data-location/retention
+approval exist; do not add publication, a binding DecisionRecord, public
+mutation APIs, reviewer UI, source/legal supersession, library projection, or
+an agent as a shortcut around those gates.
 
 ## Near-term backlog
 
@@ -297,13 +346,41 @@ projection, or an agent in that implementation slice.
 | P0 | Source/legal-version supersession | Reviewed source evidence and legal lifecycle contract | Pending; separate from recorded correction |
 | P0 | One versioned fact snapshot and deterministic non-binding applicability decision | Stable bitemporal correction semantics | Complete for current fixed-rule synthetic slice |
 | P0 | Independent append-only named-human applicability review-disposition contract and architecture gate | Exact applicability revision identity, digest, IAM, and temporal semantics | Complete |
-| P0 | Implement bounded applicability review-disposition model, service, permissions, migration, and read action | Accepted ADR 0004 | Next |
+| P0 | Implement bounded applicability review-disposition model, service, permissions, migration, and read action | Accepted ADR 0004 | Complete for current synthetic slice |
+| P0 | PostgreSQL concurrency, query-plan, rollback, backup/restore, least-privilege, retention, and audit-export acceptance | Implemented ADR 0004 slice | Pending external environment/owners |
 | P0 | Small human-reviewed pilot source set | Named reviewer and source rights | Blocked on external ownership |
 | P1 | Reviewer UI/admin workflow | Stable API and review contract | Pending |
 | P1 | Internal-policy/private overlay model | Published obligation model and privacy design | Later Phase 2 |
 | P1 | Read-only source/explanation agent evaluation | Reviewed knowledge and gold set | Later Phase 3 |
 
 ## Activity log
+
+### 2026-08-24 — Implemented bounded applicability review disposition
+
+- Added `RegulatoryApplicabilityReviewDisposition` and additive migration 0004
+  for an append-only, exact-decision, named-human event stream. The model binds
+  copied decision-maker/digest snapshots, predecessor/sequence, controlled
+  reason/rationale, server time, reviewer-bound request digest, complete event
+  digest, fixed non-binding/unpublished markers, and protected history.
+- Added an atomic internal exact-head CAS service with immutable registration-
+  folder IAM, maker/checker and service-account rejection, historical exact
+  retry before live-state checks, current exact-parent validation, semantic
+  no-op rejection, and document-wide monotonic recorded time.
+- Added a separate entity-scoped `applicability-review` GET action. It selects
+  the exact applicability decision and latest disposition at one recorded
+  timestamp, keeps `computed_non_binding_result` separate from human
+  `review_state`, masks reviewer identity through related-User IAM, never emits
+  email, and exposes no public review mutation method.
+- The focused suite passed 33/33, and the full regulatory suite passed 72/72
+  both without migrations and through the real migration graph. Django checks,
+  migration drift, artifact validation, fresh 0004 apply, empty rollback/reapply,
+  populated reverse refusal, and post-refusal preservation also passed. Scoped
+  pre-commit, changed-file Ruff, sensitive-information scanning, and independent
+  architecture/security, test/migration, and documentation reviews found no
+  remaining Critical, High, Medium, or Low issue.
+- This remains a synthetic, draft, non-binding operational record check. It is
+  not legal approval, evidence authentication, publication, applicability for a
+  real institution, Phase 1 completion, UI delivery, or an agent.
 
 ### 2026-08-24 — Accepted applicability review-disposition architecture
 

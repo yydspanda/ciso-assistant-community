@@ -133,13 +133,13 @@ public surface is limited to the entity-scoped, read-only document action:
 GET /api/regulatory/v1/documents/{uuid}/applicability/?entity=<uuid>&recorded_as_of=<aware-RFC-3339>
 ```
 
-Migration `regulatory.0003` adds the decision table without a data backfill.
-The full regulatory SQLite suite passes all 41 tests both with migrations
-disabled and through the real project migration graph.
-An independent full-project SQLite migration rehearsal verified 0003 apply,
+Migration `regulatory.0003` adds the decision table without a data backfill. At
+that delivery gate, all 41 then-existing regulatory tests passed both with
+migrations disabled and through the real project migration graph. An
+independent full-project SQLite migration rehearsal verified 0003 apply,
 empty-history rollback and reapply, and refusal to reverse after a synthetic
 decision was inserted. Django system checks, migration-drift checks, and an
-independent review reporting no critical, high, or medium findings also pass.
+independent review reporting no critical, high, or medium findings also passed.
 
 This bounded implementation remains draft, non-binding, unpublished, and
 synthetic. It has separate view and internal record permissions and no public
@@ -154,21 +154,29 @@ contract and migration guard. PostgreSQL apply, two-connection lock evidence,
 representative query plans, backup/restore, database-role enforcement, and
 audit-retention evidence remain external production gates.
 
-The accepted next architecture design adds no runtime capability. It defines a
-separate append-only `RegulatoryApplicabilityReviewDisposition` stream for a
+The bounded implementation also adds a separate append-only
+`RegulatoryApplicabilityReviewDisposition` stream for a
 second named human to record `no_correction_requested`,
 `correction_requested`, or `unable_to_complete` against one exact physical
 decision and its recomputed semantic digest. Absence of an event derives
 `not_reviewed`; every decision successor starts there and inherits no earlier
 disposition.
 
-The design separates record and review authority: Analyst and Domain Manager
+The implementation separates record and review authority: Analyst and Domain Manager
 may record the synthetic decision but cannot review it; Approver may review but
 cannot record it; Administrator may hold both permissions but cannot review a
-decision they recorded. Service accounts are excluded. A future implementation
-would remain internal-write-only and add a separate entity-scoped read action,
-not a public mutation route. None of the dispositions changes the computed
-result, creates a legal conclusion, approves evidence, enables publication or
+decision they recorded. Service accounts are excluded. Mutation remains an
+internal domain service, while a separate entity-scoped GET exposes only the
+same-time exact-decision review state with reviewer IAM masking; there is no
+public mutation route. None of the dispositions changes the computed result,
+creates a legal conclusion, approves evidence, enables publication or
 projection, or resolves a `needs_review` fact. See
 [ADR 0004](adr/0004-bounded-synthetic-applicability-review-disposition.md) for
-the accepted contract and pending implementation gates.
+the accepted contract and remaining production gates.
+
+With the review-disposition slice included, all 72 regulatory tests pass both
+with migrations disabled and through the real project migration graph. A fresh
+isolated full-project SQLite rehearsal verified 0004 apply, empty rollback and
+reapply, refusal to reverse populated review history, and preservation of the
+applied migration and recorded event after that refusal. These local results do
+not satisfy the PostgreSQL, operations, legal-review, or real-pilot gates.

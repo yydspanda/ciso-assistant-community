@@ -40,6 +40,7 @@ from .common import (
 from .records import (
     RegulatoryChain,
     _provenance_fields,
+    lock_current_regulatory_chain,
     regulatory_document_recorded_floor,
 )
 
@@ -325,45 +326,6 @@ def _chain_from_event(
     )
 
 
-def _lock_current_chain(
-    *,
-    registration: EntityDocumentRegistration,
-    folder: Folder,
-) -> RegulatoryChain:
-    document = RegulatoryDocument.objects.select_for_update().get(
-        pk=registration.document_id,
-        folder=folder,
-    )
-    version = RegulatoryDocumentVersion.objects.select_for_update().get(
-        document=document,
-        folder=folder,
-        recorded_to__isnull=True,
-    )
-    provision = RegulatoryProvision.objects.select_for_update().get(
-        document_version=version,
-        folder=folder,
-        recorded_to__isnull=True,
-    )
-    obligation = RegulatoryObligation.objects.select_for_update().get(
-        provision_links__provision=provision,
-        provision_links__folder=folder,
-        folder=folder,
-        recorded_to__isnull=True,
-    )
-    RegulatoryObligationProvision.objects.select_for_update().get(
-        folder=folder,
-        provision=provision,
-        obligation=obligation,
-    )
-    return RegulatoryChain(
-        registration=registration,
-        document=document,
-        document_version=version,
-        provision=provision,
-        obligation=obligation,
-    )
-
-
 @transaction.atomic
 def correct_regulatory_chain(
     *,
@@ -438,7 +400,10 @@ def correct_regulatory_chain(
             chain=_chain_from_event(registration=registration, event=existing),
         )
 
-    current = _lock_current_chain(registration=registration, folder=folder)
+    current = lock_current_regulatory_chain(
+        registration=registration,
+        folder=folder,
+    )
     before_payload = _audit_payload(
         version=current.document_version,
         provision=current.provision,

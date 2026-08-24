@@ -10,10 +10,11 @@ description: Proposed trust boundaries and information flow for the China financ
 
 > **Current Phase 1 subset:** the regulatory layer persists one synthetic,
 > metadata-only Document -> Version -> Provision -> Obligation chain plus one
-> append-only applicability-decision aggregate. Its public API is read-only.
-> Applicability remains draft, non-binding, unpublished, and limited to a fixed
-> rule and synthetic observations. Legal supersession, approval/publication,
-> source text, real-institution facts, projections, and agents remain proposed.
+> append-only applicability-decision aggregate and its independent named-human
+> review-disposition stream. Its public API is read-only. Applicability and its
+> review remain draft, non-binding, unpublished, and limited to a fixed rule and
+> synthetic observations. Legal supersession, approval/publication, source text,
+> real-institution facts, projections, and agents remain proposed.
 
 ```mermaid
 flowchart LR
@@ -92,23 +93,23 @@ to `needs_review`.
 This implementation does not add a general ApplicabilityRule approval lifecycle,
 binding legal decisions, confirmation/publication, real institution facts,
 source text, agents, or library projections. Migration `regulatory.0003` adds
-the table without a data backfill. The full regulatory SQLite suite passes all
-41 tests both with migrations disabled and through the real project migration
-graph; an independent full-project SQLite migration rehearsal verified 0003
-apply, empty-history rollback/reapply, and populated-history reverse refusal.
-Django checks, migration-drift checks, and an independent review reporting no
-critical, high, or medium findings also pass.
+the table without a data backfill. At that delivery gate, all 41 then-existing
+regulatory tests passed both with migrations disabled and through the real
+project migration graph; an independent full-project SQLite migration rehearsal
+verified 0003 apply, empty-history rollback/reapply, and populated-history
+reverse refusal. Django checks, migration-drift checks, and an independent
+review reporting no critical, high, or medium findings also passed.
 
 PostgreSQL apply, two-connection lock evidence, representative query plans,
 backup/restore, database-role enforcement, and audit-retention evidence remain
 external production gates. The durable design and alternatives are in
 [ADR 0003](../../../documentation/china-financial-grc/adr/0003-bounded-synthetic-applicability-persistence.md).
 
-## Accepted applicability review-disposition contract
+## Implemented applicability review-disposition contract
 
-The accepted next architecture design defines, but does not yet implement, one
-independent append-only review-disposition stream for the exact synthetic
-applicability decision and its semantic digest. Its only persisted targets are
+The bounded implementation adds one independent append-only review-disposition
+stream for the exact synthetic applicability decision and its semantic digest.
+Its only persisted targets are
 `no_correction_requested`, `correction_requested`, and
 `unable_to_complete`; no event derives or overrides the computed applicability
 result. Absence of an event derives the initial `not_reviewed` state.
@@ -126,8 +127,7 @@ their exact decision revision. A small predecessor/sequence stream lets a
 reviewer append a correction to a mistaken prior disposition without deleting
 audit history.
 
-A future implementation remains public-read-only and may add this separate
-action:
+The public surface remains read-only and adds this separate action:
 
 ```text
 GET /api/regulatory/v1/documents/{uuid}/applicability-review/
@@ -139,8 +139,14 @@ latest authorised disposition at the same recorded time. The response keeps
 `computed_non_binding_result`, human disposition, `legal_conclusion: false`,
 and `is_binding: false` separate. There is no public review write, approval,
 publication, real institution fact, workflow UI, projection, or agent in this
-design. Implementation, migration, SQLite, and PostgreSQL verification remain
-pending; the exact contract and alternatives are in
+slice. Migration `regulatory.0004`, the internal named-human recording service,
+separate view/review permissions, related-user masking, and this read action are
+implemented. With this slice included, all 72 regulatory tests pass both with
+migrations disabled and through the real project migration graph. An isolated
+full-project SQLite rehearsal verified 0004 apply, empty rollback/reapply,
+populated-history reverse refusal, and post-refusal preservation. PostgreSQL,
+operations, legal-review, and real-pilot verification remain external gates;
+the exact contract and alternatives are in
 [ADR 0004](../../../documentation/china-financial-grc/adr/0004-bounded-synthetic-applicability-review-disposition.md).
 
 ## Trust boundaries

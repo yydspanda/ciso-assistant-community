@@ -227,3 +227,51 @@ class RegulatoryApplicabilityPayload(TypedDict):
     valid_from: str | None
     valid_to: str | None
     provenance: RegulatoryProvenancePayload
+
+
+RegulatoryApplicabilityPersistedReviewDisposition = Literal[
+    "no_correction_requested",
+    "correction_requested",
+    "unable_to_complete",
+]
+
+RegulatoryApplicabilityReviewReasonCode = Literal[
+    "review_completed",
+    "fact_correction_required",
+    "evidence_correction_required",
+    "provenance_correction_required",
+    "scope_or_parent_correction_required",
+    "other_correction_required",
+    "insufficient_evidence",
+    "conflicting_information",
+    "insufficient_authority_or_scope",
+    "other_unresolved",
+]
+
+
+class RegulatoryApplicabilityReviewExpectedDecisionPayload(TypedDict):
+    physical_id: str
+    record_id: str
+    revision: int
+    semantic_payload_sha256: str
+
+
+class RegulatoryApplicabilityReviewExpectedDispositionPayload(TypedDict):
+    """All fields are present and either all null or all populated."""
+
+    physical_id: str | None
+    sequence: int | None
+    disposition: RegulatoryApplicabilityPersistedReviewDisposition | None
+    event_payload_sha256: str | None
+
+
+class RegulatoryApplicabilityReviewPayload(TypedDict):
+    """Exact-head CAS command; actor, time, and authority markers are server-owned."""
+
+    expected_decision: RegulatoryApplicabilityReviewExpectedDecisionPayload
+    expected_current_disposition: (
+        RegulatoryApplicabilityReviewExpectedDispositionPayload
+    )
+    to_disposition: RegulatoryApplicabilityPersistedReviewDisposition
+    reason_code: RegulatoryApplicabilityReviewReasonCode
+    rationale: str

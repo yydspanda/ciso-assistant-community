@@ -1,8 +1,9 @@
 # ADR 0004: bounded synthetic applicability review disposition
 
-- Status: Accepted for the next Phase 1 implementation slice
-- Implementation status: Accepted design only; no model, migration, service,
-  or API change is implemented by this ADR
+- Status: Accepted and implemented for the bounded Phase 1 synthetic slice
+- Implementation status: Implemented by additive migration `regulatory.0004`,
+  an internal named-human recording service, and a separate read-only action;
+  production database and operational gates remain open
 - Date: 2026-08-24
 - Scope: named-human review of one exact synthetic applicability-decision
   revision
@@ -162,7 +163,7 @@ rather than silently changing old hashes.
 
 ### Human authority and permission matrix
 
-The internal transition service requires an active authenticated named human.
+The internal recording service requires an active authenticated named human.
 A service account cannot act as the reviewer. The reviewer must differ from
 the exact decision's `recorded_by` actor even when one user holds several
 roles. This is the bounded maker/checker rule: the person who recorded the fact
@@ -178,7 +179,7 @@ The accepted permissions remain independent:
 
 - `view_regulatoryapplicabilityreviewdisposition` controls access to reviewer
   identity, rationale, and disposition history; and
-- `review_regulatoryapplicability` controls the internal transition service.
+- `review_regulatoryapplicability` controls the internal recording service.
 
 | Built-in role | View decision | View disposition | Record/correct decision | Review disposition |
 | --- | --- | --- | --- | --- |
@@ -243,8 +244,8 @@ an alternate decision-write path.
 
 ### Read contract remains additive and mutation remains internal
 
-There is no public review POST, PATCH, PUT, or DELETE route. A later
-implementation may add a separate entity-scoped read-only action:
+There is no public review POST, PATCH, PUT, or DELETE route. The implementation
+adds this separate entity-scoped read-only action:
 
 ```text
 GET /api/regulatory/v1/documents/{uuid}/applicability-review/
@@ -287,9 +288,9 @@ computed result is not `needs_review`, and the latest disposition is
 Neither value grants authority or changes the fixed legal/binding markers. No
 list, document-detail, or original applicability route enumerates review state.
 
-### Accepted constraints and indexes
+### Implemented constraints and indexes
 
-An implementation migration must include at least:
+Migration `regulatory.0004` includes:
 
 - unique `(decision, sequence)` identity;
 - a partial unique constraint on `decision` where predecessor is null, giving
@@ -369,9 +370,9 @@ both the original and its correction.
 
 ## Contracts and migration
 
-The accepted future migration `0004` is additive. It will create the review-
-disposition table, indexes, constraints, and separate view/review permissions
-without altering or backfilling migrations 0001 through 0003. Existing
+Migration `0004` is additive. It creates the review-disposition table, indexes,
+constraints, and separate view/review permissions without altering or
+backfilling migrations 0001 through 0003. Existing
 applicability decisions derive `not_reviewed` from the absence of dispositions.
 
 The migration must reverse cleanly while the event table is empty. A reverse
@@ -411,9 +412,14 @@ Before reporting implementation complete, verify at least:
   linearisation, representative current/historical query plans, backup/restore,
   least-privilege database roles, and audit-retention controls.
 
-Architecture acceptance does not satisfy these implementation or production
-gates. It does not establish legal review, a real pilot, Phase 1 completion, or
-customer acceptance.
+The bounded implementation has passed local Django system and migration-drift
+checks. Its 33-test focused review/migration-contract suite passes, and all 72
+regulatory tests pass both with migrations disabled and through the real
+project migration graph. An isolated full-project SQLite rehearsal verified
+0004 apply, empty rollback/reapply, populated-history reverse refusal, and
+post-refusal preservation. Those results do not satisfy the remaining
+PostgreSQL, operational, legal-review, real-pilot, Phase 1 completion, or
+customer-acceptance gates.
 
 ## Product measures for a future reviewed pilot
 

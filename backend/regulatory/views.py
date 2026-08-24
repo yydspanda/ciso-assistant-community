@@ -17,10 +17,14 @@ from tprm.models import Entity
 from .models import RegulatoryDocument
 from .serializers import (
     RegulatoryApplicabilityDecisionReadSerializer,
+    RegulatoryApplicabilityReviewDispositionReadSerializer,
     RegulatoryDocumentDetailSerializer,
     RegulatoryDocumentReadSerializer,
 )
-from .services.applicability import get_regulatory_applicability
+from .services import (
+    get_regulatory_applicability,
+    get_regulatory_applicability_review,
+)
 from .services.records import (
     RegulatoryRecordedStateUnavailable,
     regulatory_document_recorded_floor,
@@ -58,7 +62,11 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
         request_time = (
             max(wall_time, recorded_floor) if recorded_floor is not None else wall_time
         )
-        if getattr(self, "action", None) not in {"retrieve", "applicability"}:
+        if getattr(self, "action", None) not in {
+            "retrieve",
+            "applicability",
+            "applicability_review",
+        }:
             if values:
                 raise ValidationError(
                     {
@@ -92,6 +100,7 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
         if getattr(self, "action", None) not in {
             "retrieve",
             "applicability",
+            "applicability_review",
         } and self.request.query_params.getlist("recorded_as_of"):
             self._selection_time()
         return super().get_queryset()
@@ -130,11 +139,9 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
             data = self._filter_related_fields(data, field_models, allowed_ids)
         return Response(data)
 
-    @action(detail=True, methods=["get"], url_path="applicability")
-    def applicability(self, request, *args, **kwargs):
-        """Read one explicitly entity-scoped, non-binding applicability result."""
+    def _applicability_scope_and_time(self, request):
+        """Validate the shared, explicit entity and recorded-time query scope."""
 
-        document = self.get_object()
         entity_values = request.query_params.getlist("entity")
         if len(entity_values) != 1 or not entity_values[0].strip():
             raise ValidationError(
@@ -159,6 +166,14 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
                 raise ValidationError(
                     {"recorded_as_of": ("Use a timezone-aware RFC 3339 date-time.")}
                 )
+        return entity, requested_recorded_as_of
+
+    @action(detail=True, methods=["get"], url_path="applicability")
+    def applicability(self, request, *args, **kwargs):
+        """Read one explicitly entity-scoped, non-binding applicability result."""
+
+        document = self.get_object()
+        entity, requested_recorded_as_of = self._applicability_scope_and_time(request)
 
         try:
             selection = get_regulatory_applicability(
@@ -220,5 +235,86 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
                     else "no_decision_for_selected_obligation_revision"
                 ),
                 "decision": decision_data,
+            }
+        )
+
+    @action(detail=True, methods=["get"], url_path="applicability-review")
+    def applicability_review(self, request, *args, **kwargs):
+        """Read the human disposition of one exact non-binding decision revision."""
+
+        document = self.get_object()
+        entity, requested_recorded_as_of = self._applicability_scope_and_time(request)
+        try:
+            selection = get_regulatory_applicability_review(
+                actor=request.user,
+                entity=entity,
+                document_id=document.id,
+                recorded_as_of=requested_recorded_as_of,
+            )
+        except RegulatoryRecordedStateUnavailable as exc:
+            raise NotFound(
+                "No coherent applicability review state exists for this scope and time."
+            ) from exc
+        except DjangoValidationError as exc:
+            if hasattr(exc, "message_dict") and "recorded_as_of" in exc.message_dict:
+                raise ValidationError(exc.message_dict) from exc
+            raise NotFound(
+                "No coherent applicability review state exists for this scope and time."
+            ) from exc
+        except (ObjectDoesNotExist, MultipleObjectsReturned) as exc:
+            raise NotFound(
+                "No coherent applicability review state exists for this scope and time."
+            ) from exc
+
+        applicability = selection.applicability
+        decision_data = None
+        if applicability.decision is not None:
+            decision_data = RegulatoryApplicabilityDecisionReadSerializer(
+                applicability.decision,
+                context={"request": request},
+            ).data
+
+        disposition_data = None
+        if selection.disposition is not None:
+            disposition_data = RegulatoryApplicabilityReviewDispositionReadSerializer(
+                selection.disposition,
+                context={
+                    "request": request,
+                    "reviewer_reference": selection.reviewer,
+                },
+            ).data
+
+        return Response(
+            {
+                "contract_status": "draft",
+                "legal_conclusion": False,
+                "is_binding": False,
+                "scope": {
+                    "type": "legal_entity",
+                    "id": str(entity.id),
+                },
+                "document_id": str(document.id),
+                "obligation_id": applicability.chain.obligation.record_id,
+                "obligation_revision": applicability.chain.obligation.revision,
+                "recorded_as_of": (
+                    requested_recorded_as_of.isoformat()
+                    if requested_recorded_as_of is not None
+                    else None
+                ),
+                "selected_recorded_at": applicability.recorded_as_of.isoformat(),
+                "evaluation_status": (
+                    "evaluated"
+                    if applicability.decision is not None
+                    else "not_evaluated"
+                ),
+                "computed_non_binding_result": (
+                    applicability.decision.result
+                    if applicability.decision is not None
+                    else "needs_review"
+                ),
+                "decision": decision_data,
+                "review_state": selection.review_state,
+                "workflow_attention": selection.workflow_attention,
+                "latest_disposition": disposition_data,
             }
         )

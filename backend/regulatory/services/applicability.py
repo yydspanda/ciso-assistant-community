@@ -579,7 +579,7 @@ def _locked_scope(
     ):
         raise PermissionDenied("The actor cannot view the applicability entity.")
     registration = (
-        EntityDocumentRegistration.objects.select_for_update()
+        EntityDocumentRegistration.objects.select_for_update(of=("self",))
         .select_related("document", "entity")
         .get(
             folder=folder,
@@ -679,7 +679,7 @@ def record_regulatory_applicability_decision(
         }
     )
     existing = (
-        RegulatoryApplicabilityDecision.objects.select_for_update()
+        RegulatoryApplicabilityDecision.objects.select_for_update(of=("self",))
         .select_related(
             "folder",
             "registration__document",
@@ -740,7 +740,7 @@ def record_regulatory_applicability_decision(
         )
 
     current_rows = list(
-        RegulatoryApplicabilityDecision.objects.select_for_update()
+        RegulatoryApplicabilityDecision.objects.select_for_update(of=("self",))
         .select_related(
             "registration__document",
             "registration__entity",
@@ -966,3 +966,11 @@ def get_regulatory_applicability(
         decision=decision,
         recorded_as_of=selected_at,
     )
+
+
+# Package-internal shared contracts for the independent review-disposition
+# service. Keeping one scope, digest, and historical-chain implementation avoids
+# a second authority path while leaving the public service exports bounded.
+lock_regulatory_applicability_scope = _locked_scope
+validate_persisted_regulatory_applicability_decision = _validate_persisted_decision
+regulatory_chain_for_applicability_decision = _chain_for_decision

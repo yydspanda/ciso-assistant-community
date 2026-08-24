@@ -21,6 +21,7 @@ from regulatory.contracts import RegulatoryChainPayload
 from regulatory.models import (
     EntityDocumentRegistration,
     RegulatoryApplicabilityDecision,
+    RegulatoryApplicabilityReviewDisposition,
     RegulatoryDocument,
     RegulatoryDocumentVersion,
     RegulatoryObligation,
@@ -402,13 +403,68 @@ def regulatory_document_recorded_floor(
         registration__document=document,
         obligation__folder=folder,
     ).aggregate(value=Max("recorded_from"))["value"]
+    applicability_review_floor = (
+        RegulatoryApplicabilityReviewDisposition.objects.filter(
+            folder=folder,
+            decision__folder=folder,
+            decision__registration__folder=folder,
+            decision__registration__document=document,
+            decision__obligation__folder=folder,
+        ).aggregate(value=Max("occurred_at"))["value"]
+    )
     return max(
         (
             value
-            for value in (version_floor, review_floor, applicability_floor)
+            for value in (
+                version_floor,
+                review_floor,
+                applicability_floor,
+                applicability_review_floor,
+            )
             if value is not None
         ),
         default=None,
+    )
+
+
+def lock_current_regulatory_chain(
+    *,
+    registration: EntityDocumentRegistration,
+    folder: Folder,
+) -> RegulatoryChain:
+    """Lock one current physical chain after its registration and folder are locked."""
+
+    document = RegulatoryDocument.objects.select_for_update().get(
+        pk=registration.document_id,
+        folder=folder,
+    )
+    version = RegulatoryDocumentVersion.objects.select_for_update().get(
+        document=document,
+        folder=folder,
+        recorded_to__isnull=True,
+    )
+    provision = RegulatoryProvision.objects.select_for_update().get(
+        document_version=version,
+        folder=folder,
+        recorded_to__isnull=True,
+    )
+    obligation = RegulatoryObligation.objects.select_for_update().get(
+        provision_links__provision=provision,
+        provision_links__folder=folder,
+        folder=folder,
+        recorded_to__isnull=True,
+    )
+    RegulatoryObligationProvision.objects.select_for_update().get(
+        folder=folder,
+        provision=provision,
+        obligation=obligation,
+    )
+    return RegulatoryChain(
+        registration=registration,
+        document=document,
+        document_version=version,
+        provision=provision,
+        obligation=obligation,
     )
 
 

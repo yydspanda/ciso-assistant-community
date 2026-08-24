@@ -5,6 +5,7 @@ from core.serializers import BaseModelSerializer
 
 from .models import (
     RegulatoryApplicabilityDecision,
+    RegulatoryApplicabilityReviewDisposition,
     RegulatoryDocument,
     RegulatoryDocumentVersion,
     RegulatoryObligation,
@@ -65,6 +66,59 @@ class RegulatoryApplicabilityDecisionReadSerializer(serializers.ModelSerializer)
 
     def get_legal_conclusion(self, obj: RegulatoryApplicabilityDecision) -> bool:
         return False
+
+
+class RegulatoryApplicabilityReviewDispositionReadSerializer(
+    serializers.ModelSerializer
+):
+    """Read one review event without serializing its related User directly."""
+
+    reviewer = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RegulatoryApplicabilityReviewDisposition
+        fields = [
+            "id",
+            "sequence",
+            "from_disposition",
+            "to_disposition",
+            "reason_code",
+            "rationale",
+            "occurred_at",
+            "digest_profile",
+            "decision_semantic_payload_sha256",
+            "event_payload_sha256",
+            "reviewer",
+        ]
+
+    def get_reviewer(
+        self,
+        obj: RegulatoryApplicabilityReviewDisposition,
+    ) -> dict:
+        """Return the service-authorized minimal reviewer reference.
+
+        The service performs related-User object IAM. This serializer deliberately
+        does not use ``FieldsRelatedField`` because its implicit ``str(User)`` can
+        fall back to an email address when a user has no display name.
+        """
+
+        reference = self.context.get("reviewer_reference")
+        if reference is None or reference.masked or reference.id is None:
+            return {"masked": True}
+
+        display_name = reference.display_name
+        if isinstance(display_name, str):
+            display_name = display_name.strip() or None
+            # Fail closed if an upstream display fallback ever supplies an email.
+            if display_name is not None and "@" in display_name:
+                display_name = None
+        else:
+            display_name = None
+        return {
+            "masked": False,
+            "id": str(reference.id),
+            "display_name": display_name,
+        }
 
 
 class RegulatoryObligationReadSerializer(serializers.ModelSerializer):

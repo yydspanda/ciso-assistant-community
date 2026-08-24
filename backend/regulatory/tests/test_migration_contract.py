@@ -1,6 +1,9 @@
+from importlib import import_module
+from types import SimpleNamespace
+
 import pytest
 from django.contrib.auth.models import Permission
-from django.db import connection
+from django.db import connection, migrations
 
 from core.startup import (
     ADMINISTRATOR_PERMISSIONS_LIST,
@@ -10,6 +13,52 @@ from core.startup import (
     READER_PERMISSIONS_LIST,
 )
 from iam.models import ALLOWED_PERMISSION_APPS
+
+
+def test_applicability_review_reverse_guard_is_last_and_refuses_history():
+    migration_module = import_module(
+        "regulatory.migrations.0004_regulatoryapplicabilityreviewdisposition"
+    )
+    last_operation = migration_module.Migration.operations[-1]
+    assert isinstance(last_operation, migrations.RunPython)
+    assert (
+        last_operation.reverse_code
+        is migration_module.refuse_reverse_with_applicability_review_history
+    )
+
+    class HistoricalReviewManager:
+        def __init__(self, populated):
+            self.populated = populated
+
+        def using(self, alias):
+            assert alias == "migration-test"
+            return self
+
+        def exists(self):
+            return self.populated
+
+    class HistoricalReview:
+        objects = HistoricalReviewManager(populated=True)
+
+    class HistoricalApps:
+        @staticmethod
+        def get_model(app_label, model_name):
+            assert app_label == "regulatory"
+            assert model_name == "RegulatoryApplicabilityReviewDisposition"
+            return HistoricalReview
+
+    schema_editor = SimpleNamespace(connection=SimpleNamespace(alias="migration-test"))
+    with pytest.raises(RuntimeError, match="retain migration 0004"):
+        migration_module.refuse_reverse_with_applicability_review_history(
+            HistoricalApps(),
+            schema_editor,
+        )
+
+    HistoricalReview.objects = HistoricalReviewManager(populated=False)
+    migration_module.refuse_reverse_with_applicability_review_history(
+        HistoricalApps(),
+        schema_editor,
+    )
 
 
 @pytest.mark.django_db
@@ -25,6 +74,7 @@ def test_initial_migration_tables_constraints_and_permissions_exist(regulatory_r
         "regulatory_regulatoryobligationreviewevent",
         "regulatory_regulatorychaincorrectionevent",
         "regulatory_regulatoryapplicabilitydecision",
+        "regulatory_regulatoryapplicabilityreviewdisposition",
     }
     assert expected_tables <= tables
 
@@ -130,13 +180,52 @@ def test_initial_migration_tables_constraints_and_permissions_exist(regulatory_r
         "regulatoryapplicabilitydecision"
     )
 
+    with connection.cursor() as cursor:
+        applicability_review_constraints = connection.introspection.get_constraints(
+            cursor,
+            "regulatory_regulatoryapplicabilityreviewdisposition",
+        )
+    for name in (
+        "reg_app_rev_dec_time_idx",
+        "reg_app_rev_dec_seq_uniq",
+        "reg_app_rev_one_root",
+        "reg_app_rev_prev_uniq",
+        "reg_app_rev_idem_uniq",
+        "reg_app_rev_seq_pos",
+        "reg_app_rev_root_succ",
+        "reg_app_rev_reason_target",
+        "reg_app_rev_rationale",
+        "reg_app_rev_idem_present",
+        "reg_app_rev_digest_profile",
+        "reg_app_rev_nonbinding",
+        "reg_app_rev_not_published",
+        "reg_app_rev_actor_separate",
+        "reg_app_rev_prev_not_self",
+    ):
+        assert name in applicability_review_constraints
+
+    applicability_review_permissions = Permission.objects.filter(
+        content_type__app_label="regulatory",
+        content_type__model="regulatoryapplicabilityreviewdisposition",
+    )
+    assert set(applicability_review_permissions.values_list("codename", flat=True)) == {
+        "view_regulatoryapplicabilityreviewdisposition",
+        "review_regulatoryapplicability",
+    }
+
 
 def test_builtin_roles_keep_regulatory_write_authority_bounded():
     assert "view_regulatorydocument" in READER_PERMISSIONS_LIST
     assert "view_regulatoryapplicabilitydecision" not in READER_PERMISSIONS_LIST
+    assert (
+        "view_regulatoryapplicabilityreviewdisposition" not in READER_PERMISSIONS_LIST
+    )
+    assert "review_regulatoryapplicability" not in READER_PERMISSIONS_LIST
     assert "record_regulatoryapplicability" not in READER_PERMISSIONS_LIST
     assert "view_regulatorydocument" in APPROVER_PERMISSIONS_LIST
     assert "view_regulatoryapplicabilitydecision" in APPROVER_PERMISSIONS_LIST
+    assert "view_regulatoryapplicabilityreviewdisposition" in APPROVER_PERMISSIONS_LIST
+    assert "review_regulatoryapplicability" in APPROVER_PERMISSIONS_LIST
     assert "view_entity" in APPROVER_PERMISSIONS_LIST
     assert "record_regulatoryapplicability" not in APPROVER_PERMISSIONS_LIST
     for permissions in (
@@ -145,13 +234,20 @@ def test_builtin_roles_keep_regulatory_write_authority_bounded():
     ):
         assert "view_regulatorydocument" in permissions
         assert "view_regulatoryapplicabilitydecision" in permissions
+        assert "view_regulatoryapplicabilityreviewdisposition" in permissions
         assert "record_regulatoryapplicability" in permissions
+        assert "review_regulatoryapplicability" not in permissions
         assert "ingest_regulatoryrecord" in permissions
         assert "correct_regulatoryrecord" in permissions
         assert "transition_regulatoryobligation" in permissions
         assert "legal_review_regulatoryobligation" not in permissions
     assert "view_regulatorydocument" in ADMINISTRATOR_PERMISSIONS_LIST
     assert "view_regulatoryapplicabilitydecision" in ADMINISTRATOR_PERMISSIONS_LIST
+    assert (
+        "view_regulatoryapplicabilityreviewdisposition"
+        in ADMINISTRATOR_PERMISSIONS_LIST
+    )
+    assert "review_regulatoryapplicability" in ADMINISTRATOR_PERMISSIONS_LIST
     assert "record_regulatoryapplicability" in ADMINISTRATOR_PERMISSIONS_LIST
     assert "ingest_regulatoryrecord" in ADMINISTRATOR_PERMISSIONS_LIST
     assert "correct_regulatoryrecord" in ADMINISTRATOR_PERMISSIONS_LIST

@@ -145,14 +145,14 @@ internal service guarded by `record_regulatoryapplicability`; no public write,
 confirmation, approval, publication, real-entity fact, or agent capability is
 introduced.
 
-### RegulatoryApplicabilityReviewDisposition (accepted design; persistence pending)
+### RegulatoryApplicabilityReviewDisposition (implemented bounded persistence)
 
-The accepted next model design is an append-only human disposition stream
+The implemented model is an append-only human disposition stream
 for one exact physical `RegulatoryApplicabilityDecision` revision. It remains
 separate from the decision so human review cannot mutate the deterministic
 facts, result, rationale, or semantic digest.
 
-Each future disposition contains:
+Each disposition contains:
 
 - a `PROTECT` FK to the exact physical decision and a copied,
   server-recomputed decision semantic digest;
@@ -184,10 +184,10 @@ visible and fail-closed.
 
 New events require a current exact-parent decision and a reviewer different
 from its recorder. A corrected decision starts `not_reviewed`; old dispositions
-remain attached only to the old physical revision. The accepted future read
+remain attached only to the old physical revision. The implemented read
 contract is entity scoped and read-only, with independent view/review
-permissions. No model, migration, service, or API for this entity is implemented
-yet. See
+permissions and related-User masking. Mutation exists only as an atomic
+internal named-human service; no public review mutation route exists. See
 [ADR 0004](adr/0004-bounded-synthetic-applicability-review-disposition.md).
 
 ### ApplicabilityRule (target model)
@@ -317,7 +317,7 @@ obligation without requiring the chain correction to close or clone dependent
 decisions. Missing decisions and missing or unknown facts resolve to
 `needs_review`, never `not_applicable`.
 
-For the accepted review-disposition design, point-in-time selection first
+For the implemented review-disposition slice, point-in-time selection first
 resolves that exact applicability decision and then selects its latest event
 with `occurred_at <= recorded_as_of`. The disposition event is not copied to a
 successor decision. Its time joins the document aggregate floor so a later
@@ -358,28 +358,29 @@ correction event described above. The read-only detail API supports coherent
 `machine_proposed`; previous review events remain historical and do not transfer
 to the successor.
 
-It also persists the single-model synthetic applicability boundary described
-above and exposes its entity-scoped read-only GET operation. Mutation is
-available only through the named-human internal service; there is no public
-write route. The general multi-rule/multi-scope models remain target design.
+It also persists the single-model synthetic applicability boundary and its
+independent named-human review-disposition stream described above. Both expose
+entity-scoped read-only GET operations. Mutation is available only through
+named-human internal services; there is no public write route. The general
+multi-rule/multi-scope models remain target design.
 Neither boundary adds control or policy mappings, `DecisionRecord` approval,
 source/legal supersession, source text, approval/publication, real institution
 facts, or agents.
 
-The full regulatory SQLite suite passes all 41 tests both with migrations
-disabled and through the real project migration graph.
-An independent full-project SQLite rehearsal verified 0003 apply,
-empty-history rollback/reapply, and refusal to reverse populated applicability
-history. Django checks, migration-drift checks, and an independent review with
-no critical, high, or medium findings also pass. PostgreSQL apply,
-two-connection locking, representative query plans, backup/restore, database
-roles, and audit retention remain external gates. See
+With ADR 0004 included, all 72 regulatory tests pass both with migrations
+disabled and through the real project migration graph. Independent full-project
+SQLite rehearsals verified the 0003 and 0004 apply, empty-history
+rollback/reapply, populated-history reverse-refusal, and post-refusal
+preservation contracts. Django checks and migration-drift checks also pass.
+PostgreSQL apply, two-connection locking, representative query plans,
+backup/restore, database roles, and audit retention remain external gates. See
 [ADR 0002](adr/0002-recorded-time-correction.md) for the verified correction
 contract and [ADR 0003](adr/0003-bounded-synthetic-applicability-persistence.md)
 for the bounded applicability contract and migration guard.
 
-The independent review-disposition entity described above is accepted as the
-next architecture boundary; it is not implemented or migration-verified.
-It adds no legal approval, publication, real fact, UI, public mutation, generic
-workflow, or agent claim. Its accepted contract and pending gates are in
+The independent review-disposition entity described above is implemented for
+the bounded synthetic slice by migration `regulatory.0004`, its internal
+recording service, permissions, and separate read action. It adds no legal
+approval, publication, real fact, UI, public mutation, generic workflow, or
+agent claim. Its accepted contract and remaining production gates are in
 [ADR 0004](adr/0004-bounded-synthetic-applicability-review-disposition.md).
