@@ -7,6 +7,7 @@ from django.utils import timezone
 from iam.models import Folder, ServiceAccount, User
 from regulatory.models import (
     RegulatoryObligation,
+    RegulatoryObligationProvision,
     RegulatoryObligationReviewEvent,
 )
 
@@ -16,6 +17,7 @@ from .common import (
     lock_regulatory_actor,
     require_regulatory_permission,
 )
+from .records import regulatory_document_recorded_floor
 
 
 ALLOWED_REVIEW_TRANSITIONS = {
@@ -136,9 +138,40 @@ def transition_obligation_review(
             {"actor": "Analyst and legal review require different named actors."}
         )
 
+    try:
+        obligation_link = (
+            RegulatoryObligationProvision.objects.select_related(
+                "provision__document_version__document",
+            )
+            .filter(
+                folder=folder,
+                obligation=obligation,
+                provision__folder=folder,
+                provision__document_version__folder=folder,
+                provision__document_version__document__folder=folder,
+            )
+            .get()
+        )
+    except (
+        RegulatoryObligationProvision.DoesNotExist,
+        RegulatoryObligationProvision.MultipleObjectsReturned,
+    ) as exc:
+        raise ValidationError(
+            "The obligation must resolve to one regulatory document."
+        ) from exc
+    document = obligation_link.provision.document_version.document
+    aggregate_floor = regulatory_document_recorded_floor(
+        document=document,
+        folder=folder,
+    )
     latest_known_time = max(
-        obligation.recorded_from,
-        latest.occurred_at if latest is not None else obligation.recorded_from,
+        value
+        for value in (
+            aggregate_floor,
+            obligation.recorded_from,
+            latest.occurred_at if latest is not None else None,
+        )
+        if value is not None
     )
     occurred_at = max(
         timezone.now(),

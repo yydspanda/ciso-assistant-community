@@ -4,11 +4,67 @@ from core.serializer_fields import FieldsRelatedField
 from core.serializers import BaseModelSerializer
 
 from .models import (
+    RegulatoryApplicabilityDecision,
     RegulatoryDocument,
     RegulatoryDocumentVersion,
     RegulatoryObligation,
     RegulatoryProvision,
 )
+
+
+class RegulatoryApplicabilityDecisionReadSerializer(serializers.ModelSerializer):
+    scope = serializers.SerializerMethodField()
+    rule = serializers.SerializerMethodField()
+    facts = serializers.SerializerMethodField()
+    provenance = serializers.SerializerMethodField()
+    legal_conclusion = serializers.SerializerMethodField()
+
+    class Meta:
+        model = RegulatoryApplicabilityDecision
+        fields = [
+            "id",
+            "record_id",
+            "revision",
+            "fact_snapshot_id",
+            "scope",
+            "rule",
+            "facts",
+            "missing_fact_keys",
+            "result",
+            "rationale_code",
+            "rationale",
+            "valid_from",
+            "valid_to",
+            "recorded_from",
+            "recorded_to",
+            "review_status",
+            "is_binding",
+            "digest_schema",
+            "evaluator_profile",
+            "rule_snapshot_sha256",
+            "fact_snapshot_sha256",
+            "semantic_payload_sha256",
+            "provenance",
+            "legal_conclusion",
+        ]
+
+    def get_scope(self, obj: RegulatoryApplicabilityDecision) -> dict:
+        return {
+            "type": obj.scope_type,
+            "id": str(obj.registration.entity_id),
+        }
+
+    def get_rule(self, obj: RegulatoryApplicabilityDecision) -> dict:
+        return obj.rule_snapshot
+
+    def get_facts(self, obj: RegulatoryApplicabilityDecision) -> list[dict]:
+        return obj.fact_snapshot
+
+    def get_provenance(self, obj: RegulatoryApplicabilityDecision) -> dict:
+        return obj.provenance_payload()
+
+    def get_legal_conclusion(self, obj: RegulatoryApplicabilityDecision) -> bool:
+        return False
 
 
 class RegulatoryObligationReadSerializer(serializers.ModelSerializer):

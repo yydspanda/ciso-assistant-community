@@ -78,29 +78,76 @@ criteria:
 - `regulatory.0002_regulatorychaincorrectionevent_and_more` adds the named-human
   correction permission, history index, and immutable correction-event
   boundary;
+- `regulatory.0003_regulatoryapplicabilitydecision` additively creates one
+  append-only synthetic applicability-decision table, its constraints and
+  separate view/record permissions, with no data backfill;
 - one atomic domain service closes the exact current three-row revision set and
   appends linked successors at a server-owned cutoff; the successor obligation
   resets to `machine_proposed`;
 - the existing read-only detail API accepts `recorded_as_of` and resolves a
   single folder-consistent chain through half-open recorded intervals; the read
   and correction paths use the same folder lock as their concurrency boundary;
-- object and related-field IAM fail closed, and there is still no public write
-  route.
+- object and related-field IAM fail closed, and there is no public write route.
 
-This increment is recorded-time repair only. It cannot represent source/legal
-supersession and does not add applicability, binding decisions, rejection,
-approval/publication, source text, real entity data, UI writes, a library
-projection, or an agent.
+The bounded applicability service lets an authorised named human record or
+correct one canonical fact snapshot for the exact registered entity and
+physical obligation revision. It applies the fixed rule
+`SYNTHETIC-ENTITY-INSTITUTION-TYPE-BANK-001` version 1, recomputes one of
+`applicable`, `not_applicable`, or `needs_review`, and appends revision,
+idempotency, provenance, and digest evidence. An entity-scoped read-only GET
+exposes the selected non-binding result under document/entity IAM and the
+separate applicability-view permission.
+
+This increment cannot represent source/legal supersession and does not add
+binding decisions, rejection, approval/publication, source text, real
+institution facts, UI writes, a library projection, or an agent.
 
 Migration-backed focused tests and an isolated SQLite full-project database
 copy verify 0001 -> 0002 apply, empty-history rollback/reapply, and refusal to
-reverse 0002 after a real correction event exists. A brand-new empty-database
-rehearsal is blocked before these migrations by the repository's existing IAM
-migration expecting the optional allauth `account` app; this is not counted as
-a regulatory migration pass. PostgreSQL apply, two-connection folder-lock
-linearization, representative query plans, backup/restore, and audit-retention
-evidence remain deployment gates. See
+reverse 0002 after a real correction event exists. A targeted app-only command
+against a brand-new database was blocked earlier by the repository's existing
+IAM migration expecting the optional allauth `account` app; that attempt is
+not counted as a regulatory migration pass. The later full-project migration
+graph rehearsal did reach and apply 0003, as recorded below. PostgreSQL apply,
+two-connection folder-lock linearization, representative query plans,
+backup/restore, database-role enforcement, and audit-retention evidence remain
+deployment gates. See
 [ADR 0002](adr/0002-recorded-time-correction.md).
+
+Implemented bounded applicability increment:
+
+- adds one append-only `RegulatoryApplicabilityDecision` table for an explicit
+  synthetic legal-entity registration and exact physical obligation revision;
+- embeds fixed rule `SYNTHETIC-ENTITY-INSTITUTION-TYPE-BANK-001` version 1 and
+  its single `entity.institution_type eq "bank"` condition together with the
+  canonical fact snapshot, evidence references, result, provenance, and
+  versioned digests;
+- recomputes `applicable`, `not_applicable`, or `needs_review` in an atomic
+  internal service guarded by `record_regulatoryapplicability`; no public write
+  route or caller-supplied conclusion is added;
+- exposes an entity-scoped read-only document action guarded by document/entity
+  IAM and the separate `view_regulatoryapplicabilitydecision` permission;
+- selects applicability through the exact physical obligation at the same
+  `recorded_as_of`, so an obligation correction cannot carry an r1 result into
+  r2; and
+- adds fact-correction revision/CAS, idempotency, interval, non-binding,
+  unpublished, and history-preservation constraints without changing 0001 or
+  0002.
+
+The additive migration contains no data backfill and no real or sample
+institution facts. The full regulatory SQLite suite passes all 41 tests both
+with migrations disabled and through the real project migration graph. An
+independent full-project SQLite database rehearsal verified 0003 apply,
+empty-history rollback and reapply, and refusal to reverse 0003 after inserting
+a synthetic decision. Django system checks, migration-drift checks, and an
+independent review reporting no critical, high, or medium findings also pass.
+
+Retaining or archiving populated rows before any future schema removal requires
+a separate reviewed forward migration. PostgreSQL apply, two-connection folder
+and entity lock validation, representative query plans, backup/restore,
+database-role enforcement, and audit-retention evidence remain external
+deployment gates. See
+[ADR 0003](adr/0003-bounded-synthetic-applicability-persistence.md).
 
 ### Phase 2 — internal policy and control bridge
 

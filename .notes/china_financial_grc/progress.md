@@ -3,7 +3,7 @@
 > Status: **Authoritative execution record / 权威执行记录**
 > Updated: **2026-08-24**
 > Branch: `agent/china-financial-grc-foundation`
-> Current phase: **Phase 1 — temporal regulatory persistence**
+> Current phase: **Phase 1 — regulatory persistence and review workflow**
 
 This file records verified current state, evidence, blockers, and the next
 action. It contains no private institution data, internal policy content,
@@ -20,7 +20,7 @@ live in `delivery-roadmap.md`.
 | Official-source metadata packs | Complete for the current non-exhaustive seed; legal review remains unreviewed |
 | Applicability fact registry and deterministic artifact validation | Complete for draft interchange artifacts |
 | Project-level `AGENTS.md`, product skill, architecture skill, roadmap, and progress ledger | Complete and independently forward-tested in this change |
-| Django regulatory persistence, migrations, APIs, and reviewer workflow | Synthetic metadata-only chain, non-binding review, controlled recorded-time correction, and current/historical detail retrieval implemented and SQLite-tested; applicability, source/legal supersession, binding decisions, and UI remain open |
+| Django regulatory persistence, migrations, APIs, and reviewer workflow | Synthetic metadata-only chain, non-binding obligation review, controlled recorded-time correction, current/historical detail retrieval, and one fixed-rule non-binding applicability aggregate implemented and SQLite-tested; independent applicability review disposition, source/legal supersession, binding decisions, and UI remain open |
 | Reviewed provisions and obligations from the source packs | Not implemented; the end-to-end record is illustrative only |
 | Private internal-policy ingestion and mapping | Not implemented |
 | Read-only production agent, proposal writes, or continuous evidence connectors | Not implemented |
@@ -171,13 +171,44 @@ independent temporal, migration, API/IAM, and architecture reviews
   PASS — no remaining Critical, High, or Medium finding
 ```
 
-The migration and API checks cover one synthetic metadata-only aggregate. A
-separate brand-new empty SQLite `manage.py migrate regulatory 0002` rehearsal
-did not reach the regulatory app: the repository's pre-existing
-`iam.0009_create_allauth_emailaddress_objects` migration expected an installed
-allauth `account` app that was absent in that command environment. This is
-tracked as a fresh-empty environment limitation, not counted as regulatory
-migration evidence. No user database was modified.
+Phase 1 bounded synthetic applicability verification:
+
+```text
+backend/.venv/bin/python backend/manage.py check
+  PASS — no system-check issues
+
+backend/.venv/bin/python backend/manage.py makemigrations --check --dry-run regulatory
+  PASS — no migration drift
+
+backend/.venv/bin/pytest backend/regulatory/tests -q --create-db --no-migrations
+  PASS — 41 tests in 169.29 seconds after final formatting
+
+backend/.venv/bin/pytest backend/regulatory/tests -q --create-db
+  PASS — 41 tests against the real migration boundary through 0003 in 559.41
+  seconds; exit code 0
+
+backend/.venv/bin/python tools/china_financial_grc/validate_artifacts.py
+  PASS — 56 facts; 76 documents; 76 versions
+
+backend/.venv/bin/python -m pytest tools/china_financial_grc/tests/test_validate_artifacts.py -q
+  PASS — 25 tests and 12 subtests
+
+independent applicability follow-up review
+  PASS — no remaining Critical, High, or Medium finding
+
+targeted credential, private-path, and real-data scan
+  PASS — no key, private local path, or real institution/customer data in the
+  candidate changes
+```
+
+Migration 0003 was also rehearsed against an isolated, brand-new SQLite
+full-project database: full-project apply through 0003, empty-history rollback
+to 0002, and reapply to 0003 all passed. After recording one complete synthetic
+chain and applicability decision, reversal to 0002 was refused by the intended
+audit-history guard and 0003 remained applied. The earlier targeted-app-only
+blank-database invocation remains unsuitable because of the repository's
+pre-existing allauth migration-graph dependency; the successful rehearsal used
+the full project graph. No user database was modified.
 
 ## Current limitations and risks
 
@@ -185,12 +216,15 @@ migration evidence. No user database was modified.
    entries; included legal-review statuses remain `unreviewed`.
 2. **Persistence remains deliberately narrow.** The application stores a
    synthetic metadata-only Document/Version/Provision/Obligation chain,
-   non-binding review events, controlled recorded-time correction, and coherent
-   current/historical detail retrieval. It has no source/legal-version
-   supersession, applicability records, binding DecisionRecord, reviewer UI,
+   non-binding obligation review events, controlled recorded-time correction,
+   coherent current/historical detail retrieval, and one append-only fixed-rule
+   applicability aggregate. The applicability result is draft and non-binding;
+   it has no independent named-human review disposition. There is still no
+   source/legal-version supersession, binding DecisionRecord, reviewer UI,
    approval/publication, source-text intake, or real source ingestion.
-3. **No pilot entity facts.** Public artifacts cannot decide applicability for a
-   real institution, licence, product, customer, data flow, or system.
+3. **No real pilot entity facts.** Only bounded synthetic entity facts have been
+   exercised. Public artifacts cannot decide applicability for a real
+   institution, licence, product, customer, data flow, or system.
 4. **No gold set or baseline.** Extraction, mapping, reviewer effort, latency,
    and cost targets cannot be promoted until humans review a bounded dataset.
 5. **No private policy bridge.** Internal policies must remain in a private,
@@ -205,21 +239,25 @@ migration evidence. No user database was modified.
    constraints fail closed, but privileged SQL and unsupported ORM bulk/M2M
    operations still require production database-role, trigger, or tamper-
    evident-storage decisions.
-9. **Production database evidence is pending.** Final focused tests use the
-   project's SQLite path. PostgreSQL apply/rollback plus two-connection
-   correction/read linearization on the shared folder lock, representative
-   current/history query plans, backup/restore, and audit-retention evidence
-   remain external release gates.
+9. **Production database evidence is pending.** Final focused and migration
+   rehearsal tests use isolated SQLite databases. PostgreSQL migration apply,
+   two-connection write/read locking and linearisation on the shared folder
+   boundary, representative current/history query plans, backup/restore,
+   least-privilege database-role enforcement, and long-retention/tamper-evident
+   audit evidence remain external release gates.
 
 ## Current next action
 
-Persist one synthetic obligation's versioned applicability fact snapshot and a
-deterministic, non-binding three-value decision: `applicable`,
-`not_applicable`, or `needs_review`. Missing or unknown facts must
-deterministically resolve to `needs_review`; retain evidence references,
-provenance, and recorded-time retrieval. Do not add source/legal supersession,
-approval, publication, real institution facts, source text, a public write API,
-library projection, or an agent in that slice.
+Define and architecture-review one independent, append-only, non-binding
+named-human review-disposition contract for an exact synthetic applicability
+decision revision. It must bind the reviewed decision's physical identity and
+semantic digest, preserve separate view/review permissions and entity/folder
+isolation, reject service identities, stale payloads, self-review where roles
+would conflict, and history mutation, and expose correction-needed states
+without turning review into legal approval. Do not add publication, a binding
+DecisionRecord, real institution facts, source text, public mutation APIs, a
+reviewer UI, source/legal supersession, library projection, or an agent in this
+architecture-gate slice.
 
 ## Near-term backlog
 
@@ -230,13 +268,39 @@ library projection, or an agent in that slice.
 | P0 | Read-only API plus non-binding review-state service | Models, permissions, transaction design | Complete for current synthetic slice |
 | P0 | Controlled recorded-time correction and `recorded_as_of` retrieval | First current-chain slice | Complete for current synthetic slice |
 | P0 | Source/legal-version supersession | Reviewed source evidence and legal lifecycle contract | Pending; separate from recorded correction |
-| P0 | One versioned fact snapshot and deterministic non-binding applicability decision | Stable bitemporal correction semantics | Next |
+| P0 | One versioned fact snapshot and deterministic non-binding applicability decision | Stable bitemporal correction semantics | Complete for current fixed-rule synthetic slice |
+| P0 | Independent append-only named-human applicability review-disposition contract and architecture gate | Exact applicability revision identity, digest, IAM, and temporal semantics | Next |
 | P0 | Small human-reviewed pilot source set | Named reviewer and source rights | Blocked on external ownership |
 | P1 | Reviewer UI/admin workflow | Stable API and review contract | Pending |
 | P1 | Internal-policy/private overlay model | Published obligation model and privacy design | Later Phase 2 |
 | P1 | Read-only source/explanation agent evaluation | Reviewed knowledge and gold set | Later Phase 3 |
 
 ## Activity log
+
+### 2026-08-24 — Bounded synthetic applicability persistence
+
+- Added one append-only, entity-scoped applicability aggregate for an exact
+  physical obligation revision and the fixed
+  `SYNTHETIC-ENTITY-INSTITUTION-TYPE-BANK-001` rule. The service owns the rule,
+  recomputation, rationale, digests, revision, and recorded time; missing and
+  explicitly unknown facts deterministically produce `needs_review`.
+- Added caller fact/evidence/provenance bounds, exact-parent temporal isolation,
+  stale-write and semantic-no-op rejection, historical idempotent retry,
+  monotonic cross-workflow recorded-time floors, named-human-only mutation, and
+  separate entity/folder-scoped read and record permissions. The read API is
+  additive and entity-explicit; no public mutation route was added.
+- Added migration 0003 with additive indexes, constraints, permissions, and a
+  populated-history reverse guard. Isolated full-project SQLite apply, empty
+  rollback/reapply, and populated reverse refusal all passed.
+- Verified 41 no-migration tests, 41 real-migration tests, Django checks,
+  migration drift, 56-fact/76-document/76-version artifact validation, 25
+  artifact tests plus 12 subtests, sensitive-information scanning, and an
+  independent follow-up review with no remaining Critical, High, or Medium
+  finding.
+- This is synthetic, draft, and non-binding. It does not establish legal
+  applicability, complete Phase 1, review real regulation, support a production
+  database, or deliver an agent. PostgreSQL concurrency/query-plan and the
+  remaining operational database and audit controls stay external gates.
 
 ### 2026-08-24 — Controlled recorded-time correction and historical reads
 

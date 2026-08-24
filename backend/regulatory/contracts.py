@@ -1,4 +1,4 @@
-from typing import Any, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict
 
 
 class RegulatoryDocumentPayload(TypedDict):
@@ -171,3 +171,59 @@ class RegulatoryChainCorrectionPayload(TypedDict):
     document_version: RegulatoryDocumentVersionCorrectionPayload
     provision: RegulatoryProvisionCorrectionPayload
     obligation: RegulatoryObligationCorrectionPayload
+
+
+class RegulatoryProvenancePayload(TypedDict):
+    method: Literal["human", "parser", "model_proposal", "import"]
+    created_at: str
+    created_by: str
+    parser_version: str | None
+    model: str | None
+    prompt_version: str | None
+    retrieval_version: str | None
+
+
+class RegulatoryKnownInstitutionTypeObservation(TypedDict):
+    fact: Literal["entity.institution_type"]
+    known: Literal[True]
+    value: str
+    source_refs: list[str]
+    observed_at: str
+
+
+class RegulatoryUnknownInstitutionTypeObservation(TypedDict):
+    fact: Literal["entity.institution_type"]
+    known: Literal[False]
+    source_refs: list[str]
+    observed_at: None
+
+
+RegulatoryApplicabilityObservation = (
+    RegulatoryKnownInstitutionTypeObservation
+    | RegulatoryUnknownInstitutionTypeObservation
+)
+
+
+class RegulatoryApplicabilityExpectedCurrentPayload(TypedDict):
+    decision_revision: int | None
+    semantic_payload_sha256: str | None
+
+
+class RegulatoryApplicabilityExpectedObligationPayload(TypedDict):
+    physical_id: str
+    record_id: str
+    revision: int
+    chain_semantic_payload_sha256: str
+
+
+class RegulatoryApplicabilityPayload(TypedDict):
+    """Fact-only command; rule, result, and recorded time are server-owned."""
+
+    record_id: str
+    fact_snapshot_id: str
+    expected_current: RegulatoryApplicabilityExpectedCurrentPayload
+    expected_obligation: RegulatoryApplicabilityExpectedObligationPayload
+    observations: list[RegulatoryApplicabilityObservation]
+    valid_from: str | None
+    valid_to: str | None
+    provenance: RegulatoryProvenancePayload

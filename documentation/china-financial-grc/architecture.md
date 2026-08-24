@@ -101,11 +101,81 @@ read and correction and prevents clock rollback from hiding committed state.
 PostgreSQL two-connection and query-plan evidence remains an external
 production gate; SQLite tests are not a substitute for it.
 
-This as-built subset does not own source bytes or legal supersession,
-applicability, binding decisions, approval/publication, real institution facts,
-library projections, UI writes, or agent execution. Those remain target
-components gated by the delivery roadmap. The exact correction decision is in
+This verified as-built subset does not own source bytes or legal supersession,
+binding decisions, approval/publication, real institution facts, library
+projections, UI writes, or agent execution. Those remain target components
+gated by the delivery roadmap. The exact correction decision is in
 [ADR 0002](adr/0002-recorded-time-correction.md).
+
+## Implemented bounded Phase 1 applicability boundary
+
+`backend/regulatory` owns one append-only
+`RegulatoryApplicabilityDecision` aggregate rather than separate rule,
+fact-snapshot, decision, evidence-link, and invalidation tables. Migration
+`regulatory.0003` adds this table without a data backfill or institution fact
+records.
+
+The aggregate is limited to one synthetic legal-entity scope registered to the
+document and one exact physical obligation revision. It embeds:
+
+- fixed rule `SYNTHETIC-ENTITY-INSTITUTION-TYPE-BANK-001` version 1, whose only
+  condition is `entity.institution_type eq "bank"`;
+- the canonical fact observation, including known/unknown state, value,
+  evidence references, and observation time;
+- the recomputed three-value result, structured reasons, valid and recorded
+  time, actor and provenance;
+- versioned rule, fact, semantic, and request digests, a predecessor revision,
+  compare-and-swap expectations, and a folder-scoped idempotency key; and
+- explicit `draft`, non-binding, unpublished markers.
+
+The caller supplies a fact observation, not a rule or authoritative result.
+Known `"bank"` computes `applicable`, another known non-matching value computes
+`not_applicable`, and a missing or unknown observation computes
+`needs_review`. Evidence references identify supporting material but do not
+copy evidence bytes or change CISO Assistant's ownership of `Evidence` and
+`EvidenceRevision`.
+
+The public surface remains read-only. The implemented entity-scoped action is:
+
+```text
+GET /api/regulatory/v1/documents/{uuid}/applicability/?entity=<uuid>&recorded_as_of=<aware-RFC-3339>
+```
+
+It requires document and entity IAM plus the separate Django
+`view_regulatoryapplicabilitydecision` permission. The internal write service
+requires folder-scoped `record_regulatoryapplicability`; it is not a public API
+and accepts only an authenticated named human. It cannot approve, confirm,
+publish, or bind a legal conclusion. The stable entity UUID is the scope
+identifier, and the immutable entity-document registration retains the folder
+IAM boundary used to retrieve historical decisions even if mutable entity
+metadata later changes.
+
+Recorded-time selection first resolves the existing coherent chain and then
+selects a decision through that exact physical obligation and explicit entity
+registration at the same timestamp. The effective interval is the intersection
+of the decision and parent obligation recorded intervals. When an obligation
+r1 is corrected to r2, the r1 decision remains immutable historical evidence
+and is not copied or attached to r2. At and after the correction cutoff, r2 has
+no result until it receives a fresh evaluation; the read contract reports this
+as unevaluated and safely resolves it to `needs_review`.
+
+The chain correction therefore does not cascade-close applicability rows. A
+cascade would make the three-row correction operation mutate an unbounded set
+of entity decisions and would obscure its existing audit boundary. A separate
+applicability correction event is also unnecessary in this slice because every
+successor decision itself retains its direct predecessor, server cutoff, actor,
+rationale, idempotency binding, and canonical digests. See
+[ADR 0003](adr/0003-bounded-synthetic-applicability-persistence.md).
+
+The full regulatory SQLite suite passes all 41 tests both with migrations
+disabled and through the real project migration graph.
+An independent full-project SQLite migration rehearsal verified 0003 apply,
+empty-history rollback and reapply, and the populated-history reverse guard.
+Django system checks, migration-drift checks, and an independent review
+reporting no critical, high, or medium findings also pass. PostgreSQL apply,
+two-connection lock evidence, representative query plans, backup/restore,
+database-role enforcement, and audit-retention evidence remain external
+production gates.
 
 ## New logical components
 

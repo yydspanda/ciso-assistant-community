@@ -7,6 +7,9 @@ from iam.models import Folder, Role, RoleAssignment, User
 from tprm.models import Entity
 
 
+APPLICABILITY_FACT_KEY = "entity.institution_type"
+
+
 def make_folder(name: str | None = None) -> Folder:
     return Folder.objects.create(
         name=name or f"Regulatory test {uuid.uuid4().hex[:8]}",
@@ -40,7 +43,7 @@ def make_user_with_permissions(
     )
     role.permissions.set(
         Permission.objects.filter(
-            content_type__app_label="regulatory",
+            content_type__app_label__in=("regulatory", "tprm"),
             codename__in=codenames,
         )
     )
@@ -81,7 +84,7 @@ def chain_payload(suffix: str = "001") -> dict:
             "domains": ["banking", "compliance"],
             "coverage_priority": "P0",
             "coverage_stage": "obligations_proposed",
-            "applicability_fact_keys": ["entity.licence_type"],
+            "applicability_fact_keys": [APPLICABILITY_FACT_KEY],
             "selection_rationale": "Synthetic test data only; not legal advice.",
         },
         "document_version": {
@@ -181,4 +184,81 @@ def correction_payload(
         "document_version": version,
         "provision": provision,
         "obligation": obligation,
+    }
+
+
+def known_institution_type_observation(
+    value: str = "bank",
+    *,
+    source_refs: list[str] | None = None,
+    observed_at: str | None = "2026-08-21T00:00:00+08:00",
+) -> dict:
+    return {
+        "fact": APPLICABILITY_FACT_KEY,
+        "known": True,
+        "value": value,
+        "source_refs": (
+            ["test:synthetic-institution-register"]
+            if source_refs is None
+            else source_refs
+        ),
+        "observed_at": observed_at,
+    }
+
+
+def unknown_institution_type_observation() -> dict:
+    return {
+        "fact": APPLICABILITY_FACT_KEY,
+        "known": False,
+        "source_refs": [],
+        "observed_at": None,
+    }
+
+
+def applicability_payload(
+    suffix: str,
+    *,
+    chain,
+    observations: list[dict] | None = None,
+    expected_revision: int | None = None,
+    expected_payload_sha256: str | None = None,
+) -> dict:
+    """Build the complete synthetic applicability command payload.
+
+    Decision result, revision, recorded time, and publication/review state are
+    deliberately absent because deterministic server code owns them.
+    """
+
+    from regulatory.services import regulatory_chain_semantic_sha256
+
+    recorded_at = "2026-08-21T00:00:00+08:00"
+    return {
+        "record_id": f"TEST-CN-APPDEC-{suffix}",
+        "fact_snapshot_id": f"TEST-CN-FACTSNAP-{suffix}",
+        "expected_obligation": {
+            "physical_id": str(chain.obligation.id),
+            "record_id": chain.obligation.record_id,
+            "revision": chain.obligation.revision,
+            "chain_semantic_payload_sha256": regulatory_chain_semantic_sha256(chain),
+        },
+        "expected_current": {
+            "decision_revision": expected_revision,
+            "semantic_payload_sha256": expected_payload_sha256,
+        },
+        "observations": (
+            [known_institution_type_observation()]
+            if observations is None
+            else deepcopy(observations)
+        ),
+        "valid_from": "2026-08-21",
+        "valid_to": None,
+        "provenance": {
+            "method": "human",
+            "created_at": recorded_at,
+            "created_by": "test:synthetic-regulatory-analyst",
+            "parser_version": None,
+            "model": None,
+            "prompt_version": None,
+            "retrieval_version": "test-entity-register-v1",
+        },
     }

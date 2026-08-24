@@ -94,7 +94,58 @@ The event does not mean that an authority changed, amended, repealed, or
 superseded a legal instrument. Source/legal-version supersession needs a
 separate future contract with source evidence and legal review.
 
-### ApplicabilityRule
+### RegulatoryApplicabilityDecision (implemented bounded persistence)
+
+The implemented Phase 1 slice represents one synthetic applicability fact
+snapshot and its deterministic result in one append-only aggregate. Additive
+migration `regulatory.0003` creates the table without backfilling decisions or
+institution facts.
+
+Each revision contains:
+
+- one `EntityDocumentRegistration` and the exact physical
+  `RegulatoryObligation` row evaluated, both in the same folder;
+- fixed rule `SYNTHETIC-ENTITY-INSTITUTION-TYPE-BANK-001` version 1 with the
+  single condition `entity.institution_type eq "bank"`;
+- a canonical observation for that fact, including known/unknown state, value,
+  evidence references, and observation time;
+- the service-computed `applicable`, `not_applicable`, or `needs_review`
+  result, structured reasons, valid time, and provenance;
+- portable decision ID, revision, predecessor, half-open recorded interval,
+  actor, rationale, idempotency key, and versioned request/rule/fact/semantic
+  digests; and
+- fixed `draft`, non-binding, and unpublished state.
+
+The caller cannot replace the rule or choose the result. Known `"bank"`
+computes `applicable`; another known non-matching institution type computes
+`not_applicable`; missing or unknown input computes `needs_review`. A known
+fact requires a registered type, non-empty evidence references, and an
+observation time. An unknown fact carries no asserted value or fabricated
+evidence.
+
+Fact corrections replace the complete snapshot. The service compare-and-swaps
+the current revision and semantic digest, closes it at one server-owned cutoff,
+and appends a direct successor. The decision row is also the durable command
+result: it records the actor, rationale, cutoff, predecessor, idempotency
+binding, and canonical digests, so a separate correction-event table is not
+needed for this non-binding slice.
+
+The exact physical obligation is a prerequisite, not merely a portable string
+reference. Effective recorded-time selection uses the intersection of the
+decision interval and that obligation revision's interval. If obligation r1 is
+corrected to r2, an r1 decision is not inherited or copied. The old row may
+remain the last open recorded belief about historical r1, but exact-parent
+selection excludes it from r2. The new obligation safely returns unevaluated /
+`needs_review` until a fresh decision is recorded. Consequently the existing
+three-row chain correction does not cascade-close applicability history.
+
+The entity-scoped read contract requires explicit entity identity, document
+and entity IAM, and `view_regulatoryapplicabilitydecision`. Mutation remains an
+internal service guarded by `record_regulatoryapplicability`; no public write,
+confirmation, approval, publication, real-entity fact, or agent capability is
+introduced.
+
+### ApplicabilityRule (target model)
 
 Structured conditions determining whether an obligation applies. Dimensions
 include:
@@ -112,7 +163,7 @@ version, and links its predecessor; this keeps decision targets unambiguous. A
 rule does not itself claim that a legal entity, product, system, or data flow is
 in scope.
 
-### ApplicabilityDecision
+### ApplicabilityDecision (target model)
 
 Scoped evaluation of a specific obligation and rule version.
 
@@ -208,6 +259,19 @@ so it cannot combine revisions from different recorded states. This lock and
 query contract still requires PostgreSQL concurrency and query-plan validation
 before production acceptance.
 
+For the implemented synthetic applicability slice, the selector uses the same
+timestamp to resolve the parent chain and an entity-scoped decision linked to
+the selected physical obligation. Its effective recorded interval is:
+
+```text
+decision interval intersect exact obligation interval
+```
+
+This parent interval prevents an r1 decision from appearing on an r2
+obligation without requiring the chain correction to close or clone dependent
+decisions. Missing decisions and missing or unknown facts resolve to
+`needs_review`, never `not_applicable`.
+
 ## Provenance rules
 
 For every machine-proposed provision, obligation, mapping, or conclusion,
@@ -234,7 +298,7 @@ tested, and exchanged before database migrations are committed.
 
 ## Current implementation boundary
 
-The Phase 1 Django implementation currently persists only the synthetic,
+The verified Phase 1 Django implementation persists the synthetic,
 metadata-only Document -> DocumentVersion -> Provision -> Obligation subset,
 entity registration, non-binding review events, and the recorded-time
 correction event described above. The read-only detail API supports coherent
@@ -242,8 +306,22 @@ correction event described above. The read-only detail API supports coherent
 `machine_proposed`; previous review events remain historical and do not transfer
 to the successor.
 
-Applicability rules and decisions in this document remain target design. The
-implementation does not yet persist fact snapshots, applicability results,
-control or policy mappings, DecisionRecords, source/legal supersession, source
-text, approval/publication, real-entity facts, or agents. See
-[ADR 0002](adr/0002-recorded-time-correction.md) for the implemented contract.
+It also persists the single-model synthetic applicability boundary described
+above and exposes its entity-scoped read-only GET operation. Mutation is
+available only through the named-human internal service; there is no public
+write route. The general multi-rule/multi-scope models remain target design.
+Neither boundary adds control or policy mappings, `DecisionRecord` approval,
+source/legal supersession, source text, approval/publication, real institution
+facts, or agents.
+
+The full regulatory SQLite suite passes all 41 tests both with migrations
+disabled and through the real project migration graph.
+An independent full-project SQLite rehearsal verified 0003 apply,
+empty-history rollback/reapply, and refusal to reverse populated applicability
+history. Django checks, migration-drift checks, and an independent review with
+no critical, high, or medium findings also pass. PostgreSQL apply,
+two-connection locking, representative query plans, backup/restore, database
+roles, and audit retention remain external gates. See
+[ADR 0002](adr/0002-recorded-time-correction.md) for the verified correction
+contract and [ADR 0003](adr/0003-bounded-synthetic-applicability-persistence.md)
+for the bounded applicability contract and migration guard.

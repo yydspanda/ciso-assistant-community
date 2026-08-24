@@ -7,7 +7,6 @@ from typing import Any
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import Max
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 
@@ -38,7 +37,11 @@ from .common import (
     lock_regulatory_actor,
     require_regulatory_permission,
 )
-from .records import RegulatoryChain, _provenance_fields
+from .records import (
+    RegulatoryChain,
+    _provenance_fields,
+    regulatory_document_recorded_floor,
+)
 
 
 @dataclass(frozen=True)
@@ -449,16 +452,20 @@ def correct_regulatory_chain(
         current_payload_sha256=before_payload_sha256,
     )
 
-    latest_known_time = max(
-        current.document_version.recorded_from,
-        current.provision.recorded_from,
-        current.obligation.recorded_from,
-    )
-    latest_review_at = current.obligation.review_events.filter(
+    aggregate_floor = regulatory_document_recorded_floor(
+        document=current.document,
         folder=folder,
-    ).aggregate(value=Max("occurred_at"))["value"]
-    if latest_review_at is not None:
-        latest_known_time = max(latest_known_time, latest_review_at)
+    )
+    latest_known_time = max(
+        value
+        for value in (
+            aggregate_floor,
+            current.document_version.recorded_from,
+            current.provision.recorded_from,
+            current.obligation.recorded_from,
+        )
+        if value is not None
+    )
     cutoff = max(
         timezone.now(),
         latest_known_time + timedelta(microseconds=1),

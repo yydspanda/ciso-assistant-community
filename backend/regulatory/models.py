@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from datetime import date, datetime, timezone as datetime_timezone
+import hashlib
+import json
+
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.db.models import F, Q
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from django.utils.translation import gettext_lazy as _
 
 from auditlog.registry import auditlog
@@ -22,6 +28,62 @@ from .validators import (
 )
 
 CORRECTION_DIGEST_SCHEMA = "regulatory-chain-correction/v1"
+APPLICABILITY_DIGEST_SCHEMA = "regulatory-applicability-evaluation/v1"
+APPLICABILITY_EVALUATOR_PROFILE = "synthetic-single-condition/v1"
+PILOT_APPLICABILITY_SCOPE_TYPE = "legal_entity"
+PILOT_APPLICABILITY_FACT_KEY = "entity.institution_type"
+PILOT_APPLICABILITY_EXPECTED_VALUE = "bank"
+PILOT_APPLICABILITY_RULE_ID = "SYNTHETIC-ENTITY-INSTITUTION-TYPE-BANK-001"
+PILOT_APPLICABILITY_RULE_VERSION = 1
+PILOT_APPLICABILITY_VALUE_MAX_LENGTH = 100
+PILOT_APPLICABILITY_SOURCE_REF_MAX_COUNT = 20
+PILOT_APPLICABILITY_SOURCE_REF_MAX_LENGTH = 500
+PILOT_APPLICABILITY_RATIONALE_MATCH = (
+    "The known institution type matches the fixed synthetic bank rule."
+)
+PILOT_APPLICABILITY_RATIONALE_NO_MATCH = (
+    "The known institution type does not match the fixed synthetic bank rule."
+)
+PILOT_APPLICABILITY_RATIONALE_MISSING = (
+    "The required institution-type fact was missing and was recorded as unknown."
+)
+PILOT_APPLICABILITY_RATIONALE_UNKNOWN = (
+    "The required institution-type fact is explicitly unknown."
+)
+PILOT_APPLICABILITY_RULE_SNAPSHOT = {
+    "id": PILOT_APPLICABILITY_RULE_ID,
+    "version": PILOT_APPLICABILITY_RULE_VERSION,
+    "all": [
+        {
+            "fact": PILOT_APPLICABILITY_FACT_KEY,
+            "operator": "eq",
+            "value": PILOT_APPLICABILITY_EXPECTED_VALUE,
+        }
+    ],
+    "any": [],
+    "unknown_result": "needs_review",
+}
+
+
+def _canonical_json_sha256(payload) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_temporal_value(value: date | datetime | str | None) -> str | None:
+    if isinstance(value, datetime):
+        if timezone.is_aware(value):
+            value = value.astimezone(datetime_timezone.utc)
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
 
 
 class AuthorityLevel(models.TextChoices):
@@ -969,6 +1031,522 @@ class RegulatoryObligationReviewEvent(RegulatoryFolderModel):
         super().clean()
 
 
+class RegulatoryApplicabilityDecision(TemporalRevisionMixin, RegulatoryFolderModel):
+    """Versioned synthetic fact snapshot plus deterministic non-binding result."""
+
+    class ScopeType(models.TextChoices):
+        LEGAL_ENTITY = PILOT_APPLICABILITY_SCOPE_TYPE, _("Legal entity")
+
+    class Result(models.TextChoices):
+        APPLICABLE = "applicable", _("Applicable")
+        NOT_APPLICABLE = "not_applicable", _("Not applicable")
+        NEEDS_REVIEW = "needs_review", _("Needs review")
+
+    class RationaleCode(models.TextChoices):
+        RULE_SATISFIED = "rule_satisfied", _("Rule satisfied")
+        RULE_NOT_SATISFIED = "rule_not_satisfied", _("Rule not satisfied")
+        MISSING_OR_UNKNOWN_FACT = (
+            "missing_or_unknown_fact",
+            _("Missing or unknown fact"),
+        )
+
+    class ReviewStatus(models.TextChoices):
+        DRAFT = "draft", _("Draft")
+
+    previous_revision = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="+",
+        db_index=False,
+    )
+    registration = models.ForeignKey(
+        EntityDocumentRegistration,
+        on_delete=models.PROTECT,
+        related_name="applicability_decisions",
+    )
+    obligation = models.ForeignKey(
+        RegulatoryObligation,
+        on_delete=models.PROTECT,
+        related_name="applicability_decisions",
+    )
+    recorded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="regulatory_applicability_decisions",
+    )
+    scope_type = models.CharField(
+        max_length=24,
+        choices=ScopeType.choices,
+        default=ScopeType.LEGAL_ENTITY,
+        editable=False,
+    )
+    rule_id = models.CharField(
+        max_length=160,
+        default=PILOT_APPLICABILITY_RULE_ID,
+        validators=[validate_regulatory_identifier],
+    )
+    rule_version = models.PositiveIntegerField(
+        default=PILOT_APPLICABILITY_RULE_VERSION,
+    )
+    rule_snapshot = models.JSONField()
+    fact_snapshot_id = models.CharField(
+        max_length=160,
+        validators=[validate_regulatory_identifier],
+    )
+    fact_snapshot = models.JSONField()
+    missing_fact_keys = models.JSONField(
+        default=list,
+        blank=True,
+        validators=[validate_string_list],
+    )
+    result = models.CharField(max_length=24, choices=Result.choices)
+    rationale_code = models.CharField(
+        max_length=32,
+        choices=RationaleCode.choices,
+    )
+    rationale = models.TextField(max_length=4000)
+    valid_from = models.DateField(null=True, blank=True)
+    valid_to = models.DateField(null=True, blank=True)
+    review_status = models.CharField(
+        max_length=16,
+        choices=ReviewStatus.choices,
+        default=ReviewStatus.DRAFT,
+        editable=False,
+    )
+    is_binding = models.BooleanField(default=False, editable=False)
+    digest_schema = models.CharField(
+        max_length=64,
+        default=APPLICABILITY_DIGEST_SCHEMA,
+        editable=False,
+    )
+    evaluator_profile = models.CharField(
+        max_length=64,
+        default=APPLICABILITY_EVALUATOR_PROFILE,
+        editable=False,
+    )
+    rule_snapshot_sha256 = models.CharField(
+        max_length=64,
+        validators=[validate_sha256],
+    )
+    fact_snapshot_sha256 = models.CharField(
+        max_length=64,
+        validators=[validate_sha256],
+    )
+    semantic_payload_sha256 = models.CharField(
+        max_length=64,
+        validators=[validate_sha256],
+    )
+    request_sha256 = models.CharField(
+        max_length=64,
+        validators=[validate_sha256],
+    )
+    idempotency_key = models.CharField(max_length=200)
+
+    class Meta:
+        ordering = ["record_id", "revision"]
+        indexes = [
+            models.Index(
+                fields=[
+                    "folder",
+                    "registration",
+                    "obligation",
+                    "recorded_from",
+                ],
+                name="reg_app_dec_asof_idx",
+            )
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["folder", "record_id", "revision"],
+                name="reg_app_dec_record_rev_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["folder", "fact_snapshot_id", "revision"],
+                name="reg_app_fact_record_rev_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["folder", "registration", "obligation", "rule_id"],
+                condition=Q(recorded_to__isnull=True),
+                name="reg_app_dec_one_current",
+            ),
+            models.UniqueConstraint(
+                fields=["previous_revision"],
+                name="reg_app_dec_previous_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["folder", "idempotency_key"],
+                name="reg_app_dec_idem_uniq",
+            ),
+            models.CheckConstraint(
+                condition=Q(revision__gte=1),
+                name="reg_app_dec_revision_pos",
+            ),
+            models.CheckConstraint(
+                condition=Q(recorded_to__isnull=True)
+                | Q(recorded_to__gt=F("recorded_from")),
+                name="reg_app_dec_recorded_int",
+            ),
+            models.CheckConstraint(
+                condition=Q(valid_to__isnull=True)
+                | Q(valid_from__isnull=True)
+                | Q(valid_to__gt=F("valid_from")),
+                name="reg_app_dec_valid_int",
+            ),
+            models.CheckConstraint(
+                condition=Q(scope_type=PILOT_APPLICABILITY_SCOPE_TYPE),
+                name="reg_app_dec_scope_legal",
+            ),
+            models.CheckConstraint(
+                condition=Q(rule_id=PILOT_APPLICABILITY_RULE_ID),
+                name="reg_app_dec_rule_id",
+            ),
+            models.CheckConstraint(
+                condition=Q(rule_version=PILOT_APPLICABILITY_RULE_VERSION),
+                name="reg_app_dec_rule_version",
+            ),
+            models.CheckConstraint(
+                condition=Q(review_status="draft"),
+                name="reg_app_dec_draft",
+            ),
+            models.CheckConstraint(
+                condition=Q(is_binding=False),
+                name="reg_app_dec_nonbinding",
+            ),
+            models.CheckConstraint(
+                condition=Q(digest_schema=APPLICABILITY_DIGEST_SCHEMA),
+                name="reg_app_dec_digest_schema",
+            ),
+            models.CheckConstraint(
+                condition=Q(evaluator_profile=APPLICABILITY_EVALUATOR_PROFILE),
+                name="reg_app_dec_eval_profile",
+            ),
+            models.CheckConstraint(
+                condition=~Q(rationale=""),
+                name="reg_app_dec_rationale",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        result="applicable",
+                        rationale_code="rule_satisfied",
+                    )
+                    | Q(
+                        result="not_applicable",
+                        rationale_code="rule_not_satisfied",
+                    )
+                    | Q(
+                        result="needs_review",
+                        rationale_code="missing_or_unknown_fact",
+                    )
+                ),
+                name="reg_app_dec_result_reason",
+            ),
+            models.CheckConstraint(
+                condition=Q(is_published=False),
+                name="reg_app_dec_not_published",
+            ),
+        ]
+        permissions = [
+            (
+                "record_regulatoryapplicability",
+                "Can record a deterministic regulatory applicability evaluation",
+            )
+        ]
+
+    @staticmethod
+    def pilot_rule_snapshot() -> dict:
+        return deepcopy(PILOT_APPLICABILITY_RULE_SNAPSHOT)
+
+    def applicability_semantic_payload(self) -> dict:
+        return {
+            "digest_schema": APPLICABILITY_DIGEST_SCHEMA,
+            "evaluator_profile": APPLICABILITY_EVALUATOR_PROFILE,
+            "record_id": self.record_id,
+            "fact_snapshot_id": self.fact_snapshot_id,
+            "scope": {
+                "type": PILOT_APPLICABILITY_SCOPE_TYPE,
+                "registration_id": str(self.registration_id),
+                "entity_id": str(self.registration.entity_id),
+                "document_id": str(self.registration.document_id),
+            },
+            "obligation": {
+                "physical_id": str(self.obligation_id),
+                "record_id": self.obligation.record_id,
+                "revision": self.obligation.revision,
+            },
+            "rule": self.pilot_rule_snapshot(),
+            "fact_snapshot": self.fact_snapshot,
+            "missing_fact_keys": self.missing_fact_keys,
+            "result": self.result,
+            "rationale_code": self.rationale_code,
+            "rationale": self.rationale,
+            "valid_from": _canonical_temporal_value(self.valid_from),
+            "valid_to": _canonical_temporal_value(self.valid_to),
+            "review_status": self.ReviewStatus.DRAFT,
+            "is_binding": False,
+            "recorded_by_id": str(self.recorded_by_id),
+            "provenance": {
+                "method": self.provenance_method,
+                "created_at": _canonical_temporal_value(self.provenance_created_at),
+                "created_by": self.provenance_created_by,
+                "parser_version": self.parser_version,
+                "model": self.model_name,
+                "prompt_version": self.prompt_version,
+                "retrieval_version": self.retrieval_version,
+            },
+        }
+
+    def _validate_fact_snapshot(self) -> dict[str, str]:
+        errors: dict[str, str] = {}
+        if not isinstance(self.fact_snapshot, list) or len(self.fact_snapshot) != 1:
+            return {
+                "fact_snapshot": (
+                    "The pilot snapshot must contain exactly one normalized fact."
+                )
+            }
+        observation = self.fact_snapshot[0]
+        if not isinstance(observation, dict):
+            return {"fact_snapshot": "A normalized fact object is required."}
+        if observation.get("fact") != PILOT_APPLICABILITY_FACT_KEY:
+            errors["fact_snapshot"] = "The pilot fact key is fixed."
+            return errors
+        known = observation.get("known")
+        if type(known) is not bool:
+            errors["fact_snapshot"] = "The fact known flag must be boolean."
+            return errors
+
+        source_refs = observation.get("source_refs")
+        observed_at = observation.get("observed_at")
+        if known:
+            if set(observation) != {
+                "fact",
+                "known",
+                "value",
+                "source_refs",
+                "observed_at",
+            }:
+                errors["fact_snapshot"] = "The known fact shape is invalid."
+                return errors
+            value = observation.get("value")
+            if not isinstance(value, str) or not value.strip():
+                errors["fact_snapshot"] = (
+                    "A known institution type must be a non-empty string."
+                )
+            elif len(value) > PILOT_APPLICABILITY_VALUE_MAX_LENGTH:
+                errors["fact_snapshot"] = (
+                    "The institution type exceeds the pilot length limit."
+                )
+            try:
+                validate_non_empty_string_list(source_refs)
+            except ValidationError:
+                errors["fact_snapshot"] = (
+                    "A known fact needs non-empty unique evidence references."
+                )
+            else:
+                if len(source_refs) > PILOT_APPLICABILITY_SOURCE_REF_MAX_COUNT:
+                    errors["fact_snapshot"] = (
+                        "The known fact has too many evidence references."
+                    )
+                elif any(
+                    len(source_ref) > PILOT_APPLICABILITY_SOURCE_REF_MAX_LENGTH
+                    for source_ref in source_refs
+                ):
+                    errors["fact_snapshot"] = (
+                        "An evidence reference exceeds the pilot length limit."
+                    )
+            parsed_observed_at = (
+                parse_datetime(observed_at) if isinstance(observed_at, str) else None
+            )
+            if parsed_observed_at is None or timezone.is_naive(parsed_observed_at):
+                errors["fact_snapshot"] = (
+                    "A known fact needs an aware RFC 3339 observation time."
+                )
+            elif parsed_observed_at > self.recorded_from:
+                errors["fact_snapshot"] = (
+                    "A fact cannot be observed after the decision was recorded."
+                )
+            if self.missing_fact_keys:
+                errors["missing_fact_keys"] = (
+                    "A known fact cannot also be marked missing."
+                )
+        else:
+            if set(observation) != {
+                "fact",
+                "known",
+                "source_refs",
+                "observed_at",
+            }:
+                errors["fact_snapshot"] = "The unknown fact shape is invalid."
+            elif source_refs != [] or observed_at is not None:
+                errors["fact_snapshot"] = (
+                    "An unknown fact cannot carry evidence or observation time."
+                )
+        return errors
+
+    def clean(self) -> None:
+        errors: dict[str, str] = {}
+        if self.registration_id:
+            if self.registration.folder_id != self.folder_id:
+                errors["registration"] = (
+                    "The registration must be in the decision folder."
+                )
+            if self.registration.registration_kind != (
+                EntityDocumentRegistration.RegistrationKind.SYNTHETIC_PILOT
+            ):
+                errors["registration"] = (
+                    "The decision requires a synthetic-pilot registration."
+                )
+        if self.obligation_id:
+            if self.obligation.folder_id != self.folder_id:
+                errors["obligation"] = "The obligation must be in the decision folder."
+            elif (
+                self.registration_id
+                and not self.obligation.provision_links.filter(
+                    folder_id=self.folder_id,
+                    provision__folder_id=self.folder_id,
+                    provision__document_version__folder_id=self.folder_id,
+                    provision__document_version__document_id=self.registration.document_id,
+                ).exists()
+            ):
+                errors["obligation"] = (
+                    "The obligation must cite the registered document."
+                )
+        if self.rule_snapshot != self.pilot_rule_snapshot():
+            errors["rule_snapshot"] = "The synthetic pilot rule snapshot is fixed."
+        elif self.rule_snapshot_sha256 != _canonical_json_sha256(self.rule_snapshot):
+            errors["rule_snapshot_sha256"] = (
+                "The rule snapshot digest must match the fixed snapshot."
+            )
+        if self.rule_id != PILOT_APPLICABILITY_RULE_ID:
+            errors["rule_id"] = "The synthetic pilot rule ID is fixed."
+        if self.rule_version != PILOT_APPLICABILITY_RULE_VERSION:
+            errors["rule_version"] = "The synthetic pilot rule version is fixed."
+        if self.scope_type != PILOT_APPLICABILITY_SCOPE_TYPE:
+            errors["scope_type"] = "The synthetic pilot scope is a legal entity."
+        if set(self.missing_fact_keys or []) - {PILOT_APPLICABILITY_FACT_KEY}:
+            errors["missing_fact_keys"] = "The snapshot uses an unsupported fact key."
+        errors.update(self._validate_fact_snapshot())
+        fact_digest_payload = {
+            "observations": self.fact_snapshot,
+            "missing_fact_keys": self.missing_fact_keys,
+        }
+        try:
+            expected_fact_digest = _canonical_json_sha256(fact_digest_payload)
+        except (TypeError, ValueError):
+            expected_fact_digest = None
+        if self.fact_snapshot_sha256 != expected_fact_digest:
+            errors["fact_snapshot_sha256"] = (
+                "The fact snapshot digest must match the normalized fact state."
+            )
+        if "fact_snapshot" not in errors:
+            observation = self.fact_snapshot[0]
+            expected_result = (
+                self.Result.NEEDS_REVIEW
+                if not observation["known"]
+                else (
+                    self.Result.APPLICABLE
+                    if observation["value"] == PILOT_APPLICABILITY_EXPECTED_VALUE
+                    else self.Result.NOT_APPLICABLE
+                )
+            )
+            if self.result != expected_result:
+                errors["result"] = (
+                    "The result must match deterministic evaluation of the snapshot."
+                )
+        if self.valid_to is not None and self.valid_from is not None:
+            if self.valid_to <= self.valid_from:
+                errors["valid_to"] = "valid_to must be later than valid_from."
+        if self.obligation_id:
+            if self.obligation.valid_from is not None and (
+                self.valid_from is None or self.valid_from < self.obligation.valid_from
+            ):
+                errors["valid_from"] = (
+                    "The decision valid interval starts outside its obligation."
+                )
+            if self.obligation.valid_to is not None and (
+                self.valid_to is None or self.valid_to > self.obligation.valid_to
+            ):
+                errors["valid_to"] = (
+                    "The decision valid interval ends outside its obligation."
+                )
+        expected_reason = {
+            self.Result.APPLICABLE: self.RationaleCode.RULE_SATISFIED,
+            self.Result.NOT_APPLICABLE: self.RationaleCode.RULE_NOT_SATISFIED,
+            self.Result.NEEDS_REVIEW: self.RationaleCode.MISSING_OR_UNKNOWN_FACT,
+        }.get(self.result)
+        if expected_reason != self.rationale_code:
+            errors["rationale_code"] = "The rationale code must match the result."
+        expected_rationale = {
+            self.Result.APPLICABLE: PILOT_APPLICABILITY_RATIONALE_MATCH,
+            self.Result.NOT_APPLICABLE: PILOT_APPLICABILITY_RATIONALE_NO_MATCH,
+            self.Result.NEEDS_REVIEW: (
+                PILOT_APPLICABILITY_RATIONALE_MISSING
+                if self.missing_fact_keys
+                else PILOT_APPLICABILITY_RATIONALE_UNKNOWN
+            ),
+        }.get(self.result)
+        if self.rationale != expected_rationale:
+            errors["rationale"] = "The rationale must match deterministic evaluation."
+        if not (self.idempotency_key or "").strip():
+            errors["idempotency_key"] = "A non-empty idempotency key is required."
+        if self.previous_revision_id:
+            previous = self.previous_revision
+            stable_fields = (
+                "registration_id",
+                "obligation_id",
+                "scope_type",
+                "rule_id",
+                "rule_version",
+                "rule_snapshot_sha256",
+                "fact_snapshot_id",
+            )
+            if any(
+                getattr(previous, field) != getattr(self, field)
+                for field in stable_fields
+            ):
+                errors["previous_revision"] = (
+                    "A successor must preserve its scope, obligation, rule, and "
+                    "fact snapshot identity."
+                )
+            elif previous.semantic_payload_sha256 == self.semantic_payload_sha256:
+                errors["semantic_payload_sha256"] = (
+                    "A successor must change the semantic payload."
+                )
+        if self.registration_id and self.obligation_id and self.recorded_by_id:
+            try:
+                expected_semantic_digest = _canonical_json_sha256(
+                    self.applicability_semantic_payload()
+                )
+            except (TypeError, ValueError):
+                expected_semantic_digest = None
+            if self.semantic_payload_sha256 != expected_semantic_digest:
+                errors["semantic_payload_sha256"] = (
+                    "The semantic digest must match the deterministic evaluation."
+                )
+        if errors:
+            raise ValidationError(errors)
+        super().clean()
+
+    def __str__(self) -> str:
+        return f"{self.record_id} r{self.revision}: {self.result}"
+
+    @property
+    def entity_id(self):
+        return self.registration.entity_id
+
+    @property
+    def entity(self):
+        return self.registration.entity
+
+    @property
+    def observations(self) -> list[dict]:
+        """Artifact-compatible read alias for the embedded fact snapshot."""
+
+        return self.fact_snapshot
+
+
 class RegulatoryChainCorrectionEvent(RegulatoryFolderModel):
     """Auditable boundary for one atomic recorded-time chain correction."""
 
@@ -1245,4 +1823,5 @@ auditlog.register(RegulatoryProvision, exclude_fields=common_exclude)
 auditlog.register(RegulatoryObligation, exclude_fields=common_exclude)
 auditlog.register(RegulatoryObligationProvision, exclude_fields=common_exclude)
 auditlog.register(RegulatoryObligationReviewEvent, exclude_fields=common_exclude)
+auditlog.register(RegulatoryApplicabilityDecision, exclude_fields=common_exclude)
 auditlog.register(RegulatoryChainCorrectionEvent, exclude_fields=common_exclude)

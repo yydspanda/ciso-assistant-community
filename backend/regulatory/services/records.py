@@ -20,6 +20,7 @@ from tprm.models import Entity
 from regulatory.contracts import RegulatoryChainPayload
 from regulatory.models import (
     EntityDocumentRegistration,
+    RegulatoryApplicabilityDecision,
     RegulatoryDocument,
     RegulatoryDocumentVersion,
     RegulatoryObligation,
@@ -44,6 +45,10 @@ class RegulatoryChain:
     provision: RegulatoryProvision
     obligation: RegulatoryObligation
     recorded_as_of: datetime | None = None
+
+
+class RegulatoryRecordedStateUnavailable(ValidationError):
+    """A syntactically valid recorded time has no unique persisted chain."""
 
 
 def _provenance_fields(payload: dict) -> dict:
@@ -391,8 +396,18 @@ def regulatory_document_recorded_floor(
         obligation__provision_links__provision__document_version__folder=folder,
         obligation__provision_links__provision__document_version__document=document,
     ).aggregate(value=Max("occurred_at"))["value"]
+    applicability_floor = RegulatoryApplicabilityDecision.objects.filter(
+        folder=folder,
+        registration__folder=folder,
+        registration__document=document,
+        obligation__folder=folder,
+    ).aggregate(value=Max("recorded_from"))["value"]
     return max(
-        (value for value in (version_floor, review_floor) if value is not None),
+        (
+            value
+            for value in (version_floor, review_floor, applicability_floor)
+            if value is not None
+        ),
         default=None,
     )
 
@@ -440,7 +455,7 @@ def select_regulatory_chain_at(
             .get()
         )
     except (ObjectDoesNotExist, MultipleObjectsReturned) as exc:
-        raise ValidationError(
+        raise RegulatoryRecordedStateUnavailable(
             {
                 "recorded_as_of": (
                     "No complete unique regulatory chain exists at this recorded time."
@@ -483,7 +498,7 @@ def select_regulatory_chain_at(
         or active_provisions != [provision.pk]
         or active_obligations != [obligation.pk]
     ):
-        raise ValidationError(
+        raise RegulatoryRecordedStateUnavailable(
             {
                 "recorded_as_of": (
                     "The regulatory chain has ambiguous recorded-time cardinality."

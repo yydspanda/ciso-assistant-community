@@ -38,6 +38,7 @@ a governed system of record with bounded AI capabilities:
 - [Open-source decisions](open-source-decisions.md)
 - [ADR 0001: bounded regulatory persistence](adr/0001-regulatory-persistence-boundary.md)
 - [ADR 0002: controlled recorded-time correction and historical retrieval](adr/0002-recorded-time-correction.md)
+- [ADR 0003: bounded synthetic applicability persistence](adr/0003-bounded-synthetic-applicability-persistence.md)
 - [`schemas/regulatory-record.schema.json`](schemas/regulatory-record.schema.json):
   the proposed `2.0.0-draft.1` interchange contract for regulatory knowledge
 - [`catalogs/regulatory-sources.json`](catalogs/regulatory-sources.json) and the
@@ -112,9 +113,42 @@ review events, and preserves CISO Assistant object and related-field IAM
 masking. See [ADR 0002](adr/0002-recorded-time-correction.md) for the exact
 contract and remaining PostgreSQL acceptance gates.
 
-This implemented boundary still has no applicability persistence, binding
-decision, approval or publication workflow, source/legal-version supersession,
-source text, real-institution data, reviewer UI, library bridge, or agent.
-Flattening regulatory history into `Framework` and `RequirementNode` remains
-prohibited; those objects receive only reviewed projections in a later gated
-phase.
+The implemented Phase 1 boundary now also includes one synthetic-only,
+append-only `RegulatoryApplicabilityDecision` aggregate. It embeds a fixed,
+server-owned
+single-condition rule snapshot and the exact fact snapshot used to compute a
+draft, non-binding `applicable`, `not_applicable`, or `needs_review` result. The
+rule checks `entity.institution_type eq "bank"`; missing or unknown input always
+produces `needs_review`. Each decision is scoped through an explicit entity
+registration and exact physical obligation revision, so a corrected obligation
+cannot inherit an earlier applicability result.
+
+An internal, folder-scoped domain service lets an authorised named human record
+or correct that snapshot; the caller supplies observations, while the fixed
+rule, outcome, revision, digests, and recorded time remain server-owned. The
+public surface is limited to the entity-scoped, read-only document action:
+
+```text
+GET /api/regulatory/v1/documents/{uuid}/applicability/?entity=<uuid>&recorded_as_of=<aware-RFC-3339>
+```
+
+Migration `regulatory.0003` adds the decision table without a data backfill.
+The full regulatory SQLite suite passes all 41 tests both with migrations
+disabled and through the real project migration graph.
+An independent full-project SQLite migration rehearsal verified 0003 apply,
+empty-history rollback and reapply, and refusal to reverse after a synthetic
+decision was inserted. Django system checks, migration-drift checks, and an
+independent review reporting no critical, high, or medium findings also pass.
+
+This bounded implementation remains draft, non-binding, unpublished, and
+synthetic. It has separate view and internal record permissions and no public
+write route. It does not add a general `ApplicabilityRule` approval lifecycle,
+real institution facts, binding legal conclusions, approval/publication,
+source text, source/legal-version supersession, reviewer UI, an agent, or a
+library projection. Flattening regulatory history into `Framework` and
+`RequirementNode` remains prohibited; those objects receive only reviewed
+projections in a later gated phase. See
+[ADR 0003](adr/0003-bounded-synthetic-applicability-persistence.md) for the
+contract and migration guard. PostgreSQL apply, two-connection lock evidence,
+representative query plans, backup/restore, database-role enforcement, and
+audit-retention evidence remain external production gates.

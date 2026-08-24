@@ -1,19 +1,28 @@
-from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.exceptions import (
+    MultipleObjectsReturned,
+    ObjectDoesNotExist,
+    ValidationError as DjangoValidationError,
+)
 from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
+from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
 
 from core.views import BaseModelViewSet as AbstractBaseModelViewSet
 from iam.models import Folder
+from tprm.models import Entity
 
 from .models import RegulatoryDocument
 from .serializers import (
+    RegulatoryApplicabilityDecisionReadSerializer,
     RegulatoryDocumentDetailSerializer,
     RegulatoryDocumentReadSerializer,
 )
+from .services.applicability import get_regulatory_applicability
 from .services.records import (
+    RegulatoryRecordedStateUnavailable,
     regulatory_document_recorded_floor,
     select_regulatory_chain_at,
 )
@@ -49,7 +58,7 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
         request_time = (
             max(wall_time, recorded_floor) if recorded_floor is not None else wall_time
         )
-        if getattr(self, "action", None) != "retrieve":
+        if getattr(self, "action", None) not in {"retrieve", "applicability"}:
             if values:
                 raise ValidationError(
                     {
@@ -80,9 +89,10 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
         return selection
 
     def get_queryset(self):
-        if getattr(
-            self, "action", None
-        ) != "retrieve" and self.request.query_params.getlist("recorded_as_of"):
+        if getattr(self, "action", None) not in {
+            "retrieve",
+            "applicability",
+        } and self.request.query_params.getlist("recorded_as_of"):
             self._selection_time()
         return super().get_queryset()
 
@@ -119,3 +129,96 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
             allowed_ids = self._get_accessible_ids_map(set(field_models.values()))
             data = self._filter_related_fields(data, field_models, allowed_ids)
         return Response(data)
+
+    @action(detail=True, methods=["get"], url_path="applicability")
+    def applicability(self, request, *args, **kwargs):
+        """Read one explicitly entity-scoped, non-binding applicability result."""
+
+        document = self.get_object()
+        entity_values = request.query_params.getlist("entity")
+        if len(entity_values) != 1 or not entity_values[0].strip():
+            raise ValidationError(
+                {"entity": "Provide exactly one non-empty entity UUID."}
+            )
+        try:
+            entity = Entity.objects.get(pk=entity_values[0])
+        except (DjangoValidationError, ObjectDoesNotExist) as exc:
+            raise NotFound("The requested applicability scope is unavailable.") from exc
+
+        recorded_values = request.query_params.getlist("recorded_as_of")
+        requested_recorded_as_of = None
+        if recorded_values:
+            if len(recorded_values) != 1 or not recorded_values[0].strip():
+                raise ValidationError(
+                    {"recorded_as_of": "Provide one non-empty timestamp."}
+                )
+            requested_recorded_as_of = parse_datetime(recorded_values[0])
+            if requested_recorded_as_of is None or timezone.is_naive(
+                requested_recorded_as_of
+            ):
+                raise ValidationError(
+                    {"recorded_as_of": ("Use a timezone-aware RFC 3339 date-time.")}
+                )
+
+        try:
+            selection = get_regulatory_applicability(
+                actor=request.user,
+                entity=entity,
+                document_id=document.id,
+                recorded_as_of=requested_recorded_as_of,
+            )
+        except RegulatoryRecordedStateUnavailable as exc:
+            raise NotFound(
+                "No coherent applicability state exists for this scope and time."
+            ) from exc
+        except DjangoValidationError as exc:
+            if hasattr(exc, "message_dict") and "recorded_as_of" in exc.message_dict:
+                raise ValidationError(exc.message_dict) from exc
+            raise NotFound(
+                "No coherent applicability state exists for this scope and time."
+            ) from exc
+        except (ObjectDoesNotExist, MultipleObjectsReturned) as exc:
+            raise NotFound(
+                "No coherent applicability state exists for this scope and time."
+            ) from exc
+
+        decision_data = None
+        if selection.decision is not None:
+            decision_data = RegulatoryApplicabilityDecisionReadSerializer(
+                selection.decision,
+                context={"request": request},
+            ).data
+        return Response(
+            {
+                "contract_status": "draft",
+                "legal_conclusion": False,
+                "is_binding": False,
+                "scope": {
+                    "type": "legal_entity",
+                    "id": str(entity.id),
+                },
+                "document_id": str(document.id),
+                "obligation_id": selection.chain.obligation.record_id,
+                "obligation_revision": selection.chain.obligation.revision,
+                "recorded_as_of": (
+                    requested_recorded_as_of.isoformat()
+                    if requested_recorded_as_of is not None
+                    else None
+                ),
+                "selected_recorded_at": selection.recorded_as_of.isoformat(),
+                "evaluation_status": (
+                    "evaluated" if selection.decision is not None else "not_evaluated"
+                ),
+                "non_binding_result": (
+                    selection.decision.result
+                    if selection.decision is not None
+                    else "needs_review"
+                ),
+                "reason_code": (
+                    selection.decision.rationale_code
+                    if selection.decision is not None
+                    else "no_decision_for_selected_obligation_revision"
+                ),
+                "decision": decision_data,
+            }
+        )

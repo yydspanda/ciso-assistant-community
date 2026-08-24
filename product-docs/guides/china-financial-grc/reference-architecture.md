@@ -9,8 +9,10 @@ description: Proposed trust boundaries and information flow for the China financ
 > provenance before reviewed obligations are projected into frameworks.
 
 > **Current Phase 1 subset:** the regulatory layer persists one synthetic,
-> metadata-only Document -> Version -> Provision -> Obligation chain. Its public
-> API is read-only. Applicability, legal supersession, approval/publication,
+> metadata-only Document -> Version -> Provision -> Obligation chain plus one
+> append-only applicability-decision aggregate. Its public API is read-only.
+> Applicability remains draft, non-binding, unpublished, and limited to a fixed
+> rule and synthetic observations. Legal supersession, approval/publication,
 > source text, real-institution facts, projections, and agents remain proposed.
 
 ```mermaid
@@ -52,6 +54,55 @@ These behaviours are tested on the project's SQLite path. PostgreSQL migration,
 two-connection concurrency, and representative query-plan evidence remain
 production acceptance gates. The durable contract and rollback boundary are in
 [ADR 0002](../../../documentation/china-financial-grc/adr/0002-recorded-time-correction.md).
+
+## Implemented synthetic applicability contract
+
+The bounded Phase 1 implementation uses one append-only decision aggregate
+rather than a general rule, fact, approval, and evidence subsystem. It is
+limited to an explicit synthetic legal entity and the exact physical obligation
+revision selected from its registered document.
+
+The embedded rule is
+`SYNTHETIC-ENTITY-INSTITUTION-TYPE-BANK-001` version 1. Its only condition is
+`entity.institution_type eq "bank"`. A known matching value computes
+`applicable`, another known non-matching value computes `not_applicable`, and a
+missing or unknown fact computes `needs_review`. The service records the exact
+fact snapshot, evidence references, provenance, rule and fact digests, and the
+deterministic result. The caller cannot replace the rule or choose a result.
+
+The public operation is read-only and requires an explicit entity:
+
+```text
+GET /api/regulatory/v1/documents/{uuid}/applicability/?entity=<uuid>&recorded_as_of=<aware-RFC-3339>
+```
+
+It applies document and entity IAM and a separate
+`view_regulatoryapplicabilitydecision` permission. Recording or correcting a
+snapshot remains an internal, folder-scoped service protected by
+`record_regulatoryapplicability`; there is no public write action.
+
+Recorded-time lookup first selects the exact obligation revision and then only
+a decision linked to that physical row. If obligation r1 is corrected to r2,
+the r1 decision remains historical and does not attach to r2. The chain
+correction does not cascade-close it: the effective interval is the
+intersection of the decision and exact parent-obligation intervals. Until r2
+is evaluated afresh, the API reports it as unevaluated and safely resolves it
+to `needs_review`.
+
+This implementation does not add a general ApplicabilityRule approval lifecycle,
+binding legal decisions, confirmation/publication, real institution facts,
+source text, agents, or library projections. Migration `regulatory.0003` adds
+the table without a data backfill. The full regulatory SQLite suite passes all
+41 tests both with migrations disabled and through the real project migration
+graph; an independent full-project SQLite migration rehearsal verified 0003
+apply, empty-history rollback/reapply, and populated-history reverse refusal.
+Django checks, migration-drift checks, and an independent review reporting no
+critical, high, or medium findings also pass.
+
+PostgreSQL apply, two-connection lock evidence, representative query plans,
+backup/restore, database-role enforcement, and audit-retention evidence remain
+external production gates. The durable design and alternatives are in
+[ADR 0003](../../../documentation/china-financial-grc/adr/0003-bounded-synthetic-applicability-persistence.md).
 
 ## Trust boundaries
 
