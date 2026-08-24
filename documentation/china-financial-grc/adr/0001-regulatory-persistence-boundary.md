@@ -4,6 +4,11 @@
 - Date: 2026-08-21
 - Scope: one synthetic-entity regulatory register
 
+> **Extended by [ADR 0002](0002-recorded-time-correction.md) on 2026-08-24.**
+> ADR 0002 implements the reserved recorded-time correction and historical-read
+> contract. It does not implement source/legal-version supersession, which
+> remains outside the current boundary.
+
 ## Context
 
 The interchange contract preserves a regulatory chain that the existing CISO
@@ -41,8 +46,9 @@ The Phase 1 write boundary is append-mostly:
 
 - payload rows are created through one atomic service and are not editable or
   deletable through the API;
-- a future correction will close only the predecessor's `recorded_to` and add a
-  successor revision rather than overwrite its payload;
+- a correction closes only the predecessor's `recorded_to` and adds a successor
+  revision rather than overwriting its payload; the concrete bounded operation
+  is defined by ADR 0002;
 - obligation review changes are append-only events linked to the exact
   obligation revision;
 - the initial slice permits only `machine_proposed -> analyst_reviewed ->
@@ -106,7 +112,8 @@ provenance time are preserved as interchange/import facts; registration
 Remain target-only:
 
 - applicability facts, rules, and decisions;
-- source-version supersession relationships and correction services;
+- source/legal-version supersession relationships; recorded-time correction is
+  implemented separately by ADR 0002;
 - binding DecisionRecords and publication;
 - library/control/policy/evidence/finding projections;
 - source bytes, OCR, licensed text storage, WORM retention, and bulk catalog

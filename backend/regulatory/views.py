@@ -1,17 +1,21 @@
-from django.db.models import Prefetch
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
+from rest_framework.exceptions import NotFound, ValidationError
+from rest_framework.response import Response
 
 from core.views import BaseModelViewSet as AbstractBaseModelViewSet
+from iam.models import Folder
 
-from .models import (
-    RegulatoryDocument,
-    RegulatoryDocumentVersion,
-    RegulatoryObligation,
-    RegulatoryObligationReviewEvent,
-    RegulatoryProvision,
-)
+from .models import RegulatoryDocument
 from .serializers import (
     RegulatoryDocumentDetailSerializer,
     RegulatoryDocumentReadSerializer,
+)
+from .services.records import (
+    regulatory_document_recorded_floor,
+    select_regulatory_chain_at,
 )
 
 
@@ -35,49 +39,83 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
             return RegulatoryDocumentDetailSerializer
         return RegulatoryDocumentReadSerializer
 
-    def get_queryset(self):
-        queryset = super().get_queryset()
-        if getattr(self, "action", None) != "retrieve":
-            return queryset
+    def _selection_time(self, recorded_floor=None):
+        cached = getattr(self, "_recorded_time_selection", None)
+        if cached is not None:
+            return cached
 
-        review_events = RegulatoryObligationReviewEvent.objects.select_related("actor")
-        current_provisions = RegulatoryProvision.objects.filter(
-            recorded_to__isnull=True
+        values = self.request.query_params.getlist("recorded_as_of")
+        wall_time = timezone.now()
+        request_time = (
+            max(wall_time, recorded_floor) if recorded_floor is not None else wall_time
         )
-        current_obligations = RegulatoryObligation.objects.filter(
-            recorded_to__isnull=True
-        ).prefetch_related(
-            Prefetch(
-                "review_events",
-                queryset=review_events,
-                to_attr="prefetched_review_events",
-            ),
-            Prefetch(
-                "provisions",
-                queryset=current_provisions,
-                to_attr="current_source_provisions",
-            ),
+        if getattr(self, "action", None) != "retrieve":
+            if values:
+                raise ValidationError(
+                    {
+                        "recorded_as_of": (
+                            "Recorded-time selection is available only on detail."
+                        )
+                    }
+                )
+            selection = (request_time, None)
+        elif not values:
+            selection = (request_time, None)
+        else:
+            if len(values) != 1 or not values[0].strip():
+                raise ValidationError(
+                    {"recorded_as_of": "Provide one non-empty timestamp."}
+                )
+            parsed = parse_datetime(values[0])
+            if parsed is None or timezone.is_naive(parsed):
+                raise ValidationError(
+                    {"recorded_as_of": ("Use a timezone-aware RFC 3339 date-time.")}
+                )
+            if parsed > request_time:
+                raise ValidationError(
+                    {"recorded_as_of": "A future recorded-time query is not allowed."}
+                )
+            selection = (parsed, parsed)
+        self._recorded_time_selection = selection
+        return selection
+
+    def get_queryset(self):
+        if getattr(
+            self, "action", None
+        ) != "retrieve" and self.request.query_params.getlist("recorded_as_of"):
+            self._selection_time()
+        return super().get_queryset()
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        _, requested = self._selection_time()
+        context["requested_recorded_as_of"] = requested
+        return context
+
+    @transaction.atomic
+    def retrieve(self, request, *args, **kwargs):
+        document = self.get_object()
+        folder = Folder.objects.select_for_update().get(pk=document.folder_id)
+        recorded_floor = regulatory_document_recorded_floor(
+            document=document,
+            folder=folder,
         )
-        current_provisions = current_provisions.prefetch_related(
-            Prefetch(
-                "obligations",
-                queryset=current_obligations,
-                to_attr="current_obligations",
+        selection_time, _ = self._selection_time(recorded_floor)
+        try:
+            chain = select_regulatory_chain_at(
+                document=document,
+                folder=folder,
+                recorded_as_of=selection_time,
             )
-        )
-        current_versions = RegulatoryDocumentVersion.objects.filter(
-            recorded_to__isnull=True
-        ).prefetch_related(
-            Prefetch(
-                "provisions",
-                queryset=current_provisions,
-                to_attr="current_provisions",
-            ),
-        )
-        return queryset.prefetch_related(
-            Prefetch(
-                "versions",
-                queryset=current_versions,
-                to_attr="current_versions",
-            )
-        )
+            document.selected_versions = [chain.document_version]
+        except DjangoValidationError as exc:
+            raise NotFound(
+                "No complete regulatory chain exists at the requested recorded time."
+            ) from exc
+        serializer = self.get_serializer(document)
+        data = serializer.data
+        field_models = self._get_fieldsrelated_map(serializer)
+        if field_models:
+            allowed_ids = self._get_accessible_ids_map(set(field_models.values()))
+            data = self._filter_related_fields(data, field_models, allowed_ids)
+        return Response(data)

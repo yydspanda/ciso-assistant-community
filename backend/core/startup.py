@@ -1855,6 +1855,7 @@ ADMINISTRATOR_PERMISSIONS_LIST = [
 REGULATORY_READ_PERMISSIONS = ["view_regulatorydocument"]
 REGULATORY_SERVICE_PERMISSIONS = [
     "ingest_regulatoryrecord",
+    "correct_regulatoryrecord",
     "transition_regulatoryobligation",
 ]
 REGULATORY_LEGAL_REVIEW_PERMISSIONS = [

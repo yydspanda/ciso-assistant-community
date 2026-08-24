@@ -21,6 +21,8 @@ from .validators import (
     validate_string_list,
 )
 
+CORRECTION_DIGEST_SCHEMA = "regulatory-chain-correction/v1"
+
 
 class AuthorityLevel(models.TextChoices):
     LAW = "law", _("Law")
@@ -214,7 +216,11 @@ class RegulatoryDocument(RegulatoryFolderModel):
             (
                 "ingest_regulatoryrecord",
                 "Can atomically ingest a regulatory record chain",
-            )
+            ),
+            (
+                "correct_regulatoryrecord",
+                "Can atomically correct a current regulatory record chain",
+            ),
         ]
 
     def __str__(self) -> str:
@@ -371,6 +377,12 @@ class RegulatoryDocumentVersion(TemporalRevisionMixin, RegulatoryFolderModel):
 
     class Meta:
         ordering = ["record_id", "revision"]
+        indexes = [
+            models.Index(
+                fields=["folder", "document", "recorded_from"],
+                name="reg_ver_doc_asof_idx",
+            )
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=["folder", "record_id", "revision"],
@@ -930,7 +942,7 @@ class RegulatoryObligationReviewEvent(RegulatoryFolderModel):
         errors = {}
         if self.obligation_id and self.obligation.folder_id != self.folder_id:
             errors["obligation"] = "The event must use its obligation folder."
-        if not self.rationale.strip():
+        if not (self.rationale or "").strip():
             errors["rationale"] = "A review rationale is required."
         expected_edge = {
             1: (
@@ -957,6 +969,274 @@ class RegulatoryObligationReviewEvent(RegulatoryFolderModel):
         super().clean()
 
 
+class RegulatoryChainCorrectionEvent(RegulatoryFolderModel):
+    """Auditable boundary for one atomic recorded-time chain correction."""
+
+    class CorrectionKind(models.TextChoices):
+        RECORDED_TIME = "recorded_time", _("Recorded-time correction")
+
+    document = models.ForeignKey(
+        RegulatoryDocument,
+        on_delete=models.PROTECT,
+        related_name="correction_events",
+    )
+    previous_document_version = models.ForeignKey(
+        RegulatoryDocumentVersion,
+        on_delete=models.PROTECT,
+        related_name="correction_events_as_previous",
+        db_index=False,
+    )
+    successor_document_version = models.ForeignKey(
+        RegulatoryDocumentVersion,
+        on_delete=models.PROTECT,
+        related_name="correction_events_as_successor",
+        db_index=False,
+    )
+    previous_provision = models.ForeignKey(
+        RegulatoryProvision,
+        on_delete=models.PROTECT,
+        related_name="correction_events_as_previous",
+        db_index=False,
+    )
+    successor_provision = models.ForeignKey(
+        RegulatoryProvision,
+        on_delete=models.PROTECT,
+        related_name="correction_events_as_successor",
+        db_index=False,
+    )
+    previous_obligation = models.ForeignKey(
+        RegulatoryObligation,
+        on_delete=models.PROTECT,
+        related_name="correction_events_as_previous",
+        db_index=False,
+    )
+    successor_obligation = models.ForeignKey(
+        RegulatoryObligation,
+        on_delete=models.PROTECT,
+        related_name="correction_events_as_successor",
+        db_index=False,
+    )
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="regulatory_chain_corrections",
+    )
+    correction_kind = models.CharField(
+        max_length=24,
+        choices=CorrectionKind.choices,
+        default=CorrectionKind.RECORDED_TIME,
+    )
+    digest_schema = models.CharField(
+        max_length=64,
+        default=CORRECTION_DIGEST_SCHEMA,
+        editable=False,
+    )
+    occurred_at = models.DateTimeField()
+    rationale = models.TextField(max_length=4000)
+    idempotency_key = models.CharField(max_length=200)
+    payload_sha256 = models.CharField(max_length=64, validators=[validate_sha256])
+    before_payload_sha256 = models.CharField(
+        max_length=64,
+        validators=[validate_sha256],
+    )
+    after_payload_sha256 = models.CharField(
+        max_length=64,
+        validators=[validate_sha256],
+    )
+
+    class Meta:
+        ordering = ["occurred_at", "id"]
+        indexes = [
+            models.Index(
+                fields=["folder", "document", "occurred_at"],
+                name="reg_correction_doc_time_idx",
+            )
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["folder", "idempotency_key"],
+                name="reg_correction_idempotency_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["previous_document_version"],
+                name="reg_correction_previous_ver_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["successor_document_version"],
+                name="reg_correction_successor_ver_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["previous_provision"],
+                name="reg_correction_previous_prov_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["successor_provision"],
+                name="reg_correction_successor_prov_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["previous_obligation"],
+                name="reg_correction_previous_obl_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["successor_obligation"],
+                name="reg_correction_successor_obl_uniq",
+            ),
+            models.CheckConstraint(
+                condition=Q(correction_kind="recorded_time"),
+                name="reg_correction_recorded_time",
+            ),
+            models.CheckConstraint(
+                condition=Q(digest_schema=CORRECTION_DIGEST_SCHEMA),
+                name="reg_correction_digest_schema",
+            ),
+            models.CheckConstraint(
+                condition=~Q(before_payload_sha256=F("after_payload_sha256")),
+                name="reg_correction_payload_changed",
+            ),
+            models.CheckConstraint(
+                condition=~Q(previous_document_version=F("successor_document_version")),
+                name="reg_correction_version_changed",
+            ),
+            models.CheckConstraint(
+                condition=~Q(previous_provision=F("successor_provision")),
+                name="reg_correction_provision_changed",
+            ),
+            models.CheckConstraint(
+                condition=~Q(previous_obligation=F("successor_obligation")),
+                name="reg_correction_obligation_changed",
+            ),
+            models.CheckConstraint(
+                condition=~Q(rationale=""),
+                name="reg_correction_rationale_present",
+            ),
+            models.CheckConstraint(
+                condition=Q(is_published=False),
+                name="reg_correction_not_published",
+            ),
+        ]
+
+    def _validate_successor_pair(self, previous, successor, field: str) -> dict:
+        errors = {}
+        if (
+            previous.folder_id != self.folder_id
+            or successor.folder_id != self.folder_id
+        ):
+            errors[field] = "Correction revisions must remain in the event folder."
+        elif successor.previous_revision_id != previous.id:
+            errors[field] = "The successor must link to the recorded predecessor."
+        elif successor.record_id != previous.record_id:
+            errors[field] = "The successor must preserve the portable record ID."
+        elif successor.revision != previous.revision + 1:
+            errors[field] = "The successor revision must increment by one."
+        elif previous.recorded_to != self.occurred_at:
+            errors[field] = "The predecessor must close at the correction time."
+        elif successor.recorded_from != self.occurred_at:
+            errors[field] = "The successor must start at the correction time."
+        return errors
+
+    def clean(self) -> None:
+        errors = {}
+        if self.document_id and self.document.folder_id != self.folder_id:
+            errors["document"] = "The document must be in the correction folder."
+        if not (self.rationale or "").strip():
+            errors["rationale"] = "A correction rationale is required."
+        if self.before_payload_sha256 == self.after_payload_sha256:
+            errors["after_payload_sha256"] = "A correction must change the chain."
+
+        pairs = (
+            (
+                "previous_document_version_id",
+                "successor_document_version_id",
+                "previous_document_version",
+                "successor_document_version",
+                "successor_document_version",
+            ),
+            (
+                "previous_provision_id",
+                "successor_provision_id",
+                "previous_provision",
+                "successor_provision",
+                "successor_provision",
+            ),
+            (
+                "previous_obligation_id",
+                "successor_obligation_id",
+                "previous_obligation",
+                "successor_obligation",
+                "successor_obligation",
+            ),
+        )
+        for previous_id, successor_id, previous_attr, successor_attr, field in pairs:
+            if getattr(self, previous_id) and getattr(self, successor_id):
+                errors.update(
+                    self._validate_successor_pair(
+                        getattr(self, previous_attr),
+                        getattr(self, successor_attr),
+                        field,
+                    )
+                )
+
+        if (
+            self.previous_document_version_id
+            and self.document_id
+            and self.previous_document_version.document_id != self.document_id
+        ):
+            errors["previous_document_version"] = (
+                "The predecessor version must belong to the corrected document."
+            )
+        if (
+            self.successor_document_version_id
+            and self.document_id
+            and self.successor_document_version.document_id != self.document_id
+        ):
+            errors["successor_document_version"] = (
+                "The successor version must belong to the corrected document."
+            )
+        if (
+            self.previous_provision_id
+            and self.previous_document_version_id
+            and self.previous_provision.document_version_id
+            != self.previous_document_version_id
+        ):
+            errors["previous_provision"] = (
+                "The predecessor provision must belong to the predecessor version."
+            )
+        if (
+            self.successor_provision_id
+            and self.successor_document_version_id
+            and self.successor_provision.document_version_id
+            != self.successor_document_version_id
+        ):
+            errors["successor_provision"] = (
+                "The successor provision must belong to the successor version."
+            )
+        if (
+            self.previous_obligation_id
+            and self.previous_provision_id
+            and not self.previous_obligation.provision_links.filter(
+                folder_id=self.folder_id,
+                provision_id=self.previous_provision_id,
+            ).exists()
+        ):
+            errors["previous_obligation"] = (
+                "The predecessor obligation must cite the predecessor provision."
+            )
+        if (
+            self.successor_obligation_id
+            and self.successor_provision_id
+            and not self.successor_obligation.provision_links.filter(
+                folder_id=self.folder_id,
+                provision_id=self.successor_provision_id,
+            ).exists()
+        ):
+            errors["successor_obligation"] = (
+                "The successor obligation must cite the successor provision."
+            )
+        if errors:
+            raise ValidationError(errors)
+        super().clean()
+
+
 common_exclude = ["created_at", "updated_at"]
 auditlog.register(RegulatoryDocument, exclude_fields=common_exclude)
 auditlog.register(EntityDocumentRegistration, exclude_fields=common_exclude)
@@ -965,3 +1245,4 @@ auditlog.register(RegulatoryProvision, exclude_fields=common_exclude)
 auditlog.register(RegulatoryObligation, exclude_fields=common_exclude)
 auditlog.register(RegulatoryObligationProvision, exclude_fields=common_exclude)
 auditlog.register(RegulatoryObligationReviewEvent, exclude_fields=common_exclude)
+auditlog.register(RegulatoryChainCorrectionEvent, exclude_fields=common_exclude)

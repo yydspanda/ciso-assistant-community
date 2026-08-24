@@ -8,6 +8,11 @@ description: Proposed trust boundaries and information flow for the China financ
 > regulatory layer preserves legal source, version, applicability, and
 > provenance before reviewed obligations are projected into frameworks.
 
+> **Current Phase 1 subset:** the regulatory layer persists one synthetic,
+> metadata-only Document -> Version -> Provision -> Obligation chain. Its public
+> API is read-only. Applicability, legal supersession, approval/publication,
+> source text, real-institution facts, projections, and agents remain proposed.
+
 ```mermaid
 flowchart LR
     A[Official sources and approved internal rules]
@@ -24,6 +29,29 @@ flowchart LR
     E --> F
     F --> G --> H --> E
 ```
+
+## Current recorded-time contract
+
+A named human with folder-scoped correction authority can invoke the internal
+regulatory service to repair one current synthetic chain. The transaction locks
+the folder and full aggregate, chooses one server time, closes the three current
+recorded intervals, appends directly linked successors, and records an
+idempotent audit event with rationale and before/after hashes. The service is
+metadata-only and cannot claim that a regulator issued or superseded a legal
+version. A corrected obligation returns to `machine_proposed`, so prior review
+does not silently carry forward.
+
+Document detail accepts an optional timezone-aware `recorded_as_of` value. It
+uses half-open intervals and one joined citation chain, applies the same time to
+review events, and returns no result when history is missing or inconsistent.
+The read path locks the same folder before capturing its selection time, so a
+concurrent current read is defined wholly before or after a correction. Object
+and related-field IAM continue to apply to the custom response.
+
+These behaviours are tested on the project's SQLite path. PostgreSQL migration,
+two-connection concurrency, and representative query-plan evidence remain
+production acceptance gates. The durable contract and rollback boundary are in
+[ADR 0002](../../../documentation/china-financial-grc/adr/0002-recorded-time-correction.md).
 
 ## Trust boundaries
 

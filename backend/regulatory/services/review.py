@@ -1,5 +1,8 @@
+from datetime import timedelta
+
 from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.utils import timezone
 
 from iam.models import Folder, ServiceAccount, User
 from regulatory.models import (
@@ -51,8 +54,20 @@ def transition_obligation_review(
     if not idempotency_key or not idempotency_key.strip():
         raise ValidationError({"idempotency_key": "A non-empty key is required."})
     actor = lock_regulatory_actor(actor=actor)
-    obligation = RegulatoryObligation.objects.select_for_update().get(pk=obligation_id)
-    folder = Folder.objects.select_for_update().get(pk=obligation.folder_id)
+    folder_id = (
+        RegulatoryObligation.objects.filter(pk=obligation_id)
+        .values_list("folder_id", flat=True)
+        .first()
+    )
+    if folder_id is None:
+        raise RegulatoryObligation.DoesNotExist
+    # Regulatory mutations share actor -> folder -> aggregate lock ordering.
+    # The initial lookup is intentionally unlocked and is revalidated below.
+    folder = Folder.objects.select_for_update().get(pk=folder_id)
+    obligation = RegulatoryObligation.objects.select_for_update().get(
+        pk=obligation_id,
+        folder=folder,
+    )
     requested_edge = (expected_from_status, to_status)
     required_permission = REVIEW_TRANSITION_PERMISSIONS.get(requested_edge)
     if required_permission is None:
@@ -121,6 +136,15 @@ def transition_obligation_review(
             {"actor": "Analyst and legal review require different named actors."}
         )
 
+    latest_known_time = max(
+        obligation.recorded_from,
+        latest.occurred_at if latest is not None else obligation.recorded_from,
+    )
+    occurred_at = max(
+        timezone.now(),
+        latest_known_time + timedelta(microseconds=1),
+    )
+
     return RegulatoryObligationReviewEvent.objects.create(
         folder=folder,
         obligation=obligation,
@@ -128,6 +152,7 @@ def transition_obligation_review(
         from_status=current_status,
         to_status=to_status,
         actor=actor,
+        occurred_at=occurred_at,
         rationale=rationale,
         idempotency_key=idempotency_key,
         payload_sha256=digest,

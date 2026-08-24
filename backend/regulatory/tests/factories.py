@@ -150,3 +150,35 @@ def chain_payload(suffix: str = "001") -> dict:
             "provenance": deepcopy(provenance),
         },
     }
+
+
+def correction_payload(
+    suffix: str,
+    *,
+    expected_payload_sha256: str,
+    expected_revision: int = 1,
+) -> dict:
+    """Build a full semantic successor payload without server-owned time fields."""
+
+    payload = chain_payload(suffix)
+    version = payload["document_version"]
+    provision = payload["provision"]
+    obligation = payload["obligation"]
+    for revision_payload in (version, provision, obligation):
+        revision_payload.pop("recorded_from")
+        revision_payload.pop("recorded_to")
+    obligation["action"] = (
+        f"经记录时间纠错后保留可复核的合成测试记录 r{expected_revision + 1}"
+    )
+    obligation["uncertainties"] = ["Corrected proposal requires fresh human review"]
+    return {
+        "expected_revisions": {
+            "document_version": expected_revision,
+            "provision": expected_revision,
+            "obligation": expected_revision,
+            "semantic_payload_sha256": expected_payload_sha256,
+        },
+        "document_version": version,
+        "provision": provision,
+        "obligation": obligation,
+    }

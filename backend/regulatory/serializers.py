@@ -48,7 +48,9 @@ class RegulatoryObligationReadSerializer(serializers.ModelSerializer):
         ]
 
     def get_review_status(self, obj: RegulatoryObligation) -> str:
-        return obj.current_review_status
+        events = getattr(obj, "prefetched_review_events", [])
+        latest = max(events, key=lambda event: event.sequence, default=None)
+        return latest.to_status if latest else obj.review_status
 
     def get_deadline(self, obj: RegulatoryObligation) -> dict:
         return {
@@ -61,12 +63,7 @@ class RegulatoryObligationReadSerializer(serializers.ModelSerializer):
         return obj.provenance_payload()
 
     def get_provision_ids(self, obj: RegulatoryObligation) -> list[str]:
-        provisions = getattr(obj, "current_source_provisions", None)
-        if provisions is None:
-            provisions = obj.provisions.filter(
-                recorded_to__isnull=True,
-                folder_id=obj.folder_id,
-            )
+        provisions = getattr(obj, "selected_source_provisions", [])
         return [
             provision.record_id
             for provision in provisions
@@ -109,18 +106,17 @@ class RegulatoryProvisionReadSerializer(serializers.ModelSerializer):
         return obj.provenance_payload()
 
     def get_obligations(self, obj: RegulatoryProvision) -> list[dict]:
-        obligations = getattr(obj, "current_obligations", None)
-        if obligations is None:
-            obligations = obj.obligations.filter(
-                recorded_to__isnull=True,
-                folder_id=obj.folder_id,
-            )
+        obligations = getattr(obj, "selected_obligations", [])
         obligations = [
             obligation
             for obligation in obligations
             if obligation.folder_id == obj.folder_id
         ]
-        return RegulatoryObligationReadSerializer(obligations, many=True).data
+        return RegulatoryObligationReadSerializer(
+            obligations,
+            many=True,
+            context=self.context,
+        ).data
 
 
 class RegulatoryDocumentVersionReadSerializer(serializers.ModelSerializer):
@@ -169,18 +165,17 @@ class RegulatoryDocumentVersionReadSerializer(serializers.ModelSerializer):
         return []
 
     def get_provisions(self, obj: RegulatoryDocumentVersion) -> list[dict]:
-        provisions = getattr(obj, "current_provisions", None)
-        if provisions is None:
-            provisions = obj.provisions.filter(
-                recorded_to__isnull=True,
-                folder_id=obj.folder_id,
-            )
+        provisions = getattr(obj, "selected_provisions", [])
         provisions = [
             provision
             for provision in provisions
             if provision.folder_id == obj.folder_id
         ]
-        return RegulatoryProvisionReadSerializer(provisions, many=True).data
+        return RegulatoryProvisionReadSerializer(
+            provisions,
+            many=True,
+            context=self.context,
+        ).data
 
 
 class RegulatoryDocumentReadSerializer(BaseModelSerializer):
@@ -210,28 +205,33 @@ class RegulatoryDocumentDetailSerializer(RegulatoryDocumentReadSerializer):
     document_versions = serializers.SerializerMethodField()
     contract_status = serializers.SerializerMethodField()
     legal_conclusion = serializers.SerializerMethodField()
+    recorded_as_of = serializers.SerializerMethodField()
 
     class Meta(RegulatoryDocumentReadSerializer.Meta):
         fields = RegulatoryDocumentReadSerializer.Meta.fields + [
             "contract_status",
             "legal_conclusion",
+            "recorded_as_of",
             "document_versions",
         ]
 
     def get_document_versions(self, obj: RegulatoryDocument) -> list[dict]:
-        versions = getattr(obj, "current_versions", None)
-        if versions is None:
-            versions = obj.versions.filter(
-                recorded_to__isnull=True,
-                folder_id=obj.folder_id,
-            )
+        versions = getattr(obj, "selected_versions", [])
         versions = [
             version for version in versions if version.folder_id == obj.folder_id
         ]
-        return RegulatoryDocumentVersionReadSerializer(versions, many=True).data
+        return RegulatoryDocumentVersionReadSerializer(
+            versions,
+            many=True,
+            context=self.context,
+        ).data
 
     def get_contract_status(self, obj: RegulatoryDocument) -> str:
         return "draft"
 
     def get_legal_conclusion(self, obj: RegulatoryDocument) -> bool:
         return False
+
+    def get_recorded_as_of(self, obj: RegulatoryDocument) -> str | None:
+        recorded_as_of = self.context.get("requested_recorded_as_of")
+        return recorded_as_of.isoformat() if recorded_as_of is not None else None

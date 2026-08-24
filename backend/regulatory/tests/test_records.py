@@ -1,8 +1,11 @@
 from copy import deepcopy
+from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
+from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied
 
 from regulatory.models import (
@@ -105,6 +108,20 @@ def test_chain_ingestion_is_atomic_and_idempotent(regulatory_root):
         idempotency_key="same-key",
     )
     assert second.document.id == first.document.id
+
+    regressed_now = first.document_version.recorded_from - timedelta(days=1)
+    with patch("regulatory.services.records.timezone.now", return_value=regressed_now):
+        clock_regression_retry = create_regulatory_chain(
+            actor=actor,
+            entity=entity,
+            payload=deepcopy(payload),
+            idempotency_key="same-key",
+        )
+    assert clock_regression_retry.document.id == first.document.id
+    assert clock_regression_retry.document_version.id == first.document_version.id
+    assert clock_regression_retry.provision.id == first.provision.id
+    assert clock_regression_retry.obligation.id == first.obligation.id
+
     assert RegulatoryDocument.objects.count() == 1
     assert RegulatoryDocumentVersion.objects.count() == 1
     assert RegulatoryProvision.objects.count() == 1
@@ -171,6 +188,30 @@ def test_invalid_temporal_or_source_input_rolls_back_entire_chain(regulatory_roo
             entity=entity,
             payload=payload,
             idempotency_key="invalid-stage",
+        )
+    assert RegulatoryDocument.objects.count() == 0
+
+    payload = chain_payload("RECORDED-MISMATCH")
+    payload["provision"]["recorded_from"] = "2026-08-21T00:00:01+08:00"
+    with pytest.raises(ValidationError, match="must start together"):
+        create_regulatory_chain(
+            actor=actor,
+            entity=entity,
+            payload=payload,
+            idempotency_key="invalid-recorded-mismatch",
+        )
+    assert RegulatoryDocument.objects.count() == 0
+
+    payload = chain_payload("RECORDED-FUTURE")
+    future = (timezone.now() + timedelta(days=1)).isoformat()
+    for record_name in ("document_version", "provision", "obligation"):
+        payload[record_name]["recorded_from"] = future
+    with pytest.raises(ValidationError, match="cannot be in the future"):
+        create_regulatory_chain(
+            actor=actor,
+            entity=entity,
+            payload=payload,
+            idempotency_key="invalid-recorded-future",
         )
     assert RegulatoryDocument.objects.count() == 0
 

@@ -67,6 +67,46 @@ CISO Assistant already provides several strong foundations:
 
 The extension should preserve those boundaries.
 
+## Implemented Phase 1 boundary
+
+The current as-built regulatory layer is the bounded `backend/regulatory`
+Django app. It owns a synthetic, metadata-only Document -> DocumentVersion ->
+Provision -> Obligation aggregate, entity registration, append-only non-binding
+review events, controlled recorded-time correction, and current/historical
+read selection. CISO Assistant continues to own users, service accounts,
+folders, IAM, and the synthetic `tprm.Entity`; no parallel IAM, workflow, or GRC
+store is introduced.
+
+The public `/api/regulatory/v1/` surface remains read-only. Its detail operation
+accepts an optional timezone-aware `recorded_as_of`, resolves one coherent
+folder-consistent revision chain with half-open recorded intervals, and limits
+review events to the same selection time. The detail path preserves both object
+IAM and related-field masking. Missing or ambiguous aggregates fail closed.
+
+Recorded-time repair is an internal deterministic domain operation, not an
+agent or public write endpoint. A named human with the folder-scoped correction
+permission may submit one complete typed successor set for a `SYNTHETIC-*`
+entity. The transaction locks the actor, entity/folder, registration and full
+aggregate, chooses one server cutoff, closes all three current revisions, adds
+linked successors, and records an immutable correction event with semantic
+before/after hashes. Corrected obligations restart at `machine_proposed`, so a
+previous review cannot silently endorse new content.
+
+The folder is the aggregate concurrency boundary. Mutations acquire it before
+child rows; detail reads acquire the same lock before capturing their selection
+time. Review/correction timestamps advance after the aggregate's latest known
+recorded event, and reads floor wall time at the latest committed aggregate
+time. This provides a defined before-or-after result for a concurrent current
+read and correction and prevents clock rollback from hiding committed state.
+PostgreSQL two-connection and query-plan evidence remains an external
+production gate; SQLite tests are not a substitute for it.
+
+This as-built subset does not own source bytes or legal supersession,
+applicability, binding decisions, approval/publication, real institution facts,
+library projections, UI writes, or agent execution. Those remain target
+components gated by the delivery roadmap. The exact correction decision is in
+[ADR 0002](adr/0002-recorded-time-correction.md).
+
 ## New logical components
 
 ### 1. Regulatory source service

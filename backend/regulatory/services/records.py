@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 
-from django.core.exceptions import ValidationError
+from django.core.exceptions import (
+    MultipleObjectsReturned,
+    ObjectDoesNotExist,
+    ValidationError,
+)
 from django.db import transaction
+from django.db.models import Max, Q
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
 from iam.models import Folder, User
 from tprm.models import Entity
@@ -16,6 +24,7 @@ from regulatory.models import (
     RegulatoryDocumentVersion,
     RegulatoryObligation,
     RegulatoryObligationProvision,
+    RegulatoryObligationReviewEvent,
     RegulatoryProvision,
 )
 
@@ -29,11 +38,12 @@ from .common import (
 
 @dataclass(frozen=True)
 class RegulatoryChain:
-    registration: EntityDocumentRegistration
+    registration: EntityDocumentRegistration | None
     document: RegulatoryDocument
     document_version: RegulatoryDocumentVersion
     provision: RegulatoryProvision
     obligation: RegulatoryObligation
+    recorded_as_of: datetime | None = None
 
 
 def _provenance_fields(payload: dict) -> dict:
@@ -118,6 +128,32 @@ def _validate_first_slice_contract(payload: RegulatoryChainPayload) -> None:
             errors[f"{record_name}.recorded_to"] = (
                 "The first slice accepts only current recorded revisions."
             )
+    recorded_starts = {
+        record_name: parse_datetime(record["recorded_from"])
+        for record_name, record in (
+            ("document_version", version),
+            ("provision", provision),
+            ("obligation", obligation),
+        )
+    }
+    for record_name, recorded_from in recorded_starts.items():
+        if recorded_from is None or timezone.is_naive(recorded_from):
+            errors[f"{record_name}.recorded_from"] = (
+                "A timezone-aware RFC 3339 recorded_from is required."
+            )
+        elif recorded_from > timezone.now():
+            errors[f"{record_name}.recorded_from"] = (
+                "An initial recorded_from cannot be in the future."
+            )
+    aware_starts = [
+        value
+        for value in recorded_starts.values()
+        if value is not None and timezone.is_aware(value)
+    ]
+    if len(aware_starts) == 3 and len(set(aware_starts)) != 1:
+        errors["recorded_from"] = (
+            "The initial version, provision, and obligation must start together."
+        )
     if errors:
         raise ValidationError(errors)
 
@@ -133,19 +169,22 @@ def _existing_chain(
         document=document,
         folder=registration.folder,
         record_id=payload["document_version"]["id"],
-        recorded_to__isnull=True,
+        revision=1,
+        previous_revision__isnull=True,
     )
     provision = RegulatoryProvision.objects.get(
         document_version=version,
         folder=registration.folder,
         record_id=payload["provision"]["id"],
-        recorded_to__isnull=True,
+        revision=1,
+        previous_revision__isnull=True,
     )
     obligation = RegulatoryObligation.objects.get(
         provision_links__provision=provision,
         folder=registration.folder,
         record_id=payload["obligation"]["id"],
-        recorded_to__isnull=True,
+        revision=1,
+        previous_revision__isnull=True,
     )
     return RegulatoryChain(
         registration=registration,
@@ -189,7 +228,6 @@ def create_regulatory_chain(
         codename="ingest_regulatoryrecord",
         folder=folder,
     )
-    _validate_first_slice_contract(payload)
 
     digest = canonical_payload_sha256({"entity_id": str(entity.id), "payload": payload})
     existing = (
@@ -204,6 +242,11 @@ def create_regulatory_chain(
                 {"idempotency_key": "The key is bound to a different payload."}
             )
         return _existing_chain(existing, payload)
+
+    # Validate wall-clock-sensitive fields only for a new command. An exact
+    # retry is bound to the already committed payload digest and must remain
+    # idempotent if the host clock later moves behind its recorded timestamp.
+    _validate_first_slice_contract(payload)
 
     document_data = payload["document"]
     version_data = payload["document_version"]
@@ -322,20 +365,166 @@ def create_regulatory_chain(
     )
 
 
+def _recorded_interval_query(prefix: str, recorded_as_of: datetime) -> Q:
+    return Q(**{f"{prefix}recorded_from__lte": recorded_as_of}) & (
+        Q(**{f"{prefix}recorded_to__isnull": True})
+        | Q(**{f"{prefix}recorded_to__gt": recorded_as_of})
+    )
+
+
+def regulatory_document_recorded_floor(
+    *,
+    document: RegulatoryDocument,
+    folder: Folder,
+) -> datetime | None:
+    """Return the latest committed recorded timestamp for a locked document."""
+
+    version_floor = RegulatoryDocumentVersion.objects.filter(
+        folder=folder,
+        document=document,
+    ).aggregate(value=Max("recorded_from"))["value"]
+    review_floor = RegulatoryObligationReviewEvent.objects.filter(
+        folder=folder,
+        obligation__folder=folder,
+        obligation__provision_links__folder=folder,
+        obligation__provision_links__provision__folder=folder,
+        obligation__provision_links__provision__document_version__folder=folder,
+        obligation__provision_links__provision__document_version__document=document,
+    ).aggregate(value=Max("occurred_at"))["value"]
+    return max(
+        (value for value in (version_floor, review_floor) if value is not None),
+        default=None,
+    )
+
+
+def select_regulatory_chain_at(
+    *,
+    document: RegulatoryDocument,
+    folder: Folder,
+    recorded_as_of: datetime,
+    registration: EntityDocumentRegistration | None = None,
+) -> RegulatoryChain:
+    """Select one coherent revision set while the caller holds the folder lock."""
+
+    if timezone.is_naive(recorded_as_of):
+        raise ValidationError(
+            {"recorded_as_of": "A timezone-aware datetime is required."}
+        )
+    if document.folder_id != folder.id:
+        raise ValidationError("The regulatory document folder is inconsistent.")
+    if registration is not None and (
+        registration.folder_id != folder.id or registration.document_id != document.id
+    ):
+        raise ValidationError("The regulatory registration is inconsistent.")
+    try:
+        link = (
+            RegulatoryObligationProvision.objects.select_related(
+                "obligation",
+                "provision__document_version",
+            )
+            .filter(
+                folder=folder,
+                obligation__folder=folder,
+                provision__folder=folder,
+                provision__document_version__folder=folder,
+                provision__document_version__document=document,
+            )
+            .filter(
+                _recorded_interval_query(
+                    "provision__document_version__",
+                    recorded_as_of,
+                )
+            )
+            .filter(_recorded_interval_query("provision__", recorded_as_of))
+            .filter(_recorded_interval_query("obligation__", recorded_as_of))
+            .get()
+        )
+    except (ObjectDoesNotExist, MultipleObjectsReturned) as exc:
+        raise ValidationError(
+            {
+                "recorded_as_of": (
+                    "No complete unique regulatory chain exists at this recorded time."
+                )
+            }
+        ) from exc
+    version = link.provision.document_version
+    provision = link.provision
+    obligation = link.obligation
+    active_versions = list(
+        RegulatoryDocumentVersion.objects.filter(
+            folder=folder,
+            document=document,
+        )
+        .filter(_recorded_interval_query("", recorded_as_of))
+        .values_list("pk", flat=True)[:2]
+    )
+    active_provisions = list(
+        RegulatoryProvision.objects.filter(
+            folder=folder,
+            document_version__folder=folder,
+            document_version__document=document,
+        )
+        .filter(
+            _recorded_interval_query("document_version__", recorded_as_of),
+            _recorded_interval_query("", recorded_as_of),
+        )
+        .values_list("pk", flat=True)[:2]
+    )
+    active_obligations = list(
+        RegulatoryObligation.objects.filter(
+            folder=folder,
+            record_id=obligation.record_id,
+        )
+        .filter(_recorded_interval_query("", recorded_as_of))
+        .values_list("pk", flat=True)[:2]
+    )
+    if (
+        active_versions != [version.pk]
+        or active_provisions != [provision.pk]
+        or active_obligations != [obligation.pk]
+    ):
+        raise ValidationError(
+            {
+                "recorded_as_of": (
+                    "The regulatory chain has ambiguous recorded-time cardinality."
+                )
+            }
+        )
+    obligation.prefetched_review_events = list(
+        obligation.review_events.filter(
+            folder=folder,
+            occurred_at__lte=recorded_as_of,
+        ).order_by("sequence")
+    )
+    obligation.selected_source_provisions = [provision]
+    provision.selected_obligations = [obligation]
+    version.selected_provisions = [provision]
+    document.selected_versions = [version]
+    return RegulatoryChain(
+        registration=registration,
+        document=document,
+        document_version=version,
+        provision=provision,
+        obligation=obligation,
+        recorded_as_of=recorded_as_of,
+    )
+
+
 @transaction.atomic
 def get_regulatory_chain(
     *,
     actor: User,
     entity: Entity,
     document_id,
+    recorded_as_of: datetime | None = None,
 ) -> RegulatoryChain:
-    """Retrieve the current one-document pilot chain within entity folder IAM."""
+    """Retrieve one coherent recorded-time chain within entity folder IAM."""
 
     actor = lock_regulatory_actor(actor=actor)
     if entity.pk is None:
         raise ValidationError({"entity": "A persisted synthetic entity is required."})
-    entity = Entity.objects.select_related("folder").get(pk=entity.pk)
-    folder = entity.folder
+    entity = Entity.objects.select_for_update().get(pk=entity.pk)
+    folder = Folder.objects.select_for_update().get(pk=entity.folder_id)
     require_regulatory_permission(
         actor=actor,
         codename="view_regulatorydocument",
@@ -349,22 +538,26 @@ def get_regulatory_chain(
     document = registration.document
     if document.folder_id != folder.id:
         raise ValidationError("The registered document folder is inconsistent.")
-    version = document.versions.get(
-        folder=folder,
-        recorded_to__isnull=True,
-    )
-    provision = version.provisions.get(
-        folder=folder,
-        recorded_to__isnull=True,
-    )
-    obligation = provision.obligations.get(
-        folder=folder,
-        recorded_to__isnull=True,
-    )
-    return RegulatoryChain(
-        registration=registration,
+    recorded_floor = regulatory_document_recorded_floor(
         document=document,
-        document_version=version,
-        provision=provision,
-        obligation=obligation,
+        folder=folder,
+    )
+    wall_time = timezone.now()
+    request_time = (
+        max(wall_time, recorded_floor) if recorded_floor is not None else wall_time
+    )
+    if recorded_as_of is not None:
+        if timezone.is_naive(recorded_as_of):
+            raise ValidationError(
+                {"recorded_as_of": "A timezone-aware datetime is required."}
+            )
+        if recorded_as_of > request_time:
+            raise ValidationError(
+                {"recorded_as_of": "A future recorded-time query is not allowed."}
+            )
+    return select_regulatory_chain_at(
+        document=document,
+        folder=folder,
+        registration=registration,
+        recorded_as_of=recorded_as_of or request_time,
     )

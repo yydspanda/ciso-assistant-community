@@ -37,6 +37,7 @@ a governed system of record with bounded AI capabilities:
 - [Migration and delivery plan](migration-plan.md)
 - [Open-source decisions](open-source-decisions.md)
 - [ADR 0001: bounded regulatory persistence](adr/0001-regulatory-persistence-boundary.md)
+- [ADR 0002: controlled recorded-time correction and historical retrieval](adr/0002-recorded-time-correction.md)
 - [`schemas/regulatory-record.schema.json`](schemas/regulatory-record.schema.json):
   the proposed `2.0.0-draft.1` interchange contract for regulatory knowledge
 - [`catalogs/regulatory-sources.json`](catalogs/regulatory-sources.json) and the
@@ -97,10 +98,23 @@ process.
 
 ## Implementation boundary
 
-Phase 1 now adds a bounded, read-only first persistence slice behind
-`/api/regulatory/v1/`. It stores only a synthetic-entity
-Document -> Version -> Provision -> Obligation chain and non-binding review
-events. It does not implement applicability decisions, approvals, publication,
-real-institution data, a library bridge, or an agent. Flattening regulatory
-history into `Framework` and `RequirementNode` remains prohibited; those
-objects receive only reviewed projections in a later gated phase.
+Phase 1 now persists a bounded synthetic-entity Document -> Version -> Provision
+-> Obligation chain and non-binding review events behind the read-only
+`/api/regulatory/v1/` API. A folder-scoped, named-human domain service can make
+metadata-only recorded-time corrections by atomically closing one current
+revision set and appending linked successors. It cannot claim source/legal
+supersession, and a corrected obligation restarts at `machine_proposed`.
+
+Document detail supports coherent historical selection through a timezone-aware
+`recorded_as_of` value and half-open recorded intervals. The read path locks the
+same folder boundary used by correction, resolves one joined chain, time-filters
+review events, and preserves CISO Assistant object and related-field IAM
+masking. See [ADR 0002](adr/0002-recorded-time-correction.md) for the exact
+contract and remaining PostgreSQL acceptance gates.
+
+This implemented boundary still has no applicability persistence, binding
+decision, approval or publication workflow, source/legal-version supersession,
+source text, real-institution data, reviewer UI, library bridge, or agent.
+Flattening regulatory history into `Framework` and `RequirementNode` remains
+prohibited; those objects receive only reviewed projections in a later gated
+phase.

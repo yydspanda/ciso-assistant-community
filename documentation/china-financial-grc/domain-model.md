@@ -78,6 +78,22 @@ Reviewed normative proposition derived from one or more provisions.
 
 An obligation becomes operational only after human review.
 
+### RegulatoryChainCorrectionEvent
+
+Implemented audit boundary for one recorded-time repair of the current
+DocumentVersion -> Provision -> Obligation revision set.
+
+- exact predecessor and successor references for all three records;
+- server-owned cutoff time shared by predecessor closure and successor start;
+- authenticated named-human actor, rationale, and folder-scoped idempotency
+  key;
+- canonical request, before-state, and after-state SHA-256 digests;
+- correction kind fixed to `recorded_time` and publication fixed to false.
+
+The event does not mean that an authority changed, amended, repealed, or
+superseded a legal instrument. Source/legal-version supersession needs a
+separate future contract with source evidence and legal review.
+
 ### ApplicabilityRule
 
 Structured conditions determining whether an obligation applies. Dimensions
@@ -178,8 +194,19 @@ Every versioned entity uses half-open validity intervals:
 ```
 
 `valid_to = null` means no known legal end. `recorded_to = null` means the row
-is the current recorded belief. Corrections create new recorded versions; they
-do not mutate history.
+is the current recorded belief. A recorded-time correction closes the current
+DocumentVersion, Provision, and Obligation at one server cutoff and appends
+direct successors beginning at that cutoff. It preserves portable record IDs,
+increments revisions, and never overwrites prior payload. Selection at the
+cutoff returns the successor; selection immediately before it returns the
+predecessor.
+
+For the implemented synthetic aggregate, current reads and corrections lock the
+same folder boundary before their selection/cutoff time. The historical selector
+then applies one timestamp to a joined citation chain and to its review events,
+so it cannot combine revisions from different recorded states. This lock and
+query contract still requires PostgreSQL concurrency and query-plan validation
+before production acceptance.
 
 ## Provenance rules
 
@@ -204,3 +231,19 @@ defines the portable `2.0.0-draft.1` contract. Its `draft` status is explicit;
 breaking changes remain possible until production consumers and migrations are
 defined. It is deliberately independent of Django models so it can be reviewed,
 tested, and exchanged before database migrations are committed.
+
+## Current implementation boundary
+
+The Phase 1 Django implementation currently persists only the synthetic,
+metadata-only Document -> DocumentVersion -> Provision -> Obligation subset,
+entity registration, non-binding review events, and the recorded-time
+correction event described above. The read-only detail API supports coherent
+`recorded_as_of` retrieval. A corrected obligation always restarts as
+`machine_proposed`; previous review events remain historical and do not transfer
+to the successor.
+
+Applicability rules and decisions in this document remain target design. The
+implementation does not yet persist fact snapshots, applicability results,
+control or policy mappings, DecisionRecords, source/legal supersession, source
+text, approval/publication, real-entity facts, or agents. See
+[ADR 0002](adr/0002-recorded-time-correction.md) for the implemented contract.

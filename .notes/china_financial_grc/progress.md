@@ -1,7 +1,7 @@
 # China Financial GRC Progress Ledger / 中国金融 GRC 进度台账
 
 > Status: **Authoritative execution record / 权威执行记录**
-> Updated: **2026-08-21**
+> Updated: **2026-08-24**
 > Branch: `agent/china-financial-grc-foundation`
 > Current phase: **Phase 1 — temporal regulatory persistence**
 
@@ -20,7 +20,7 @@ live in `delivery-roadmap.md`.
 | Official-source metadata packs | Complete for the current non-exhaustive seed; legal review remains unreviewed |
 | Applicability fact registry and deterministic artifact validation | Complete for draft interchange artifacts |
 | Project-level `AGENTS.md`, product skill, architecture skill, roadmap, and progress ledger | Complete and independently forward-tested in this change |
-| Django regulatory persistence, migrations, APIs, and reviewer workflow | First synthetic current-chain slice implemented and tested; correction, applicability, binding decisions, and UI remain open |
+| Django regulatory persistence, migrations, APIs, and reviewer workflow | Synthetic metadata-only chain, non-binding review, controlled recorded-time correction, and current/historical detail retrieval implemented and SQLite-tested; applicability, source/legal supersession, binding decisions, and UI remain open |
 | Reviewed provisions and obligations from the source packs | Not implemented; the end-to-end record is illustrative only |
 | Private internal-policy ingestion and mapping | Not implemented |
 | Read-only production agent, proposal writes, or continuous evidence connectors | Not implemented |
@@ -144,15 +144,51 @@ analyst/legal permission separation, aggregate child folders, entity metadata
 disclosure, and inherited generic actions. The final static review found no
 remaining merge blocker.
 
+Phase 1 recorded-time-correction verification:
+
+```text
+backend/.venv/bin/pytest backend/regulatory/tests -q --nomigrations --reuse-db
+  PASS — 25 focused model, service, API, IAM, temporal-boundary, review-reset,
+  stale-write, no-op, idempotency, corruption, and constraint tests
+
+backend/.venv/bin/pytest backend/regulatory/tests -q --create-db
+  PASS — 25 tests against the real migration boundary through 0002, including
+  current-read and exact-retry behavior under wall-clock regression
+
+backend/.venv/bin/python manage.py check
+  PASS — no system-check issues
+
+backend/.venv/bin/python manage.py makemigrations regulatory --check --dry-run
+  PASS — no migration drift
+
+isolated SQLite full-project database: regulatory 0001 -> 0002
+  PASS — apply; empty-history rollback to 0001; reapply to 0002
+
+isolated SQLite full-project database with an actual correction event
+  PASS — reverse to 0001 refused by the intended audit-history guard
+
+independent temporal, migration, API/IAM, and architecture reviews
+  PASS — no remaining Critical, High, or Medium finding
+```
+
+The migration and API checks cover one synthetic metadata-only aggregate. A
+separate brand-new empty SQLite `manage.py migrate regulatory 0002` rehearsal
+did not reach the regulatory app: the repository's pre-existing
+`iam.0009_create_allauth_emailaddress_objects` migration expected an installed
+allauth `account` app that was absent in that command environment. This is
+tracked as a fresh-empty environment limitation, not counted as regulatory
+migration evidence. No user database was modified.
+
 ## Current limitations and risks
 
 1. **Metadata is not reviewed law.** Source records are metadata-only discovery
    entries; included legal-review statuses remain `unreviewed`.
-2. **Persistence remains deliberately narrow.** The application stores one
-   current synthetic Document/Version/Provision/Obligation chain and non-binding
-   review events. It has no correction/supersession service, as-of history API,
-   applicability records, binding DecisionRecord, reviewer UI, or real source
-   ingestion.
+2. **Persistence remains deliberately narrow.** The application stores a
+   synthetic metadata-only Document/Version/Provision/Obligation chain,
+   non-binding review events, controlled recorded-time correction, and coherent
+   current/historical detail retrieval. It has no source/legal-version
+   supersession, applicability records, binding DecisionRecord, reviewer UI,
+   approval/publication, source-text intake, or real source ingestion.
 3. **No pilot entity facts.** Public artifacts cannot decide applicability for a
    real institution, licence, product, customer, data flow, or system.
 4. **No gold set or baseline.** Extraction, mapping, reviewer effort, latency,
@@ -170,17 +206,20 @@ remaining merge blocker.
    operations still require production database-role, trigger, or tamper-
    evident-storage decisions.
 9. **Production database evidence is pending.** Final focused tests use the
-   project's SQLite path; PostgreSQL apply/rollback, concurrency, lock, and
-   query-plan evidence remains a later release gate.
+   project's SQLite path. PostgreSQL apply/rollback plus two-connection
+   correction/read linearization on the shared folder lock, representative
+   current/history query plans, backup/restore, and audit-retention evidence
+   remain external release gates.
 
 ## Current next action
 
-Implement the next bounded temporal-correction slice: lock one current
-DocumentVersion/Provision/Obligation revision set, close only its recorded
-interval through an auditable domain operation, create validated successor
-revisions, and add recorded-time `as_of` retrieval plus apply/rollback and stale-
-write tests. Do not add applicability, approval, publication, real institution
-data, source text, or an agent in that slice.
+Persist one synthetic obligation's versioned applicability fact snapshot and a
+deterministic, non-binding three-value decision: `applicable`,
+`not_applicable`, or `needs_review`. Missing or unknown facts must
+deterministically resolve to `needs_review`; retain evidence references,
+provenance, and recorded-time retrieval. Do not add source/legal supersession,
+approval, publication, real institution facts, source text, a public write API,
+library projection, or an agent in that slice.
 
 ## Near-term backlog
 
@@ -189,14 +228,36 @@ data, source text, or an agent in that slice.
 | P0 | Phase 1 architecture/ownership decision | Current repository model and IAM review | Complete |
 | P0 | First regulatory chain models and initial migration | Accepted ownership decision | Complete for current synthetic slice |
 | P0 | Read-only API plus non-binding review-state service | Models, permissions, transaction design | Complete for current synthetic slice |
-| P0 | Controlled correction/supersession and `as_of` retrieval | First current-chain slice | Next |
-| P0 | Applicability fact/rule/decision persistence | Stable bitemporal correction semantics | Pending |
+| P0 | Controlled recorded-time correction and `recorded_as_of` retrieval | First current-chain slice | Complete for current synthetic slice |
+| P0 | Source/legal-version supersession | Reviewed source evidence and legal lifecycle contract | Pending; separate from recorded correction |
+| P0 | One versioned fact snapshot and deterministic non-binding applicability decision | Stable bitemporal correction semantics | Next |
 | P0 | Small human-reviewed pilot source set | Named reviewer and source rights | Blocked on external ownership |
 | P1 | Reviewer UI/admin workflow | Stable API and review contract | Pending |
 | P1 | Internal-policy/private overlay model | Published obligation model and privacy design | Later Phase 2 |
 | P1 | Read-only source/explanation agent evaluation | Reviewed knowledge and gold set | Later Phase 3 |
 
 ## Activity log
+
+### 2026-08-24 — Controlled recorded-time correction and historical reads
+
+- Accepted ADR 0002 and kept recorded-time repair distinct from an authority's
+  source/legal-version supersession.
+- Added a folder-scoped, named-human correction operation for the synthetic,
+  metadata-only chain. It compare-and-swap closes one exact current revision
+  set, appends direct successors at a single server cutoff, resets obligation
+  review to `machine_proposed`, and records idempotent actor/rationale and
+  semantic before/after digests.
+- Added coherent `recorded_as_of` document detail selection with half-open
+  intervals, one joined citation chain, time-filtered review events, shared
+  folder-lock linearization, monotonic aggregate recorded time under wall-clock
+  rollback, and fail-closed object/related-field IAM.
+- Added migration 0002 with history indexes, correction permission, durable
+  correction-event constraints, and a reverse guard that refuses to discard
+  existing correction audit history.
+- Verified focused SQLite behaviour, migration-backed tests, empty-history
+  rollback/reapply, populated-history rollback refusal, system checks, and no
+  migration drift. PostgreSQL migration, two-connection locking, and query-plan
+  evidence remain explicit external gates.
 
 ### 2026-08-21 — First database-backed regulatory chain
 

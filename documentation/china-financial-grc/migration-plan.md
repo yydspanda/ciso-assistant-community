@@ -69,6 +69,39 @@ Exit criteria:
 - every published obligation has an official citation;
 - future-effective and superseded versions behave correctly.
 
+Current implemented increment, which does not satisfy the full Phase 1 exit
+criteria:
+
+- `regulatory.0001_initial` creates the synthetic, metadata-only Document ->
+  DocumentVersion -> Provision -> Obligation aggregate, registration, and
+  append-only non-binding review events;
+- `regulatory.0002_regulatorychaincorrectionevent_and_more` adds the named-human
+  correction permission, history index, and immutable correction-event
+  boundary;
+- one atomic domain service closes the exact current three-row revision set and
+  appends linked successors at a server-owned cutoff; the successor obligation
+  resets to `machine_proposed`;
+- the existing read-only detail API accepts `recorded_as_of` and resolves a
+  single folder-consistent chain through half-open recorded intervals; the read
+  and correction paths use the same folder lock as their concurrency boundary;
+- object and related-field IAM fail closed, and there is still no public write
+  route.
+
+This increment is recorded-time repair only. It cannot represent source/legal
+supersession and does not add applicability, binding decisions, rejection,
+approval/publication, source text, real entity data, UI writes, a library
+projection, or an agent.
+
+Migration-backed focused tests and an isolated SQLite full-project database
+copy verify 0001 -> 0002 apply, empty-history rollback/reapply, and refusal to
+reverse 0002 after a real correction event exists. A brand-new empty-database
+rehearsal is blocked before these migrations by the repository's existing IAM
+migration expecting the optional allauth `account` app; this is not counted as
+a regulatory migration pass. PostgreSQL apply, two-connection folder-lock
+linearization, representative query plans, backup/restore, and audit-retention
+evidence remain deployment gates. See
+[ADR 0002](adr/0002-recorded-time-correction.md).
+
 ### Phase 2 — internal policy and control bridge
 
 Add clause-level internal policy ingestion and reviewed mappings to obligations,

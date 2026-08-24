@@ -23,6 +23,7 @@ def test_initial_migration_tables_constraints_and_permissions_exist(regulatory_r
         "regulatory_regulatoryobligation",
         "regulatory_regulatoryobligationprovision",
         "regulatory_regulatoryobligationreviewevent",
+        "regulatory_regulatorychaincorrectionevent",
     }
     assert expected_tables <= tables
 
@@ -32,6 +33,7 @@ def test_initial_migration_tables_constraints_and_permissions_exist(regulatory_r
             "regulatory_regulatorydocumentversion",
         )
     for name in (
+        "reg_ver_doc_asof_idx",
         "reg_ver_folder_record_rev_uniq",
         "reg_ver_one_current",
         "reg_ver_recorded_interval",
@@ -51,7 +53,38 @@ def test_initial_migration_tables_constraints_and_permissions_exist(regulatory_r
     assert "ingest_regulatoryrecord" in codenames
     assert "transition_regulatoryobligation" in codenames
     assert "legal_review_regulatoryobligation" in codenames
+    assert "correct_regulatoryrecord" in codenames
+    correction_permission = Permission.objects.get(
+        content_type__app_label="regulatory",
+        codename="correct_regulatoryrecord",
+    )
+    assert correction_permission.content_type.model == "regulatorydocument"
     assert "regulatory" in ALLOWED_PERMISSION_APPS
+
+    with connection.cursor() as cursor:
+        correction_constraints = connection.introspection.get_constraints(
+            cursor,
+            "regulatory_regulatorychaincorrectionevent",
+        )
+    for name in (
+        "reg_correction_doc_time_idx",
+        "reg_correction_idempotency_uniq",
+        "reg_correction_previous_ver_uniq",
+        "reg_correction_successor_ver_uniq",
+        "reg_correction_previous_prov_uniq",
+        "reg_correction_successor_prov_uniq",
+        "reg_correction_previous_obl_uniq",
+        "reg_correction_successor_obl_uniq",
+        "reg_correction_recorded_time",
+        "reg_correction_digest_schema",
+        "reg_correction_payload_changed",
+        "reg_correction_version_changed",
+        "reg_correction_provision_changed",
+        "reg_correction_obligation_changed",
+        "reg_correction_rationale_present",
+        "reg_correction_not_published",
+    ):
+        assert name in correction_constraints
 
 
 def test_builtin_roles_keep_regulatory_write_authority_bounded():
@@ -63,12 +96,16 @@ def test_builtin_roles_keep_regulatory_write_authority_bounded():
     ):
         assert "view_regulatorydocument" in permissions
         assert "ingest_regulatoryrecord" in permissions
+        assert "correct_regulatoryrecord" in permissions
         assert "transition_regulatoryobligation" in permissions
         assert "legal_review_regulatoryobligation" not in permissions
     assert "view_regulatorydocument" in ADMINISTRATOR_PERMISSIONS_LIST
     assert "ingest_regulatoryrecord" in ADMINISTRATOR_PERMISSIONS_LIST
+    assert "correct_regulatoryrecord" in ADMINISTRATOR_PERMISSIONS_LIST
     assert "transition_regulatoryobligation" in ADMINISTRATOR_PERMISSIONS_LIST
     assert "legal_review_regulatoryobligation" in ADMINISTRATOR_PERMISSIONS_LIST
     assert "legal_review_regulatoryobligation" in APPROVER_PERMISSIONS_LIST
     assert "ingest_regulatoryrecord" not in READER_PERMISSIONS_LIST
+    assert "correct_regulatoryrecord" not in READER_PERMISSIONS_LIST
+    assert "correct_regulatoryrecord" not in APPROVER_PERMISSIONS_LIST
     assert "transition_regulatoryobligation" not in APPROVER_PERMISSIONS_LIST
