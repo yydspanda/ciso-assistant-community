@@ -20,7 +20,7 @@ live in `delivery-roadmap.md`.
 | Official-source metadata packs | Complete for the current non-exhaustive seed; legal review remains unreviewed |
 | Applicability fact registry and deterministic artifact validation | Complete for draft interchange artifacts |
 | Project-level `AGENTS.md`, product skill, architecture skill, roadmap, and progress ledger | Complete and independently forward-tested in this change |
-| Django regulatory persistence, migrations, APIs, and reviewer workflow | Synthetic metadata-only chain, non-binding obligation review, controlled recorded-time correction, current/historical detail retrieval, and one fixed-rule non-binding applicability aggregate implemented and SQLite-tested; independent applicability review disposition, source/legal supersession, binding decisions, and UI remain open |
+| Django regulatory persistence, migrations, APIs, and reviewer workflow | Synthetic metadata-only chain, non-binding obligation review, controlled recorded-time correction, current/historical detail retrieval, and one fixed-rule non-binding applicability aggregate implemented and SQLite-tested; independent applicability review-disposition architecture accepted but implementation, source/legal supersession, binding decisions, and UI remain open |
 | Reviewed provisions and obligations from the source packs | Not implemented; the end-to-end record is illustrative only |
 | Private internal-policy ingestion and mapping | Not implemented |
 | Read-only production agent, proposal writes, or continuous evidence connectors | Not implemented |
@@ -210,6 +210,33 @@ blank-database invocation remains unsuitable because of the repository's
 pre-existing allauth migration-graph dependency; the successful rehearsal used
 the full project graph. No user database was modified.
 
+Phase 1 applicability review-disposition architecture gate:
+
+```text
+backend/.venv/bin/python tools/china_financial_grc/validate_artifacts.py
+  PASS — 56 facts; 76 documents; 76 versions
+
+backend/.venv/bin/python -m pytest tools/china_financial_grc/tests/test_validate_artifacts.py -q
+  PASS — 25 tests and 12 subtests
+
+scoped pre-commit on ADR 0004, synchronized architecture/product docs, and ledger
+  PASS — end-of-file and trailing-whitespace checks
+
+git diff --check
+  PASS — no whitespace errors
+
+targeted credential, private-path, and real-data scan
+  PASS — no key, private local path, or real institution/customer data in the
+  candidate changes
+
+independent architecture/security and Django implementation-feasibility reviews
+  PASS — no remaining Critical, High, or Medium finding
+```
+
+This gate changed documentation only. No model, migration, service, API, or
+Python source changed, so no backend runtime or migration result is claimed for
+ADR 0004.
+
 ## Current limitations and risks
 
 1. **Metadata is not reviewed law.** Source records are metadata-only discovery
@@ -219,9 +246,10 @@ the full project graph. No user database was modified.
    non-binding obligation review events, controlled recorded-time correction,
    coherent current/historical detail retrieval, and one append-only fixed-rule
    applicability aggregate. The applicability result is draft and non-binding;
-   it has no independent named-human review disposition. There is still no
-   source/legal-version supersession, binding DecisionRecord, reviewer UI,
-   approval/publication, source-text intake, or real source ingestion.
+   its independent named-human review-disposition design is accepted but has no
+   model, migration, service, or API yet. There is still no source/legal-version
+   supersession, binding DecisionRecord, reviewer UI, approval/publication,
+   source-text intake, or real source ingestion.
 3. **No real pilot entity facts.** Only bounded synthetic entity facts have been
    exercised. Public artifacts cannot decide applicability for a real
    institution, licence, product, customer, data flow, or system.
@@ -248,16 +276,15 @@ the full project graph. No user database was modified.
 
 ## Current next action
 
-Define and architecture-review one independent, append-only, non-binding
-named-human review-disposition contract for an exact synthetic applicability
-decision revision. It must bind the reviewed decision's physical identity and
-semantic digest, preserve separate view/review permissions and entity/folder
-isolation, reject service identities, stale payloads, self-review where roles
-would conflict, and history mutation, and expose correction-needed states
-without turning review into legal approval. Do not add publication, a binding
-DecisionRecord, real institution facts, source text, public mutation APIs, a
-reviewer UI, source/legal supersession, library projection, or an agent in this
-architecture-gate slice.
+Implement the accepted ADR 0004 bounded
+`RegulatoryApplicabilityReviewDisposition` persistence, atomic named-human
+transition service, permissions, additive migration, and separate entity-
+scoped read-only action. Preserve exact decision/digest CAS, append-only event
+history, maker/checker separation, immutable folder IAM, related-user masking,
+recorded-time isolation, and populated-history reverse refusal. Do not add
+publication, a binding DecisionRecord, real institution facts, source text,
+public mutation APIs, a reviewer UI, source/legal supersession, library
+projection, or an agent in that implementation slice.
 
 ## Near-term backlog
 
@@ -269,13 +296,36 @@ architecture-gate slice.
 | P0 | Controlled recorded-time correction and `recorded_as_of` retrieval | First current-chain slice | Complete for current synthetic slice |
 | P0 | Source/legal-version supersession | Reviewed source evidence and legal lifecycle contract | Pending; separate from recorded correction |
 | P0 | One versioned fact snapshot and deterministic non-binding applicability decision | Stable bitemporal correction semantics | Complete for current fixed-rule synthetic slice |
-| P0 | Independent append-only named-human applicability review-disposition contract and architecture gate | Exact applicability revision identity, digest, IAM, and temporal semantics | Next |
+| P0 | Independent append-only named-human applicability review-disposition contract and architecture gate | Exact applicability revision identity, digest, IAM, and temporal semantics | Complete |
+| P0 | Implement bounded applicability review-disposition model, service, permissions, migration, and read action | Accepted ADR 0004 | Next |
 | P0 | Small human-reviewed pilot source set | Named reviewer and source rights | Blocked on external ownership |
 | P1 | Reviewer UI/admin workflow | Stable API and review contract | Pending |
 | P1 | Internal-policy/private overlay model | Published obligation model and privacy design | Later Phase 2 |
 | P1 | Read-only source/explanation agent evaluation | Reviewed knowledge and gold set | Later Phase 3 |
 
 ## Activity log
+
+### 2026-08-24 — Accepted applicability review-disposition architecture
+
+- Accepted ADR 0004 for an independent append-only named-human disposition
+  stream bound to one exact physical applicability decision and its recomputed
+  semantic digest. The derived initial state is `not_reviewed`; persisted
+  states are `no_correction_requested`, `correction_requested`, and
+  `unable_to_complete`.
+- Froze exact-predecessor CAS, reviewer-bound idempotency, full event-digest
+  material, controlled reason/rationale transitions, immutable history,
+  decision/obligation correction isolation, document-wide monotonic time, and
+  a strict named-human maker/checker boundary.
+- Froze independent view/review permissions, related-user masking, a separate
+  future entity-scoped read action, additive migration constraints, empty-table
+  rollback, populated-history reverse refusal, and the implementation test and
+  PostgreSQL release gates.
+- Independent architecture/security and Django feasibility reviews found no
+  remaining Critical, High, or Medium issue. The regulatory artifact validator
+  and its 25 tests plus 12 subtests passed unchanged.
+- This is an accepted design, not runtime delivery. No model, migration,
+  service, API, legal approval, real fact, public mutation, UI, publication,
+  projection, agent, or production-database claim was added.
 
 ### 2026-08-24 — Bounded synthetic applicability persistence
 

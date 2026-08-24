@@ -145,6 +145,51 @@ internal service guarded by `record_regulatoryapplicability`; no public write,
 confirmation, approval, publication, real-entity fact, or agent capability is
 introduced.
 
+### RegulatoryApplicabilityReviewDisposition (accepted design; persistence pending)
+
+The accepted next model design is an append-only human disposition stream
+for one exact physical `RegulatoryApplicabilityDecision` revision. It remains
+separate from the decision so human review cannot mutate the deterministic
+facts, result, rationale, or semantic digest.
+
+Each future disposition contains:
+
+- a `PROTECT` FK to the exact physical decision and a copied,
+  server-recomputed decision semantic digest;
+- the decision maker copied from `decision.recorded_by` and a distinct
+  named-human reviewer;
+- sequence and direct predecessor disposition, `from_disposition`,
+  `to_disposition`, controlled reason code, required rationale, and
+  server-owned `occurred_at`;
+- fixed digest profile, event and request digests, and a folder-scoped
+  idempotency key; and
+- fixed non-binding and unpublished state.
+
+The derived initial state is `not_reviewed`. Persisted dispositions are
+`no_correction_requested`, `correction_requested`, and
+`unable_to_complete`. Any persisted disposition may be replaced through an
+append-only successor. A same-disposition successor requires a materially
+different controlled reason or rationale and exact predecessor CAS; an exact
+semantic no-op is rejected. This lets a reviewer correct an earlier human event
+without deleting history or minting a semantically identical applicability
+decision.
+
+`no_correction_requested` means only that the reviewer did not request a
+correction to the exact stored synthetic record. It does not confirm legal
+applicability, evidence authenticity or sufficiency, source review, the rule,
+or compliance. `correction_requested` routes work but cannot change the
+decision; the existing applicability service owns any successor fact snapshot.
+`unable_to_complete` keeps insufficient or conflicting review conditions
+visible and fail-closed.
+
+New events require a current exact-parent decision and a reviewer different
+from its recorder. A corrected decision starts `not_reviewed`; old dispositions
+remain attached only to the old physical revision. The accepted future read
+contract is entity scoped and read-only, with independent view/review
+permissions. No model, migration, service, or API for this entity is implemented
+yet. See
+[ADR 0004](adr/0004-bounded-synthetic-applicability-review-disposition.md).
+
 ### ApplicabilityRule (target model)
 
 Structured conditions determining whether an obligation applies. Dimensions
@@ -272,6 +317,13 @@ obligation without requiring the chain correction to close or clone dependent
 decisions. Missing decisions and missing or unknown facts resolve to
 `needs_review`, never `not_applicable`.
 
+For the accepted review-disposition design, point-in-time selection first
+resolves that exact applicability decision and then selects its latest event
+with `occurred_at <= recorded_as_of`. The disposition event is not copied to a
+successor decision. Its time joins the document aggregate floor so a later
+decision, obligation review, or correction cannot be recorded before committed
+review history under host-clock rollback.
+
 ## Provenance rules
 
 For every machine-proposed provision, obligation, mapping, or conclusion,
@@ -325,3 +377,9 @@ roles, and audit retention remain external gates. See
 [ADR 0002](adr/0002-recorded-time-correction.md) for the verified correction
 contract and [ADR 0003](adr/0003-bounded-synthetic-applicability-persistence.md)
 for the bounded applicability contract and migration guard.
+
+The independent review-disposition entity described above is accepted as the
+next architecture boundary; it is not implemented or migration-verified.
+It adds no legal approval, publication, real fact, UI, public mutation, generic
+workflow, or agent claim. Its accepted contract and pending gates are in
+[ADR 0004](adr/0004-bounded-synthetic-applicability-review-disposition.md).

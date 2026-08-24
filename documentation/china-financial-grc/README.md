@@ -39,6 +39,7 @@ a governed system of record with bounded AI capabilities:
 - [ADR 0001: bounded regulatory persistence](adr/0001-regulatory-persistence-boundary.md)
 - [ADR 0002: controlled recorded-time correction and historical retrieval](adr/0002-recorded-time-correction.md)
 - [ADR 0003: bounded synthetic applicability persistence](adr/0003-bounded-synthetic-applicability-persistence.md)
+- [ADR 0004: bounded synthetic applicability review disposition](adr/0004-bounded-synthetic-applicability-review-disposition.md)
 - [`schemas/regulatory-record.schema.json`](schemas/regulatory-record.schema.json):
   the proposed `2.0.0-draft.1` interchange contract for regulatory knowledge
 - [`catalogs/regulatory-sources.json`](catalogs/regulatory-sources.json) and the
@@ -152,3 +153,22 @@ projections in a later gated phase. See
 contract and migration guard. PostgreSQL apply, two-connection lock evidence,
 representative query plans, backup/restore, database-role enforcement, and
 audit-retention evidence remain external production gates.
+
+The accepted next architecture design adds no runtime capability. It defines a
+separate append-only `RegulatoryApplicabilityReviewDisposition` stream for a
+second named human to record `no_correction_requested`,
+`correction_requested`, or `unable_to_complete` against one exact physical
+decision and its recomputed semantic digest. Absence of an event derives
+`not_reviewed`; every decision successor starts there and inherits no earlier
+disposition.
+
+The design separates record and review authority: Analyst and Domain Manager
+may record the synthetic decision but cannot review it; Approver may review but
+cannot record it; Administrator may hold both permissions but cannot review a
+decision they recorded. Service accounts are excluded. A future implementation
+would remain internal-write-only and add a separate entity-scoped read action,
+not a public mutation route. None of the dispositions changes the computed
+result, creates a legal conclusion, approves evidence, enables publication or
+projection, or resolves a `needs_review` fact. See
+[ADR 0004](adr/0004-bounded-synthetic-applicability-review-disposition.md) for
+the accepted contract and pending implementation gates.

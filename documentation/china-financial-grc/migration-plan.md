@@ -149,6 +149,44 @@ database-role enforcement, and audit-retention evidence remain external
 deployment gates. See
 [ADR 0003](adr/0003-bounded-synthetic-applicability-persistence.md).
 
+Accepted next increment, with implementation and migration verification still
+pending:
+
+- add one independent append-only
+  `RegulatoryApplicabilityReviewDisposition` stream bound to the exact physical
+  synthetic applicability decision and its recomputed semantic digest;
+- derive `not_reviewed` from no event and allow only
+  `no_correction_requested`, `correction_requested`, and
+  `unable_to_complete`, with append-only successor events for correcting a
+  prior human disposition;
+- preserve a strict maker/checker boundary: Analyst and Domain Manager record
+  decisions, Approver reviews them, and even Administrator cannot review a
+  decision they personally recorded; service identities remain prohibited;
+- add separate disposition-view and review permissions under the immutable
+  registration-folder IAM boundary;
+- include disposition time in the shared document aggregate floor and select
+  review history only through the current/historical exact applicability
+  decision; and
+- expose only a separate entity-scoped read action while keeping all review
+  mutation inside an atomic named-human domain service.
+
+The accepted additive migration `0004` will create the disposition table,
+selection index, event-chain/idempotency/digest/non-binding constraints, and
+permissions without altering or backfilling 0001 through 0003. Existing
+decisions remain `not_reviewed` by absence. Empty-history rollback should remove
+only the new schema; a reverse guard must refuse to discard any recorded
+disposition history.
+
+Before this increment can be described as implemented, focused and full SQLite
+tests must cover exact decision/digest CAS, disposition correction, self-review
+and service-account rejection, permission and cross-entity/folder isolation,
+decision and obligation correction boundaries, recorded-time selection and
+clock rollback, API method hiding, constraints, migration drift, empty
+rollback/reapply, and populated reverse refusal. PostgreSQL migration,
+two-connection locking, query plans, backup/restore, database-role enforcement,
+and audit retention remain external production gates. See
+[ADR 0004](adr/0004-bounded-synthetic-applicability-review-disposition.md).
+
 ### Phase 2 — internal policy and control bridge
 
 Add clause-level internal policy ingestion and reviewed mappings to obligations,

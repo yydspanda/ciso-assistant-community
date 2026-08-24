@@ -104,6 +104,45 @@ backup/restore, database-role enforcement, and audit-retention evidence remain
 external production gates. The durable design and alternatives are in
 [ADR 0003](../../../documentation/china-financial-grc/adr/0003-bounded-synthetic-applicability-persistence.md).
 
+## Accepted applicability review-disposition contract
+
+The accepted next architecture design defines, but does not yet implement, one
+independent append-only review-disposition stream for the exact synthetic
+applicability decision and its semantic digest. Its only persisted targets are
+`no_correction_requested`, `correction_requested`, and
+`unable_to_complete`; no event derives or overrides the computed applicability
+result. Absence of an event derives the initial `not_reviewed` state.
+
+This is a maker/checker record, not legal approval. The named human who recorded
+the fact snapshot cannot review that exact revision. Analyst and Domain Manager
+remain recorders, Approver is the bounded reviewer, and Administrator still
+cannot self-review. Service accounts are excluded. Reviewer identity and
+rationale require a separate disposition-view permission under the immutable
+entity-registration folder.
+
+Decision and obligation corrections never copy a disposition. A successor
+decision starts `not_reviewed`; prior human events remain historical only on
+their exact decision revision. A small predecessor/sequence stream lets a
+reviewer append a correction to a mistaken prior disposition without deleting
+audit history.
+
+A future implementation remains public-read-only and may add this separate
+action:
+
+```text
+GET /api/regulatory/v1/documents/{uuid}/applicability-review/
+    ?entity=<uuid>&recorded_as_of=<aware-RFC-3339>
+```
+
+It first resolves the existing exact applicability decision, then selects its
+latest authorised disposition at the same recorded time. The response keeps
+`computed_non_binding_result`, human disposition, `legal_conclusion: false`,
+and `is_binding: false` separate. There is no public review write, approval,
+publication, real institution fact, workflow UI, projection, or agent in this
+design. Implementation, migration, SQLite, and PostgreSQL verification remain
+pending; the exact contract and alternatives are in
+[ADR 0004](../../../documentation/china-financial-grc/adr/0004-bounded-synthetic-applicability-review-disposition.md).
+
 ## Trust boundaries
 
 - Source content is untrusted data and cannot supply tool or system

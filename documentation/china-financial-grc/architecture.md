@@ -177,6 +177,82 @@ two-connection lock evidence, representative query plans, backup/restore,
 database-role enforcement, and audit-retention evidence remain external
 production gates.
 
+## Accepted bounded applicability review boundary
+
+The accepted next Phase 1 design remains owned by `backend/regulatory` and adds
+no implemented capability yet. It defines an independent append-only
+`RegulatoryApplicabilityReviewDisposition` event stream for a named human to
+review one exact physical `RegulatoryApplicabilityDecision` revision and its
+server-recomputed semantic digest.
+
+The disposition vocabulary is deliberately narrower than legal approval:
+
+- `no_correction_requested` means the reviewer did not request a correction to
+  that exact stored synthetic record;
+- `correction_requested` signals that the exact record should be superseded
+  through the existing applicability correction service; and
+- `unable_to_complete` records that evidence, scope, authority, or information
+  prevented the bounded review from completing.
+
+No event derives `applicable` or `not_applicable`, changes the decision's fixed
+`draft`/non-binding/unpublished state, approves evidence, or establishes legal
+applicability. The absence of an event derives `not_reviewed`. A later event can
+correct an earlier human disposition through a predecessor/sequence chain, but
+an exact semantic no-op is rejected and no history is overwritten. A same-
+disposition successor is valid only when its controlled reason or rationale
+materially changes under an exact predecessor compare-and-swap.
+
+Review authority is separated from fact-recording authority. Analyst and Domain
+Manager may view dispositions and record decisions but cannot review them.
+Approver may view and review but cannot record a decision. Administrator may
+hold both permissions, while the service still enforces reviewer identity !=
+the exact decision's `recorded_by` identity. Every reviewer is an active named
+human; service accounts cannot act. Reviewer identity and rationale have a
+separate view permission and remain entity/folder scoped.
+Reviewer identity additionally follows related-User object IAM; without it the
+read contract masks the actor and discloses no UUID, name, or email.
+
+The accepted transaction reuses the immutable registration folder as its
+historical IAM boundary and locks:
+
+```text
+actor -> entity -> registration folder -> registration -> current chain
+      -> exact current applicability decision -> latest disposition
+```
+
+Checking only an open applicability row is insufficient because an obligation
+correction may leave the old decision row open while exact-parent selection
+makes it historical. New dispositions must target the decision selected through
+the current coherent chain. Exact idempotent retries may return a historical
+event after later correction or entity movement, but new events require the
+entity to remain in its live synthetic scope.
+
+The document recorded-time floor will include disposition event time. A
+decision correction therefore starts after its review history even under host
+clock rollback. Decision d1 dispositions remain on d1; decision d2 derives
+`not_reviewed`. Obligation r1 dispositions cannot appear on r2 because the read
+first selects the exact applicability decision through the physical
+obligation.
+
+The accepted design includes no public review write route. A later
+implementation may add only a separate entity-scoped read action:
+
+```text
+GET /api/regulatory/v1/documents/{uuid}/applicability-review/
+    ?entity=<uuid>&recorded_as_of=<aware-RFC-3339>
+```
+
+It first uses the existing applicability selector, then selects the latest
+authorised disposition at the same recorded timestamp. The computed result and
+human disposition are returned as separate non-binding fields. The existing
+applicability endpoint remains backward compatible and does not disclose review
+history to custom roles lacking the new disposition-view permission.
+
+The accepted additive migration design, implementation, tests, and PostgreSQL
+evidence remain pending. The durable alternatives, permission matrix, digest/CAS
+contract, rollback guard, and negative verification cases are in
+[ADR 0004](adr/0004-bounded-synthetic-applicability-review-disposition.md).
+
 ## New logical components
 
 ### 1. Regulatory source service
