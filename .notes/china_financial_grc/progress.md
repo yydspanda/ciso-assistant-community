@@ -1,7 +1,7 @@
 # China Financial GRC Progress Ledger / 中国金融 GRC 进度台账
 
 > Status: **Authoritative execution record / 权威执行记录**
-> Updated: **2026-08-24**
+> Updated: **2026-08-25**
 > Branch: `agent/china-financial-grc-foundation`
 > Current phase: **Phase 1 — regulatory persistence and review workflow**
 
@@ -14,12 +14,12 @@ live in `delivery-roadmap.md`.
 
 | Item | State |
 | --- | --- |
-| Public fork and working branch | Complete and pushed |
+| Public fork and working branch | Complete and pushed; ADR 0004 implementation commit: `879fafe347eb221393cf1dcdefd0acd33b7e7aee` |
 | Phase 0 architecture/governance/domain design | Complete as a draft target design |
 | Loadable China financial control foundation | Complete; high-level foundation only |
 | Official-source metadata packs | Complete for the current non-exhaustive seed; legal review remains unreviewed |
 | Applicability fact registry and deterministic artifact validation | Complete for draft interchange artifacts |
-| Project-level `AGENTS.md`, product skill, architecture skill, roadmap, and progress ledger | Complete and independently forward-tested in this change |
+| Project-level `AGENTS.md`, product skill, architecture skill, roadmap, and progress ledger | Complete and independently forward-tested |
 | Django regulatory persistence, migrations, APIs, and reviewer workflow | Synthetic metadata-only chain, non-binding obligation review, controlled recorded-time correction, current/historical detail retrieval, one fixed-rule non-binding applicability aggregate, and its independent named-human review-disposition stream implemented and SQLite-tested; source/legal supersession, binding decisions, and UI remain open |
 | Reviewed provisions and obligations from the source packs | Not implemented; the end-to-end record is illustrative only |
 | Private internal-policy ingestion and mapping | Not implemented |
@@ -57,8 +57,8 @@ live in `delivery-roadmap.md`.
 
 - Local OpenAI-compatible providers are configured only in ignored CISO
   Assistant settings.
-- No model API key, external-project configuration, private database, or local path was
-  committed.
+- No model API key, external-project configuration, private database, or local
+  path was committed.
 - Local provider availability is not a production data-location or legal-
   transfer approval.
 
@@ -273,8 +273,7 @@ scoped pre-commit and Ruff check on changed regulatory files
 
 targeted credential, private-path, provider-config, and real-data scan
   PASS — no key, external-provider config, private local path, messaging-app
-  path, or real
-  institution/customer data in the candidate changes
+  path, or real institution/customer data in the candidate changes
 
 post-fix independent architecture/security, test/migration, and documentation reviews
   PASS — no remaining Critical, High, Medium, or Low finding
@@ -354,6 +353,21 @@ an agent as a shortcut around those gates.
 | P1 | Read-only source/explanation agent evaluation | Reviewed knowledge and gold set | Later Phase 3 |
 
 ## Activity log
+
+### 2026-08-25 — ADR 0004 delivery pushed and handed off
+
+- Pushed commit `879fafe347eb221393cf1dcdefd0acd33b7e7aee` —
+  `implement bounded applicability review disposition` — to the fork branch
+  `agent/china-financial-grc-foundation`.
+- At the implementation handoff, local `HEAD`, the local tracking ref, and the
+  remote branch ref all resolved to that commit; the worktree was clean after
+  push.
+- The verified implementation and test evidence remains the bounded synthetic,
+  draft, non-binding, internal-write/GET-only slice recorded below. This handoff
+  does not promote Phase 1 or satisfy PostgreSQL, operations, legal-review,
+  real-pilot, or customer-acceptance gates.
+- The current next action remains external database and operations acceptance;
+  roadmap phase order, outcomes, dependencies, and exit gates did not change.
 
 ### 2026-08-24 — Implemented bounded applicability review disposition
 
