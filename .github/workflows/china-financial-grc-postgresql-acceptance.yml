@@ -1,0 +1,51 @@
+name: China Financial GRC PostgreSQL Synthetic Technical Acceptance
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
+    paths:
+      - "backend/**"
+      - "tools/china_financial_grc/postgresql/**"
+      - ".github/workflows/china-financial-grc-postgresql-acceptance.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgresql-synthetic-technical-acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          python-version: "3.14"
+          enable-cache: true
+
+      - name: Install locked backend dependencies
+        working-directory: backend
+        run: uv sync --locked
+
+      - name: Run the complete isolated PostgreSQL harness
+        env:
+          CHINA_GRC_ACCEPTANCE_EVIDENCE_PARENT: ${{ runner.temp }}
+        run: ./tools/china_financial_grc/postgresql/run_acceptance.sh
+
+      - name: Upload synthetic shareable evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: china-financial-grc-postgresql-synthetic-technical-acceptance
+          path: |
+            ${{ runner.temp }}/ciso-china-grc-postgresql-*/*
+            !${{ runner.temp }}/ciso-china-grc-postgresql-*/*.dump
+            !${{ runner.temp }}/ciso-china-grc-postgresql-*/SHA256SUMS
+          retention-days: 14

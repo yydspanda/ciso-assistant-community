@@ -1,0 +1,50 @@
+name: China Financial GRC Fork Upstream Divergence
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: "23 1 * * 1" # Weekly, Monday 09:23 Asia/Shanghai.
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "tools/china_financial_grc/check_upstream_divergence.py"
+      - "tools/china_financial_grc/tests/test_check_upstream_divergence.py"
+      - ".github/workflows/china-financial-grc-upstream-divergence.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  upstream-divergence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout complete fork history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run divergence checker unit tests
+        run: python3 -m unittest tools.china_financial_grc.tests.test_check_upstream_divergence
+
+      - name: Fetch canonical upstream main into an isolated ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags \
+            https://github.com/intuitem/ciso-assistant-community.git \
+            +refs/heads/main:refs/remotes/china-financial-grc-canonical/main
+
+      - name: Check fork divergence
+        run: |
+          python3 tools/china_financial_grc/check_upstream_divergence.py \
+            --repository . \
+            --upstream-ref refs/remotes/china-financial-grc-canonical/main \
+            --head-ref HEAD \
+            --warn-behind 10 \
+            --fail-behind 20

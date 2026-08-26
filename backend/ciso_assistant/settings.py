@@ -458,6 +458,7 @@ INSTALLED_APPS = [
     "pmbok",
     "ebios_rm",
     "tprm",
+    "regulatory",
     "privacy",
     "resilience",
     "automation",

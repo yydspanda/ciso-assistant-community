@@ -1,0 +1,274 @@
+{
+  "schema_version": "2.0.0-draft.1",
+  "contract_status": "draft",
+  "generated_at": "2026-08-20T00:00:00+08:00",
+  "description": "Illustrative, non-authoritative model proposal. It has not received legal review or approval; all-zero hashes and example identities are placeholders and must not be used as legal evidence.",
+  "documents": [
+    {
+      "id": "CN-NPC-PIPL-2021",
+      "title_zh": "中华人民共和国个人信息保护法",
+      "title_en": "Personal Information Protection Law of the People's Republic of China (non-authoritative translation)",
+      "issuer": "全国人民代表大会常务委员会",
+      "authority_level": "law",
+      "territories": ["CN"],
+      "regulated_entity_scopes": ["cross_sector"],
+      "domains": ["privacy", "cross_border_data", "ai_model_governance"]
+    }
+  ],
+  "document_versions": [
+    {
+      "id": "EXAMPLE-CN-NPC-PIPL-2021-v1",
+      "document_id": "CN-NPC-PIPL-2021",
+      "version_label": "2021 enacted text",
+      "document_no": null,
+      "status": "effective",
+      "status_as_of": "2026-08-20",
+      "effective_basis": "explicit_date",
+      "issued_date": "2021-08-20",
+      "published_date": "2021-08-20",
+      "effective_date": "2021-11-01",
+      "transition_end": null,
+      "repeal_date": null,
+      "supersedes_version_ids": [],
+      "source_url": "https://www.npc.gov.cn/npc/c2/c30834/202108/t20210820_313088.html",
+      "source_hash": null,
+      "content_storage_policy": "metadata_only",
+      "notes": "Example metadata only. Production ingestion must perform legal review and, where permitted, snapshot and hash the official source.",
+      "source_checked_on": "2026-08-20",
+      "metadata_confidence": "confirmed",
+      "legal_review_status": "unreviewed",
+      "legal_reviewed_at": null,
+      "legal_reviewed_by": null,
+      "valid_from": "2021-11-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "import",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "foundation:example-source-import",
+        "parser_version": null,
+        "model": null,
+        "prompt_version": null,
+        "retrieval_version": "official-source-register@2026-08-20"
+      }
+    }
+  ],
+  "provisions": [
+    {
+      "id": "EXAMPLE-CN-NPC-PIPL-2021-v1-art24",
+      "document_id": "CN-NPC-PIPL-2021",
+      "version_id": "EXAMPLE-CN-NPC-PIPL-2021-v1",
+      "article": "第二十四条",
+      "heading": "利用个人信息进行自动化决策",
+      "text": null,
+      "source_locator": {
+        "kind": "article",
+        "value": "第二十四条"
+      },
+      "content_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "model_proposal",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "example:model-run",
+        "parser_version": null,
+        "model": "example-model",
+        "prompt_version": "example-provision-extraction-v1",
+        "retrieval_version": null
+      }
+    }
+  ],
+  "obligations": [
+    {
+      "id": "CN-PIPL-AUTO-DECISION-HUMAN-REVIEW-001",
+      "title_zh": "重大影响自动化决策的人工作业与说明机制",
+      "provision_ids": ["EXAMPLE-CN-NPC-PIPL-2021-v1-art24"],
+      "authority_level": "law",
+      "modality": "must",
+      "subject": "使用个人信息开展自动化决策的个人信息处理者",
+      "action": "对个人权益有重大影响的决定建立透明、公平、可说明并支持非纯自动化处置的机制",
+      "object": "影响个人权益的自动化决策过程与结果",
+      "conditions": [
+        "处理活动使用个人信息进行自动化决策",
+        "决定可能对个人权益产生重大影响"
+      ],
+      "exceptions": [],
+      "deadline": {
+        "kind": "none",
+        "value": null,
+        "rule_id": null
+      },
+      "expected_evidence": [
+        "自动化决策使用场景与风险分级台账",
+        "透明度与公平性测试记录",
+        "说明及人工复核流程",
+        "个人请求和处置记录"
+      ],
+      "penalty_or_consequence": null,
+      "valid_from": "2021-11-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "review_status": "machine_proposed",
+      "confidence": 0.65,
+      "uncertainties": [
+        "是否构成重大影响必须结合具体产品、决定和个人权益由具名人员复核"
+      ],
+      "provenance": {
+        "method": "model_proposal",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "example:model-run",
+        "parser_version": null,
+        "model": "example-model",
+        "prompt_version": "example-obligation-extraction-v1",
+        "retrieval_version": "official-source-register@2026-08-20"
+      }
+    }
+  ],
+  "applicability_rules": [
+    {
+      "id": "APP-CN-PIPL-AUTO-DECISION-001",
+      "obligation_id": "CN-PIPL-AUTO-DECISION-HUMAN-REVIEW-001",
+      "version": 1,
+      "supersedes_rule_id": null,
+      "all": [
+        {
+          "fact": "processing.uses_personal_information",
+          "operator": "eq",
+          "value": true
+        },
+        {
+          "fact": "processing.uses_automated_decision",
+          "operator": "eq",
+          "value": true
+        },
+        {
+          "fact": "technology.customer_rights_impact",
+          "operator": "eq",
+          "value": true
+        }
+      ],
+      "any": [],
+      "unknown_result": "needs_review",
+      "review_status": "draft",
+      "valid_from": "2021-11-01",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "model_proposal",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "example:model-run",
+        "parser_version": null,
+        "model": "example-model",
+        "prompt_version": "example-applicability-rule-v1",
+        "retrieval_version": "official-source-register@2026-08-20"
+      }
+    }
+  ],
+  "applicability_decisions": [
+    {
+      "id": "APPDEC-EXAMPLE-PRODUCT-001",
+      "obligation_id": "CN-PIPL-AUTO-DECISION-HUMAN-REVIEW-001",
+      "scope": {
+        "type": "product",
+        "id": "example-product"
+      },
+      "rule": {
+        "id": "APP-CN-PIPL-AUTO-DECISION-001",
+        "version": 1
+      },
+      "facts": [
+        {
+          "fact": "processing.uses_personal_information",
+          "known": true,
+          "value": true,
+          "source_refs": ["example:data-flow-register"],
+          "observed_at": "2026-08-20T00:00:00+08:00"
+        },
+        {
+          "fact": "processing.uses_automated_decision",
+          "known": true,
+          "value": true,
+          "source_refs": ["example:model-inventory"],
+          "observed_at": "2026-08-20T00:00:00+08:00"
+        },
+        {
+          "fact": "technology.customer_rights_impact",
+          "known": false,
+          "source_refs": [],
+          "observed_at": null
+        }
+      ],
+      "result": "needs_review",
+      "rationale": "A material fact remains unknown, so the deterministic default is escalation for named human review.",
+      "review_status": "draft",
+      "confirmed_by": null,
+      "confirmed_at": null,
+      "valid_from": "2026-08-20",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "model_proposal",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "example:model-run",
+        "parser_version": null,
+        "model": "example-model",
+        "prompt_version": "example-applicability-evaluation-v1",
+        "retrieval_version": "official-source-register@2026-08-20"
+      }
+    }
+  ],
+  "control_mappings": [
+    {
+      "id": "MAP-CN-PIPL-AUTO-DECISION-001",
+      "version": 1,
+      "supersedes_mapping_id": null,
+      "obligation_id": "CN-PIPL-AUTO-DECISION-HUMAN-REVIEW-001",
+      "control_urn": "urn:yydspanda:risk:reference_control:cn-financial-common-controls:mod-01",
+      "relationship": "partially_implements",
+      "rationale": "The model and automated-decision governance control provides inventory, risk review, testing, human oversight, monitoring, and exit evidence; product-specific privacy and customer-rights procedures remain necessary.",
+      "owner_role": "Model risk owner",
+      "reviewer_role": "Privacy and compliance",
+      "test_frequency": "before production and at least annually or after material change",
+      "evidence_types": [
+        "use-case register",
+        "impact assessment",
+        "human-review procedure",
+        "fairness and explainability test"
+      ],
+      "review_status": "proposed",
+      "valid_from": "2026-08-20",
+      "valid_to": null,
+      "recorded_from": "2026-08-20T00:00:00+08:00",
+      "recorded_to": null,
+      "provenance": {
+        "method": "model_proposal",
+        "created_at": "2026-08-20T00:00:00+08:00",
+        "created_by": "example:model-run",
+        "parser_version": null,
+        "model": "example-model",
+        "prompt_version": "example-control-mapping-v1",
+        "retrieval_version": "official-source-register@2026-08-20"
+      }
+    }
+  ],
+  "decision_records": [
+    {
+      "id": "DEC-EXAMPLE-2026-0001",
+      "subject_type": "applicability_decision",
+      "subject_id": "APPDEC-EXAMPLE-PRODUCT-001",
+      "decision": "return_for_changes",
+      "decided_at": "2026-08-20T00:00:00+08:00",
+      "decided_by": "example:designated-reviewer",
+      "role": "Example human reviewer",
+      "rationale": "The major-impact fact is unknown. This illustrative record returns the proposal for fact gathering; it is not a legal approval.",
+      "conditions": ["Obtain evidence and a named legal or compliance review before any production use"],
+      "expires_at": null,
+      "payload_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

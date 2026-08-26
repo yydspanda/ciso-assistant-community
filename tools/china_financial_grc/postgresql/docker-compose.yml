@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: ciso_acceptance_admin
+      POSTGRES_PASSWORD: ${PG_ACCEPTANCE_ADMIN_PASSWORD:?set by run_acceptance.sh}
+    ports:
+      - "127.0.0.1:${PG_ACCEPTANCE_PORT:-55432}:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: "no"

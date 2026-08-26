@@ -1,0 +1,63 @@
+{
+  "schema_version": "1.0.0-draft.1",
+  "contract_status": "draft",
+  "generated_at": "2026-08-20T00:00:00+08:00",
+  "description": "Versioned inventory and discovery-profile composition for the China financial regulatory source catalogs. Profiles select catalogs for discovery only; applicability still requires evidence-backed facts and reviewed rules.",
+  "packs": [
+    {
+      "id": "common",
+      "catalog_file": "regulatory-sources.json",
+      "catalog_sha256": "5ed26cd9b6eb3fdf6c10de88b85aa8f9d1f6002b14fb96807e155b2d6c33a846",
+      "minimum_documents": 26,
+      "description": "Cross-sector laws, governance, AML, privacy, data, cyber and common financial regulation."
+    },
+    {
+      "id": "banking",
+      "catalog_file": "banking-regulatory-sources.json",
+      "catalog_sha256": "3d821bb8666ba2ee4ff31d1c46abdd1eb6c3843f82e115b45ad0a26d0328eaa1",
+      "minimum_documents": 16,
+      "description": "Banking prudential and lending sources plus several bank-and-insurance shared instruments."
+    },
+    {
+      "id": "insurance",
+      "catalog_file": "insurance-regulatory-sources.json",
+      "catalog_sha256": "c2f97b9a41a0cfdd0b1a2be3bd1107419c8d9fc8e275ce6b009927c947197a90",
+      "minimum_documents": 14,
+      "description": "Insurance solvency, funds, products, sales, reinsurance, reserves and fraud sources."
+    },
+    {
+      "id": "fintech-data-ai",
+      "catalog_file": "fintech-data-regulatory-sources.json",
+      "catalog_sha256": "a90c28549fb1278a255e4b6abea5b18b5f72ad934ff840797840b81cc95cf780",
+      "minimum_documents": 20,
+      "description": "Payment, financial data, outbound transfer, cybersecurity, cryptography, cloud and public-AI sources."
+    }
+  ],
+  "profiles": [
+    {
+      "id": "COMMON",
+      "pack_ids": ["common"],
+      "description": "Cross-sector discovery foundation; never a complete entity profile by itself."
+    },
+    {
+      "id": "BANK",
+      "pack_ids": ["common", "banking", "fintech-data-ai"],
+      "description": "Bank discovery union, including cross-sector data, cyber, cloud and AI sources."
+    },
+    {
+      "id": "INSURANCE",
+      "pack_ids": ["common", "banking", "insurance", "fintech-data-ai"],
+      "description": "Insurance discovery union; the banking pack is included because it currently contains shared licence, related-party, consumer and reporting instruments."
+    },
+    {
+      "id": "FINTECH",
+      "pack_ids": ["common", "fintech-data-ai"],
+      "description": "Technology-provider discovery union; payment obligations still require the relevant licence and activity facts."
+    },
+    {
+      "id": "PAYMENT",
+      "pack_ids": ["common", "fintech-data-ai"],
+      "description": "Non-bank payment discovery union, subject to payment licence, business and reserve-fund facts."
+    }
+  ]
+}

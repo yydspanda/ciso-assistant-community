@@ -1,0 +1,51 @@
+name: China Financial GRC Project Governance
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+    paths:
+      - "AGENTS.md"
+      - ".notes/china_financial_grc/**"
+      - "tools/china_financial_grc/validate_project_governance.py"
+      - "tools/china_financial_grc/tests/test_validate_project_governance.py"
+      - "tools/china_financial_grc/check_upstream_divergence.py"
+      - "tools/china_financial_grc/tests/test_check_upstream_divergence.py"
+      - ".github/workflows/china-financial-grc-project-governance.yml"
+      - ".github/workflows/china-financial-grc-upstream-divergence.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-project-governance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Validate the project governance ledger
+        run: python tools/china_financial_grc/validate_project_governance.py
+
+      - name: Run project governance validator tests
+        run: >-
+          python -m unittest discover
+          -s tools/china_financial_grc/tests
+          -p "test_validate_project_governance.py"
+
+      - name: Run upstream divergence checker tests
+        run: python -m unittest tools.china_financial_grc.tests.test_check_upstream_divergence

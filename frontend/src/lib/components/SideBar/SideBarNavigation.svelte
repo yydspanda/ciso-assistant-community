@@ -5,29 +5,16 @@
 	import SideBarCategory from '$lib/components/SideBar/SideBarCategory.svelte';
 	import { Accordion } from '@skeletonlabs/skeleton-svelte';
 	import { page } from '$app/state';
-	import { URL_MODEL_MAP } from '$lib/utils/crud';
-	import { hasPermissionAnywhere } from '$lib/utils/access-control';
+	import { isNavigationItemVisible } from './navigationVisibility';
 	import { driverInstance } from '$lib/utils/stores';
 
 	const user = page.data.user;
 
 	const items = navData.items
 		.map((item) => {
-			// Check and filter the sub-items based on user permissions
-			const filteredSubItems = item.items.filter((subItem) => {
-				if (subItem.adminOnly) {
-					return Boolean(user?.is_admin);
-				}
-				if (subItem.exclude) {
-					return user?.roles?.some((role: string) => !subItem.exclude.includes(role)) ?? false;
-				} else if (subItem.permissions) {
-					return subItem.permissions?.some((permission) => hasPermissionAnywhere(user, permission));
-				} else if (Object.hasOwn(URL_MODEL_MAP, subItem.href.split('/')[1])) {
-					const model = URL_MODEL_MAP[subItem.href.split('/')[1]];
-					return hasPermissionAnywhere(user, `view_${model.name}`);
-				}
-				return false;
-			});
+			const filteredSubItems = item.items.filter((subItem) =>
+				isNavigationItemVisible(subItem, user)
+			);
 
 			return {
 				...item,

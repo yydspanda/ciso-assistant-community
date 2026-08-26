@@ -58,6 +58,7 @@ ALLOWED_PERMISSION_APPS = (
     "core",
     "ebios_rm",
     "tprm",
+    "regulatory",
     "privacy",
     "resilience",
     "crq",

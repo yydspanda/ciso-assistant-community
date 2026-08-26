@@ -1,10 +1,9 @@
 <script lang="ts">
 	import { browser } from '$app/environment';
 	import { safeTranslate } from '$lib/utils/i18n';
-	import { navigationLinks } from './paletteData';
+	import { getNavigationLinks, isNavigationLinkFeatureVisible } from './paletteData';
 	import { goto } from '$lib/utils/breadcrumbs';
 	import { page } from '$app/state';
-	import { navData } from '../SideBar/navData';
 	import { getSidebarVisibleItems } from '$lib/utils/sidebar-config';
 	import { expandChat } from '../ChatWidget/chatStore.svelte';
 	import { m } from '$paraglide/messages';
@@ -15,16 +14,20 @@
 	const isMac = browser && navigator.platform.toUpperCase().indexOf('MAC') >= 0;
 	const modifierKey = isMac ? '⌘' : 'Ctrl';
 
-	// Generate navigation commands with automatic close
-	const navigationCommands = navigationLinks.map((link) => ({
-		label: safeTranslate(link.label),
-		value: link.href,
-		icon: link.icon,
-		onSelect: () => {
-			opened = false;
-			goto(link.href, { label: link.label, breadcrumbAction: 'replace' });
-		}
-	}));
+	// Generate permission-filtered navigation commands with automatic close.
+	const navigationCommands = $derived(
+		getNavigationLinks(page.data?.user).map((link) => ({
+			label: safeTranslate(link.label),
+			visibilityKey: link.label,
+			categoryVisibilityKey: link.categoryVisibilityKey,
+			value: link.href,
+			icon: link.icon,
+			onSelect: () => {
+				opened = false;
+				goto(link.href, { label: link.label, breadcrumbAction: 'replace' });
+			}
+		}))
+	);
 
 	const featureFlags = $derived(page.data?.featureflags ?? {});
 
@@ -44,13 +47,7 @@
 			: []
 	);
 	const sideBarVisibleItems = $derived(getSidebarVisibleItems(featureFlags));
-
-	const visibilityKeyByHref = Object.fromEntries(
-		(navData.items ?? [])
-			.flatMap((section) => section.items ?? [])
-			.filter((item) => item?.href && item?.name)
-			.map((item) => [item.href, item.name])
-	);
+	const visibleItemMap = $derived(sideBarVisibleItems as Record<string, boolean | undefined>);
 
 	// Strip accents/diacritics for accent-insensitive matching
 	function normalize(str: string): string {
@@ -65,11 +62,15 @@
 	let filteredNavigationCommands = $derived(
 		navigationCommands
 			.filter((link) => normalize(link.label).includes(normalize(searchText)))
-			.filter((link) => {
-				const visibilityKey = visibilityKeyByHref[link.value];
-				if (!visibilityKey) return true;
-				return sideBarVisibleItems[visibilityKey] !== false;
-			})
+			.filter((link) =>
+				isNavigationLinkFeatureVisible(
+					{
+						label: link.visibilityKey,
+						categoryVisibilityKey: link.categoryVisibilityKey
+					},
+					visibleItemMap
+				)
+			)
 	);
 	let filteredActionCommands = $derived(
 		actionCommands.filter((cmd) => normalize(cmd.label).includes(normalize(searchText)))

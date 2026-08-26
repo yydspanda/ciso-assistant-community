@@ -1,0 +1,1165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:yydspanda:risk:schema:cn-financial-regulatory-record:2.0.0-draft.1",
+  "title": "China financial GRC regulatory record interchange (draft)",
+  "description": "A draft, source-aware and bitemporal interchange contract for regulatory documents, versions, provisions, obligations, applicability, control mappings, and decisions.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_status",
+    "generated_at",
+    "documents",
+    "document_versions",
+    "provisions",
+    "obligations",
+    "applicability_rules",
+    "applicability_decisions",
+    "control_mappings",
+    "decision_records"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "2.0.0-draft.1"
+    },
+    "contract_status": {
+      "const": "draft"
+    },
+    "generated_at": {
+      "$ref": "#/$defs/dateTime"
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 4000
+    },
+    "documents": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/regulatoryDocument"
+      }
+    },
+    "document_versions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/regulatoryDocumentVersion"
+      }
+    },
+    "provisions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/provision"
+      }
+    },
+    "obligations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/obligation"
+      }
+    },
+    "applicability_rules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/applicabilityRule"
+      }
+    },
+    "applicability_decisions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/applicabilityDecision"
+      }
+    },
+    "control_mappings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/controlMapping"
+      }
+    },
+    "decision_records": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/decisionRecord"
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{2,159}$"
+    },
+    "date": {
+      "type": "string",
+      "format": "date"
+    },
+    "dateTime": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "authorityLevel": {
+      "type": "string",
+      "enum": [
+        "law",
+        "administrative_regulation",
+        "departmental_rule",
+        "regulatory_normative_document",
+        "mandatory_standard",
+        "recommended_standard",
+        "internal_policy",
+        "interpretive_material",
+        "enforcement_material"
+      ]
+    },
+    "regulatoryDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title_zh",
+        "issuer",
+        "authority_level",
+        "territories",
+        "regulated_entity_scopes",
+        "domains"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "title_zh": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "title_en": {
+          "type": "string",
+          "maxLength": 1000,
+          "description": "Non-authoritative translation unless explicitly stated otherwise."
+        },
+        "issuer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "authority_level": {
+          "$ref": "#/$defs/authorityLevel"
+        },
+        "territories": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "regulated_entity_scopes": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Regulated entity, licence, or operating-role discovery scopes. The cross_sector label means broad discovery relevance, not automatic legal applicability. This is not a content-licence field.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        },
+        "coverage_priority": {
+          "type": "string",
+          "enum": ["P0", "P1", "P2"],
+          "description": "Collection and review priority only; it is not an authority or applicability ranking."
+        },
+        "coverage_stage": {
+          "type": "string",
+          "enum": [
+            "source_metadata",
+            "provision_indexed",
+            "obligations_proposed",
+            "obligations_reviewed"
+          ],
+          "description": "Highest completed knowledge-production stage. Source metadata alone is not an operational obligation."
+        },
+        "applicability_fact_keys": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "description": "Candidate fact keys needed for later deterministic applicability analysis. Their presence does not establish that the instrument applies.",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.]{2,159}$"
+          }
+        },
+        "selection_rationale": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "domains": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "governance",
+              "compliance",
+              "banking",
+              "insurance",
+              "fintech",
+              "licensing",
+              "prudential_capital",
+              "liquidity_risk",
+              "credit_risk",
+              "market_risk",
+              "insurance_solvency",
+              "actuarial_reserving",
+              "insurance_funds",
+              "payment_services",
+              "regulatory_reporting",
+              "aml_kyc",
+              "consumer_protection",
+              "data_security",
+              "privacy",
+              "cross_border_data",
+              "cybersecurity",
+              "mlps",
+              "critical_infrastructure",
+              "cryptography",
+              "ai_model_governance",
+              "outsourcing",
+              "operational_resilience",
+              "internal_control",
+              "audit",
+              "cost_control"
+            ]
+          }
+        }
+      }
+    },
+    "regulatoryDocumentVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "document_id",
+        "version_label",
+        "document_no",
+        "status",
+        "status_as_of",
+        "effective_basis",
+        "issued_date",
+        "published_date",
+        "effective_date",
+        "transition_end",
+        "repeal_date",
+        "supersedes_version_ids",
+        "source_url",
+        "source_hash",
+        "content_storage_policy",
+        "source_checked_on",
+        "metadata_confidence",
+        "legal_review_status",
+        "legal_reviewed_at",
+        "legal_reviewed_by",
+        "valid_from",
+        "valid_to",
+        "recorded_from",
+        "recorded_to",
+        "provenance"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "document_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "version_label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "document_no": {
+          "type": ["string", "null"],
+          "maxLength": 300
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "draft",
+            "published_future_effective",
+            "effective",
+            "active_no_explicit_commencement",
+            "superseded",
+            "repealed",
+            "unknown"
+          ]
+        },
+        "status_as_of": {
+          "$ref": "#/$defs/date"
+        },
+        "effective_basis": {
+          "type": "string",
+          "enum": [
+            "explicit_date",
+            "publication_clause",
+            "no_explicit_commencement_clause",
+            "unresolved"
+          ]
+        },
+        "issued_date": {
+          "oneOf": [
+            {"$ref": "#/$defs/date"},
+            {"type": "null"}
+          ]
+        },
+        "published_date": {
+          "description": "Official promulgation or public-release date evidenced by the cited authority source. It is not inferred from a URL path and may be null when the first official publication date is unresolved.",
+          "oneOf": [
+            {"$ref": "#/$defs/date"},
+            {"type": "null"}
+          ]
+        },
+        "effective_date": {
+          "oneOf": [
+            {"$ref": "#/$defs/date"},
+            {"type": "null"}
+          ]
+        },
+        "transition_end": {
+          "oneOf": [
+            {"$ref": "#/$defs/date"},
+            {"type": "null"}
+          ]
+        },
+        "repeal_date": {
+          "oneOf": [
+            {"$ref": "#/$defs/date"},
+            {"type": "null"}
+          ]
+        },
+        "supersedes_version_ids": {
+          "type": "array",
+          "description": "Predecessor version IDs represented in this exchange payload. Unless legally reviewed as complete, an empty array does not assert that no earlier legal version exists.",
+          "items": {
+            "$ref": "#/$defs/identifier"
+          },
+          "uniqueItems": true
+        },
+        "source_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://"
+        },
+        "source_hash": {
+          "oneOf": [
+            {"$ref": "#/$defs/sha256"},
+            {"type": "null"}
+          ]
+        },
+        "content_storage_policy": {
+          "type": "string",
+          "enum": ["metadata_only", "official_snapshot", "licensed_copy"]
+        },
+        "notes": {
+          "type": "string",
+          "maxLength": 4000
+        },
+        "source_checked_on": {
+          "$ref": "#/$defs/date",
+          "description": "Date on which the official-link metadata was checked; not a legal-review assertion."
+        },
+        "metadata_confidence": {
+          "type": "string",
+          "enum": ["confirmed", "partial", "unresolved"],
+          "description": "Confidence in the source metadata only; this does not assert legal applicability or legal review."
+        },
+        "legal_review_status": {
+          "type": "string",
+          "enum": ["unreviewed", "reviewed"]
+        },
+        "legal_reviewed_at": {
+          "oneOf": [
+            {"$ref": "#/$defs/dateTime"},
+            {"type": "null"}
+          ]
+        },
+        "legal_reviewed_by": {
+          "type": ["string", "null"],
+          "maxLength": 300
+        },
+        "valid_from": {
+          "oneOf": [
+            {"$ref": "#/$defs/date"},
+            {"type": "null"}
+          ]
+        },
+        "valid_to": {
+          "oneOf": [
+            {"$ref": "#/$defs/date"},
+            {"type": "null"}
+          ]
+        },
+        "recorded_from": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "recorded_to": {
+          "oneOf": [
+            {"$ref": "#/$defs/dateTime"},
+            {"type": "null"}
+          ]
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        }
+      }
+    },
+    "sourceLocator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["article", "page", "page_bbox", "dom_selector", "annex", "table_cell", "other"]
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "created_at", "created_by"],
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": ["human", "parser", "model_proposal", "import"]
+        },
+        "created_at": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "created_by": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "parser_version": {
+          "type": ["string", "null"],
+          "maxLength": 300
+        },
+        "model": {
+          "type": ["string", "null"],
+          "maxLength": 300
+        },
+        "prompt_version": {
+          "type": ["string", "null"],
+          "maxLength": 300
+        },
+        "retrieval_version": {
+          "type": ["string", "null"],
+          "maxLength": 300
+        }
+      }
+    },
+    "provision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "document_id",
+        "version_id",
+        "article",
+        "source_locator",
+        "content_hash",
+        "recorded_from",
+        "recorded_to",
+        "provenance"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "document_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "version_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "article": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "heading": {
+          "type": ["string", "null"],
+          "maxLength": 1000
+        },
+        "text": {
+          "type": ["string", "null"],
+          "description": "Only present when storage and redistribution are permitted."
+        },
+        "source_locator": {
+          "$ref": "#/$defs/sourceLocator"
+        },
+        "content_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "recorded_from": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "recorded_to": {
+          "oneOf": [
+            {"$ref": "#/$defs/dateTime"},
+            {"type": "null"}
+          ]
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        }
+      }
+    },
+    "deadline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["none", "fixed_date", "duration_after_trigger", "periodic", "without_undue_delay", "needs_review"]
+        },
+        "value": {
+          "type": ["string", "null"],
+          "maxLength": 500
+        },
+        "rule_id": {
+          "type": ["string", "null"],
+          "maxLength": 300
+        }
+      }
+    },
+    "obligation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title_zh",
+        "provision_ids",
+        "authority_level",
+        "modality",
+        "subject",
+        "action",
+        "conditions",
+        "deadline",
+        "valid_from",
+        "valid_to",
+        "recorded_from",
+        "recorded_to",
+        "review_status",
+        "confidence",
+        "provenance"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "title_zh": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "provision_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "authority_level": {
+          "$ref": "#/$defs/authorityLevel"
+        },
+        "modality": {
+          "type": "string",
+          "enum": ["must", "must_not", "should", "may", "organisation_defined"]
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        },
+        "action": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "object": {
+          "type": ["string", "null"],
+          "maxLength": 2000
+        },
+        "conditions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          }
+        },
+        "exceptions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          }
+        },
+        "deadline": {
+          "$ref": "#/$defs/deadline"
+        },
+        "expected_evidence": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          }
+        },
+        "penalty_or_consequence": {
+          "type": ["string", "null"],
+          "maxLength": 4000
+        },
+        "valid_from": {
+          "oneOf": [
+            {"$ref": "#/$defs/date"},
+            {"type": "null"}
+          ]
+        },
+        "valid_to": {
+          "oneOf": [
+            {"$ref": "#/$defs/date"},
+            {"type": "null"}
+          ]
+        },
+        "recorded_from": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "recorded_to": {
+          "oneOf": [
+            {"$ref": "#/$defs/dateTime"},
+            {"type": "null"}
+          ]
+        },
+        "review_status": {
+          "type": "string",
+          "enum": ["machine_proposed", "analyst_reviewed", "legal_reviewed", "approved", "rejected", "superseded"]
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "uncertainties": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000
+          }
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        }
+      }
+    },
+    "condition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fact", "operator", "value"],
+      "properties": {
+        "fact": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.]{2,159}$"
+        },
+        "operator": {
+          "type": "string",
+          "enum": ["eq", "ne", "in", "not_in", "gt", "gte", "lt", "lte", "contains", "exists"]
+        },
+        "value": {}
+      }
+    },
+    "applicabilityRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "obligation_id",
+        "version",
+        "supersedes_rule_id",
+        "all",
+        "any",
+        "unknown_result",
+        "review_status",
+        "valid_from",
+        "valid_to",
+        "recorded_from",
+        "recorded_to",
+        "provenance"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "obligation_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "supersedes_rule_id": {
+          "oneOf": [
+            {"$ref": "#/$defs/identifier"},
+            {"type": "null"}
+          ]
+        },
+        "all": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/condition"
+          }
+        },
+        "any": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/condition"
+          }
+        },
+        "unknown_result": {
+          "const": "needs_review"
+        },
+        "review_status": {
+          "type": "string",
+          "enum": ["draft", "approved", "retired"]
+        },
+        "valid_from": {
+          "oneOf": [
+            {"$ref": "#/$defs/date"},
+            {"type": "null"}
+          ]
+        },
+        "valid_to": {
+          "oneOf": [
+            {"$ref": "#/$defs/date"},
+            {"type": "null"}
+          ]
+        },
+        "recorded_from": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "recorded_to": {
+          "oneOf": [
+            {"$ref": "#/$defs/dateTime"},
+            {"type": "null"}
+          ]
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        }
+      }
+    },
+    "applicabilityScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "legal_entity",
+            "business_unit",
+            "product",
+            "system",
+            "data_flow",
+            "process",
+            "customer_segment"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/identifier"
+        }
+      }
+    },
+    "applicabilityRuleReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "applicabilityFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fact", "known", "source_refs", "observed_at"],
+      "properties": {
+        "fact": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.]{2,159}$"
+        },
+        "known": {
+          "type": "boolean"
+        },
+        "value": {},
+        "source_refs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          }
+        },
+        "observed_at": {
+          "oneOf": [
+            {"$ref": "#/$defs/dateTime"},
+            {"type": "null"}
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"known": {"const": true}},
+            "required": ["known"]
+          },
+          "then": {
+            "required": ["value"],
+            "properties": {
+              "source_refs": {"minItems": 1},
+              "observed_at": {"$ref": "#/$defs/dateTime"}
+            }
+          },
+          "else": {
+            "allOf": [
+              {
+                "not": {
+                  "required": ["value"]
+                }
+              },
+              {
+                "properties": {
+                  "source_refs": {"maxItems": 0},
+                  "observed_at": {"type": "null"}
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "applicabilityDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "obligation_id",
+        "scope",
+        "rule",
+        "facts",
+        "result",
+        "rationale",
+        "review_status",
+        "confirmed_by",
+        "confirmed_at",
+        "valid_from",
+        "valid_to",
+        "recorded_from",
+        "recorded_to",
+        "provenance"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "obligation_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "scope": {
+          "$ref": "#/$defs/applicabilityScope"
+        },
+        "rule": {
+          "$ref": "#/$defs/applicabilityRuleReference"
+        },
+        "facts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/applicabilityFact"
+          }
+        },
+        "result": {
+          "type": "string",
+          "enum": ["applicable", "not_applicable", "needs_review"]
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "review_status": {
+          "type": "string",
+          "enum": ["draft", "confirmed", "rejected", "superseded"]
+        },
+        "confirmed_by": {
+          "type": ["string", "null"],
+          "maxLength": 300
+        },
+        "confirmed_at": {
+          "oneOf": [
+            {"$ref": "#/$defs/dateTime"},
+            {"type": "null"}
+          ]
+        },
+        "valid_from": {
+          "oneOf": [
+            {"$ref": "#/$defs/date"},
+            {"type": "null"}
+          ]
+        },
+        "valid_to": {
+          "oneOf": [
+            {"$ref": "#/$defs/date"},
+            {"type": "null"}
+          ]
+        },
+        "recorded_from": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "recorded_to": {
+          "oneOf": [
+            {"$ref": "#/$defs/dateTime"},
+            {"type": "null"}
+          ]
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"review_status": {"const": "confirmed"}},
+            "required": ["review_status"]
+          },
+          "then": {
+            "properties": {
+              "confirmed_by": {"type": "string", "minLength": 1},
+              "confirmed_at": {"$ref": "#/$defs/dateTime"}
+            }
+          },
+          "else": {
+            "properties": {
+              "confirmed_by": {"type": "null"},
+              "confirmed_at": {"type": "null"}
+            }
+          }
+        }
+      ]
+    },
+    "controlMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "version",
+        "supersedes_mapping_id",
+        "obligation_id",
+        "control_urn",
+        "relationship",
+        "rationale",
+        "owner_role",
+        "reviewer_role",
+        "review_status",
+        "valid_from",
+        "valid_to",
+        "recorded_from",
+        "recorded_to",
+        "provenance"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "supersedes_mapping_id": {
+          "oneOf": [
+            {"$ref": "#/$defs/identifier"},
+            {"type": "null"}
+          ]
+        },
+        "obligation_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "control_urn": {
+          "type": "string",
+          "pattern": "^urn:[a-z0-9._-]+:risk:(reference_control|function):[a-z0-9._:-]+$"
+        },
+        "relationship": {
+          "type": "string",
+          "enum": ["implements", "partially_implements", "supports", "conflicts"]
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "owner_role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "reviewer_role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "test_frequency": {
+          "type": ["string", "null"],
+          "maxLength": 300
+        },
+        "evidence_types": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        },
+        "review_status": {
+          "type": "string",
+          "enum": ["proposed", "approved", "rejected", "retired"]
+        },
+        "valid_from": {
+          "oneOf": [
+            {"$ref": "#/$defs/date"},
+            {"type": "null"}
+          ]
+        },
+        "valid_to": {
+          "oneOf": [
+            {"$ref": "#/$defs/date"},
+            {"type": "null"}
+          ]
+        },
+        "recorded_from": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "recorded_to": {
+          "oneOf": [
+            {"$ref": "#/$defs/dateTime"},
+            {"type": "null"}
+          ]
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        }
+      }
+    },
+    "decisionRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "subject_type",
+        "subject_id",
+        "decision",
+        "decided_at",
+        "decided_by",
+        "role",
+        "rationale",
+        "payload_sha256"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "subject_type": {
+          "type": "string",
+          "enum": [
+            "document",
+            "document_version",
+            "provision",
+            "obligation",
+            "applicability_rule",
+            "applicability_decision",
+            "control_mapping"
+          ]
+        },
+        "subject_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "decision": {
+          "type": "string",
+          "enum": ["approve", "reject", "return_for_changes", "revoke"]
+        },
+        "decided_at": {
+          "$ref": "#/$defs/dateTime"
+        },
+        "decided_by": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "decided_by_kind": {
+          "type": "string",
+          "enum": ["human", "workload"]
+        },
+        "role": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "conditions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1000
+          }
+        },
+        "expires_at": {
+          "oneOf": [
+            {"$ref": "#/$defs/dateTime"},
+            {"type": "null"}
+          ]
+        },
+        "payload_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "payload_digest_profile": {
+          "const": "cn-financial-grc-canonical-json-v1"
+        }
+      }
+    }
+  }
+}

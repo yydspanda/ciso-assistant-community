@@ -1,0 +1,574 @@
+{
+  "schema_version": "1.0.0-draft.1",
+  "contract_status": "draft",
+  "generated_at": "2026-08-20T00:00:00+08:00",
+  "description": "Controlled candidate facts for later deterministic applicability analysis. Values are institution-specific, require evidence, and remain needs_review when unknown.",
+  "facts": [
+    {
+      "key": "entity.territories",
+      "title_zh": "经营及注册地域",
+      "value_type": "set",
+      "description": "法人注册、获准经营及实际提供服务的国家或地区集合。",
+      "evidence_examples": ["营业执照和金融许可证", "分支机构与跨境经营清单"],
+      "owner_role": "legal_entity_management",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "entity.regulators",
+      "title_zh": "主管监管机关",
+      "value_type": "set",
+      "description": "对该法人、牌照或活动具有监督权限的机关集合。",
+      "evidence_examples": ["监管关系清单", "监管批复和报送关系"],
+      "owner_role": "compliance",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "entity.licence_types",
+      "title_zh": "金融牌照类型",
+      "value_type": "set",
+      "description": "监管机关颁发且当前有效的金融业务许可类型。",
+      "evidence_examples": ["许可证原件或监管电子证照", "许可事项变更批复"],
+      "owner_role": "legal_entity_management",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "entity.institution_type",
+      "title_zh": "金融机构类型",
+      "value_type": "string",
+      "description": "按现行监管口径确定的机构类别，不以企业自称代替。",
+      "evidence_examples": ["设立批复", "许可证机构类型"],
+      "owner_role": "legal_entity_management",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "entity.third_party_data_security_assessment_provider",
+      "title_zh": "第三方数据安全风险评估机构角色",
+      "value_type": "boolean",
+      "description": "本机构是否受托作为独立第三方开展网络数据安全风险评估；该角色与被评估的数据处理者角色分别判断。",
+      "evidence_examples": ["评估服务合同及工作说明", "评估机构独立性与人员资质档案"],
+      "owner_role": "data_security",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "entity.total_assets_cny",
+      "title_zh": "法人总资产",
+      "value_type": "decimal",
+      "description": "按指定时点和监管口径计算的人民币总资产，必须同时保存口径和时点。",
+      "evidence_examples": ["经审计财务报表", "监管报表及口径说明"],
+      "owner_role": "finance",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "entity.employee_count",
+      "title_zh": "职工人数",
+      "value_type": "integer",
+      "description": "按指定时点和适用公司法口径计算的职工人数。",
+      "evidence_examples": ["人力资源主数据", "经复核的职工名册和口径说明"],
+      "owner_role": "human_resources",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "entity.group_membership",
+      "title_zh": "金融集团成员身份",
+      "value_type": "boolean",
+      "description": "是否属于受并表或集团监管的金融集团及其边界。",
+      "evidence_examples": ["集团组织架构", "并表监管范围批复"],
+      "owner_role": "legal_entity_management",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "entity.cross_border_operations",
+      "title_zh": "跨境经营活动",
+      "value_type": "boolean",
+      "description": "是否通过境外分支、子公司、跨境产品或服务开展经营。",
+      "evidence_examples": ["境外机构清单", "跨境业务和监管报送清单"],
+      "owner_role": "compliance",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "entity.systemic_designations",
+      "title_zh": "系统重要性认定",
+      "value_type": "set",
+      "description": "由有权机关公布或通知的系统重要性、关基等正式认定。",
+      "evidence_examples": ["监管公布名单", "正式认定或通知文件"],
+      "owner_role": "risk_management",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "entity.listing_status",
+      "title_zh": "上市状态",
+      "value_type": "string",
+      "allowed_values": ["listed", "unlisted", "listing_candidate"],
+      "description": "法人或控制集团的上市状态及市场范围。",
+      "evidence_examples": ["证券交易所披露", "公司治理档案"],
+      "owner_role": "company_secretary",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "governance.audit_committee_model",
+      "title_zh": "审计委员会治理模式",
+      "value_type": "string",
+      "allowed_values": ["audit_committee_replaces_supervisory_board", "supervisory_board_retained", "other"],
+      "description": "章程和有效决议确定的审计委员会与监事会安排。",
+      "evidence_examples": ["公司章程", "股东会和董事会决议"],
+      "owner_role": "company_secretary",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "governance.related_party_transactions",
+      "title_zh": "关联交易活动",
+      "value_type": "boolean",
+      "description": "是否存在按适用监管口径识别的关联方及关联交易候选事项。",
+      "evidence_examples": ["关联方动态名册", "交易台账和利益冲突申报"],
+      "owner_role": "company_secretary",
+      "sensitivity": "restricted",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "banking.business_lines",
+      "title_zh": "银行业务条线",
+      "value_type": "set",
+      "description": "实际开展且获许可的存款、贷款、交易、托管、理财等业务集合。",
+      "evidence_examples": ["业务范围批复", "产品和业务目录"],
+      "owner_role": "banking_compliance",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "banking.consolidated_scope",
+      "title_zh": "银行并表监管范围",
+      "value_type": "set",
+      "description": "纳入资本、风险、流动性或其他并表监管的法人和业务范围。",
+      "evidence_examples": ["并表监管范围文件", "集团财务合并底稿"],
+      "owner_role": "banking_risk",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "banking.trading_book_materiality",
+      "title_zh": "交易账簿重要性",
+      "value_type": "string",
+      "allowed_values": ["material", "non_material", "not_applicable"],
+      "description": "按适用监管口径评估的交易账簿规模和重要性。",
+      "evidence_examples": ["交易账簿政策", "头寸和资本计量报表"],
+      "owner_role": "market_risk",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "banking.counterparty_exposure_types",
+      "title_zh": "交易对手风险暴露类型",
+      "value_type": "set",
+      "description": "授信、同业、衍生品、结算及其他交易对手暴露的监管分类。",
+      "evidence_examples": ["风险暴露台账", "交易对手及关联集团映射"],
+      "owner_role": "credit_risk",
+      "sensitivity": "restricted",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "banking.loan_product_types",
+      "title_zh": "贷款产品类型",
+      "value_type": "set",
+      "description": "实际提供的个人、流动资金、固定资产、互联网及其他贷款类型。",
+      "evidence_examples": ["贷款产品目录", "产品准入和监管报送映射"],
+      "owner_role": "credit_compliance",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "banking.deposit_taking",
+      "title_zh": "吸收存款活动",
+      "value_type": "boolean",
+      "description": "是否依法开展吸收公众存款或其他存款类业务。",
+      "evidence_examples": ["金融许可证", "存款产品目录"],
+      "owner_role": "banking_compliance",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "banking.asset_securitisation_activity",
+      "title_zh": "资产证券化活动",
+      "value_type": "boolean",
+      "description": "是否作为发起、服务、投资或其他角色参与资产证券化。",
+      "evidence_examples": ["交易结构和合同", "监管备案或登记材料"],
+      "owner_role": "banking_risk",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "insurance.company_types",
+      "title_zh": "保险主体类型",
+      "value_type": "set",
+      "description": "财产险、人身险、再保险、保险集团、保险资管或中介等监管主体类型。",
+      "evidence_examples": ["保险许可证", "设立及业务范围批复"],
+      "owner_role": "insurance_compliance",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "insurance.product_types",
+      "title_zh": "保险产品类型",
+      "value_type": "set",
+      "description": "实际开发、销售、承保或管理的财产、人身及细分保险产品。",
+      "evidence_examples": ["产品目录", "审批备案回执及产品版本"],
+      "owner_role": "insurance_product",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "insurance.sales_channels",
+      "title_zh": "保险销售渠道",
+      "value_type": "set",
+      "description": "自营、代理、经纪、银保、互联网、电话等实际销售渠道。",
+      "evidence_examples": ["渠道和合作机构清单", "销售系统配置"],
+      "owner_role": "insurance_sales_compliance",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "insurance.intermediary_roles",
+      "title_zh": "保险中介角色",
+      "value_type": "set",
+      "description": "专业代理、兼业代理、个人代理、经纪或公估等角色。",
+      "evidence_examples": ["中介许可证或登记", "委托和授权协议"],
+      "owner_role": "insurance_sales_compliance",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "insurance.funds_investment_activities",
+      "title_zh": "保险资金运用活动",
+      "value_type": "set",
+      "description": "保险资金投资类别、委托方式、托管安排及交易角色。",
+      "evidence_examples": ["投资资产目录", "投资授权、委托和托管合同"],
+      "owner_role": "insurance_investment_risk",
+      "sensitivity": "restricted",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "insurance.reinsurance_activity",
+      "title_zh": "再保险活动",
+      "value_type": "boolean",
+      "description": "是否开展分出、分入、转分保或再保险经纪活动。",
+      "evidence_examples": ["再保险合同台账", "自留和分保政策"],
+      "owner_role": "reinsurance_risk",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "insurance.nonlife_business",
+      "title_zh": "非寿险业务",
+      "value_type": "boolean",
+      "description": "是否经营需要按非寿险规则计提准备金的业务。",
+      "evidence_examples": ["业务范围和产品清单", "准备金报表"],
+      "owner_role": "actuarial",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "payment.institution_types",
+      "title_zh": "支付机构类型",
+      "value_type": "set",
+      "description": "银行或非银行支付机构及其具体许可类别。",
+      "evidence_examples": ["支付业务许可证", "许可业务类型和地域范围"],
+      "owner_role": "payment_compliance",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "payment.business_types",
+      "title_zh": "支付业务类型",
+      "value_type": "set",
+      "description": "储值账户运营、支付交易处理及其他实际开展的支付业务。",
+      "evidence_examples": ["支付产品和业务清单", "许可证及技术处理流程"],
+      "owner_role": "payment_compliance",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "payment.customer_reserve_funds",
+      "title_zh": "客户备付金处理",
+      "value_type": "boolean",
+      "description": "是否收取、归集、核算、划转或对账客户备付金。",
+      "evidence_examples": ["备付金账户清单", "备付金日终对账和差错处理记录"],
+      "owner_role": "payment_finance",
+      "sensitivity": "restricted",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "product.customer_types",
+      "title_zh": "产品客户类型",
+      "value_type": "set",
+      "description": "消费者、专业机构、个人、企业、未成年人等客户范围。",
+      "evidence_examples": ["产品目标市场", "客户分层和准入规则"],
+      "owner_role": "product_governance",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "product.sales_channels",
+      "title_zh": "金融产品销售渠道",
+      "value_type": "set",
+      "description": "柜面、自营网络、第三方网络、电话及线下合作渠道。",
+      "evidence_examples": ["渠道清单", "网络营销和销售合作协议"],
+      "owner_role": "product_governance",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "processing.uses_personal_information",
+      "title_zh": "处理个人信息",
+      "value_type": "boolean",
+      "description": "业务流程、产品、系统或模型是否处理已识别或可识别自然人的信息。",
+      "evidence_examples": ["个人信息处理活动记录", "数据流图和字段目录"],
+      "owner_role": "privacy",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "processing.uses_automated_decision",
+      "title_zh": "使用自动化决策",
+      "value_type": "boolean",
+      "description": "是否通过程序自动分析、评估个人行为习惯、兴趣爱好或经济健康信用等状况并作出决定。",
+      "evidence_examples": ["业务决策流程", "模型、规则引擎和人工复核设计"],
+      "owner_role": "privacy",
+      "sensitivity": "restricted",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "data.personal_information_subject_count",
+      "title_zh": "个人信息主体累计人数",
+      "value_type": "integer",
+      "description": "按适用期间、去重规则和处理或出境口径计算的个人信息主体人数。",
+      "evidence_examples": ["数据资产目录和处理记录", "经复核的去重统计查询及口径说明"],
+      "owner_role": "privacy",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "data.sensitive_personal_information_subject_count",
+      "title_zh": "敏感个人信息主体累计人数",
+      "value_type": "integer",
+      "description": "按适用期间、去重和敏感信息认定口径计算的主体人数。",
+      "evidence_examples": ["敏感个人信息目录", "经复核的出境或处理统计"],
+      "owner_role": "privacy",
+      "sensitivity": "restricted",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "data.cross_border_transfer",
+      "title_zh": "数据向境外提供",
+      "value_type": "boolean",
+      "description": "是否存在法律意义上的数据向境外提供，包括远程访问和向境外模型发送上下文的候选场景。",
+      "evidence_examples": ["数据流图", "境外接收方、云和模型端点清单"],
+      "owner_role": "privacy",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "data.important_data_status",
+      "title_zh": "重要数据状态",
+      "value_type": "string",
+      "allowed_values": ["notified_or_published", "candidate", "not_identified", "unknown"],
+      "description": "有关部门或地区通知、公开目录及企业候选识别的区分状态。",
+      "evidence_examples": ["主管部门通知或公开目录", "经审批的数据分类分级记录"],
+      "owner_role": "data_security",
+      "sensitivity": "restricted",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "system.mlps_level",
+      "title_zh": "网络安全等级保护级别",
+      "value_type": "integer",
+      "description": "系统正式定级或当前候选级别；候选值不能替代备案和测评结论。",
+      "evidence_examples": ["定级报告和备案证明", "等级测评报告"],
+      "owner_role": "cybersecurity",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "system.cii_notification_status",
+      "title_zh": "关键信息基础设施认定状态",
+      "value_type": "string",
+      "allowed_values": ["authority_notified", "candidate", "not_notified", "unknown"],
+      "description": "区分有权部门正式认定通知与企业内部候选判断。",
+      "evidence_examples": ["保护工作部门通知", "内部候选评估和法律复核"],
+      "owner_role": "cybersecurity",
+      "sensitivity": "restricted",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "system.important_network_system",
+      "title_zh": "重要网络与信息系统",
+      "value_type": "boolean",
+      "description": "系统是否按密码、行业或其他适用规则被识别为重要网络与信息系统。",
+      "evidence_examples": ["系统重要性评估", "监管或主管部门确认材料"],
+      "owner_role": "cybersecurity",
+      "sensitivity": "restricted",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "cryptography.commercial_cryptography_use",
+      "title_zh": "商用密码应用",
+      "value_type": "boolean",
+      "description": "系统是否使用商用密码产品、服务、算法、协议或密钥体系保护网络和数据。",
+      "evidence_examples": ["密码资产和密钥清单", "密码应用方案及测评报告"],
+      "owner_role": "cryptography_management",
+      "sensitivity": "restricted",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "technology.public_internet_service",
+      "title_zh": "面向境内公众的互联网服务",
+      "value_type": "boolean",
+      "description": "服务是否面向中国境内公众开放，而非仅限内部受控使用。",
+      "evidence_examples": ["产品服务范围", "访问控制和用户注册规则"],
+      "owner_role": "technology_compliance",
+      "sensitivity": "internal",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "technology.cloud_service_use",
+      "title_zh": "云计算服务使用",
+      "value_type": "boolean",
+      "description": "金融业务、数据或重要系统是否部署于或依赖云计算服务。",
+      "evidence_examples": ["云服务和部署清单", "共享责任矩阵与外包合同"],
+      "owner_role": "technology_risk",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "technology.algorithm_recommendation_service",
+      "title_zh": "算法推荐服务",
+      "value_type": "boolean",
+      "description": "是否使用监管定义范围内的算法推荐技术提供互联网信息服务。",
+      "evidence_examples": ["算法和产品功能清单", "算法备案及适用性法律分析"],
+      "owner_role": "ai_governance",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "technology.deep_synthesis_service",
+      "title_zh": "深度合成服务",
+      "value_type": "boolean",
+      "description": "是否提供监管定义范围内的深度合成互联网信息服务。",
+      "evidence_examples": ["模型和媒体生成能力清单", "产品适用性法律分析"],
+      "owner_role": "ai_governance",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "technology.public_generative_ai_service",
+      "title_zh": "面向公众的生成式人工智能服务",
+      "value_type": "boolean",
+      "description": "是否向中国境内公众提供生成文本、图片、音频、视频等内容的服务。",
+      "evidence_examples": ["产品服务范围", "用户协议、访问控制和模型能力说明"],
+      "owner_role": "ai_governance",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "technology.public_opinion_or_social_mobilisation",
+      "title_zh": "舆论属性或社会动员能力",
+      "value_type": "boolean",
+      "description": "服务是否具有监管定义范围内的舆论属性或社会动员能力。",
+      "evidence_examples": ["产品传播能力评估", "算法备案和安全评估材料"],
+      "owner_role": "technology_compliance",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "technology.anthropomorphic_interaction_service",
+      "title_zh": "拟人化持续情感互动服务",
+      "value_type": "boolean",
+      "description": "是否模拟人格特征并与用户开展持续性情感互动；普通客服或工作助手不得仅凭使用大模型被自动归入。",
+      "evidence_examples": ["产品交互设计", "人格模拟和持续情感互动功能评估"],
+      "owner_role": "ai_governance",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "technology.registered_user_count",
+      "title_zh": "注册用户数",
+      "value_type": "integer",
+      "description": "按适用规则定义和统计时点计算的注册用户数量。",
+      "evidence_examples": ["用户主数据统计", "指标口径和复核记录"],
+      "owner_role": "product_analytics",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "technology.monthly_active_user_count",
+      "title_zh": "月活跃用户数",
+      "value_type": "integer",
+      "description": "按适用规则定义和统计期间计算的月活跃用户数量。",
+      "evidence_examples": ["月活指标报表", "指标口径、查询和复核记录"],
+      "owner_role": "product_analytics",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "technology.overseas_listing",
+      "title_zh": "境外上市活动",
+      "value_type": "boolean",
+      "description": "网络平台运营者是否正在或拟在境外上市。",
+      "evidence_examples": ["上市计划及申报材料", "董事会和中介机构项目记录"],
+      "owner_role": "company_secretary",
+      "sensitivity": "restricted",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "technology.financial_ai_use_cases",
+      "title_zh": "金融人工智能应用场景",
+      "value_type": "set",
+      "description": "信贷、承保理赔、资金交易、估值、风控、客户服务等实际AI使用场景。",
+      "evidence_examples": ["模型及AI应用台账", "业务流程、工具权限和上线审批记录"],
+      "owner_role": "ai_governance",
+      "sensitivity": "restricted",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "technology.customer_rights_impact",
+      "title_zh": "客户权益重大影响",
+      "value_type": "boolean",
+      "description": "系统或模型输出是否直接影响授信、承保、理赔、定价、合同或其他客户重大权益。",
+      "evidence_examples": ["业务决策流程图", "自动化程度和人工复核设计"],
+      "owner_role": "consumer_protection",
+      "sensitivity": "restricted",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "outsourcing.materiality",
+      "title_zh": "外包重要性",
+      "value_type": "string",
+      "allowed_values": ["material", "non_material", "candidate", "unknown"],
+      "description": "按机构适用政策和监管标准认定的外包重要性。",
+      "evidence_examples": ["外包风险评估", "重要外包审批和监管报告"],
+      "owner_role": "third_party_risk",
+      "sensitivity": "confidential",
+      "unknown_result": "needs_review"
+    },
+    {
+      "key": "incident.impact_scope",
+      "title_zh": "事件影响范围",
+      "value_type": "string",
+      "description": "按业务中断、地域、客户、数据数量、系统和经济影响等事实形成的事件范围摘要。",
+      "evidence_examples": ["事件时间线和影响测算", "系统、客户及数据影响证据"],
+      "owner_role": "incident_management",
+      "sensitivity": "restricted",
+      "unknown_result": "needs_review"
+    }
+  ]
+}

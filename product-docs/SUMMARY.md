@@ -123,6 +123,15 @@
 ## Guides
 
 * [Overview](guides/README.md)
+* Solution blueprints
+  * [China financial GRC](guides/china-financial-grc/README.md)
+    * [Regulatory scope](guides/china-financial-grc/regulatory-scope.md)
+    * [Regulatory source packs](guides/china-financial-grc/regulatory-source-packs.md)
+    * [Reference architecture](guides/china-financial-grc/reference-architecture.md)
+    * [Domain model](guides/china-financial-grc/domain-model.md)
+    * [Agent governance and boundaries](guides/china-financial-grc/agent-governance.md)
+    * [Open-source component decisions](guides/china-financial-grc/open-source-components.md)
+    * [Delivery roadmap](guides/china-financial-grc/roadmap.md)
 * [General tips](guides/general-tips.md)
 * Getting started
   * [Initial setup](guides/initial-setup.md)

@@ -1,0 +1,6 @@
+interface:
+  display_name: "China Financial GRC Product Manager"
+  short_description: "Shape governed China financial GRC product decisions"
+  default_prompt: "Use $china-financial-grc-product-manager to frame the next China financial GRC outcome, MVP boundary, metrics, and acceptance gates."
+policy:
+  allow_implicit_invocation: true
