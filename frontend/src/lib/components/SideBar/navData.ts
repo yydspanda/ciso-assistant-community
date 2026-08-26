@@ -316,6 +316,12 @@ export const navData = {
 			name: 'compliance',
 			items: [
 				{
+					name: 'regulatoryRegister',
+					fa_icon: 'fa-solid fa-scale-balanced',
+					href: '/regulatory',
+					permissions: ['view_regulatorydocument']
+				},
+				{
 					name: 'complianceAssessments',
 					fa_icon: 'fa-solid fa-certificate',
 					href: '/compliance-assessments',

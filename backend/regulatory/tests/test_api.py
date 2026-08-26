@@ -249,6 +249,7 @@ def test_recorded_as_of_parameter_fails_closed(regulatory_root):
         f"{url}?recorded_as_of=",
         f"{url}?recorded_as_of=2026-08-21",
         f"{url}?recorded_as_of=2026-08-21T00:00:00",
+        f"{url}?recorded_as_of=2026-02-30T00:00:00Z",
         f"{url}?recorded_as_of=2026-08-21T00:00:00Z&recorded_as_of=2026-08-22T00:00:00Z",
     )
     for invalid_url in invalid_urls:

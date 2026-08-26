@@ -8,7 +8,7 @@ import { writePageReport, type PageReport, type Severity } from '../utils/a11y-r
 
 const WCAG_TAGS = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'];
 
-// Desktop-scoped; not the WCAG 1.4.10 320px target — see the accessibility statement.
+// Existing pages remain desktop-scoped; new bounded views may opt into the WCAG 1.4.10 320px target.
 const REFLOW_MIN_WIDTH = 1024;
 
 const THEME: 'light' | 'dark' = process.env.A11Y_THEME === 'dark' ? 'dark' : 'light';
@@ -27,7 +27,13 @@ async function applyThemePref(page: Page): Promise<void> {
 	});
 }
 
-async function auditPage(page: Page, name: string, path: string): Promise<void> {
+async function auditPage(
+	page: Page,
+	name: string,
+	path: string,
+	reflowMinWidth = REFLOW_MIN_WIDTH,
+	enforceReflow = false
+): Promise<void> {
 	await page.waitForLoadState('networkidle').catch(() => {});
 
 	const isDark = await page.evaluate(() => document.documentElement.classList.contains('dark'));
@@ -35,9 +41,8 @@ async function auditPage(page: Page, name: string, path: string): Promise<void> 
 		expect.soft(isDark, `${name}: dark theme did not apply`).toBe(true);
 	}
 
+	await page.setViewportSize({ width: reflowMinWidth, height: 900 });
 	const results = await new AxeBuilder({ page }).withTags(WCAG_TAGS).analyze();
-
-	await page.setViewportSize({ width: REFLOW_MIN_WIDTH, height: 900 });
 	const horizontalOverflowPx = await page.evaluate(() =>
 		Math.max(0, document.documentElement.scrollWidth - document.documentElement.clientWidth)
 	);
@@ -81,6 +86,9 @@ async function auditPage(page: Page, name: string, path: string): Promise<void> 
 	);
 
 	expect.soft(blocking, `${name} has critical/serious a11y violations`).toEqual([]);
+	if (enforceReflow) {
+		expect.soft(horizontalOverflowPx, `${name} has horizontal overflow`).toBe(0);
+	}
 }
 
 test('a11y: login page', async ({ loginPage, page }) => {
@@ -90,7 +98,12 @@ test('a11y: login page', async ({ loginPage, page }) => {
 	await auditPage(page, 'login', '/login');
 });
 
-const AUTH_PAGES: { name: string; path: string }[] = [
+const AUTH_PAGES: {
+	name: string;
+	path: string;
+	reflowMinWidth?: number;
+	enforceReflow?: boolean;
+}[] = [
 	{ name: 'analytics-dashboard', path: '/analytics' },
 	{ name: 'audits-list', path: '/compliance-assessments' },
 	{ name: 'applied-controls-list', path: '/applied-controls' },
@@ -101,15 +114,16 @@ const AUTH_PAGES: { name: string; path: string }[] = [
 	{ name: 'calendar', path: '/calendar' },
 	{ name: 'x-rays', path: '/x-rays' },
 	{ name: 'entities-graph', path: '/entities/graph' },
-	{ name: 'reports', path: '/reports' }
+	{ name: 'reports', path: '/reports' },
+	{ name: 'regulatory-register', path: '/regulatory', reflowMinWidth: 320, enforceReflow: true }
 ];
 
-for (const { name, path } of AUTH_PAGES) {
+for (const { name, path, reflowMinWidth, enforceReflow } of AUTH_PAGES) {
 	test(`a11y: ${name}`, async ({ logedPage, page }) => {
 		await applyThemePref(page);
 		await page.goto(path);
 		await page.locator('body[data-hydrated="true"]').waitFor();
-		await auditPage(page, name, path);
+		await auditPage(page, name, path, reflowMinWidth, enforceReflow);
 	});
 }
 

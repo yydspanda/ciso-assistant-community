@@ -162,6 +162,7 @@ def test_applicability_api_validates_entity_and_recorded_time_strictly(
         f"{url}?entity={entity.id}&recorded_as_of=",
         f"{url}?entity={entity.id}&recorded_as_of=2026-08-21",
         f"{url}?entity={entity.id}&recorded_as_of=2026-08-21T00:00:00",
+        f"{url}?entity={entity.id}&recorded_as_of=2026-02-30T00:00:00Z",
         (
             f"{url}?entity={entity.id}"
             "&recorded_as_of=2026-08-21T00:00:00Z"

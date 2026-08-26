@@ -134,12 +134,24 @@ GET /api/regulatory/v1/documents/{uuid}/applicability-review/
     ?entity=<uuid>&recorded_as_of=<aware-RFC-3339>
 ```
 
+The fork's `/regulatory` and `/regulatory/{uuid}` SvelteKit routes consume these
+GET contracts as a read-only register and viewer. The browser receives a
+metadata-only projection, while the server validates response shape and binds
+document, entity, obligation revision, recorded time, and decision digest before
+combining panels. The generic entity list only assists discovery; API-side IAM
+and registration checks remain authoritative. Current panel reads share the
+applicability response's microsecond-precise selection anchor. The projection
+accepts only HTTPS official-source links and strips provision text and free-text
+version notes; decision valid time is shown separately from recorded time. The
+interface contains no state-changing review or approval control.
+
 It first resolves the existing exact applicability decision, then selects its
 latest authorised disposition at the same recorded time. The response keeps
 `computed_non_binding_result`, human disposition, `legal_conclusion: false`,
 and `is_binding: false` separate. There is no public review write, approval,
-publication, real institution fact, workflow UI, projection, or agent in this
-slice. Migration `regulatory.0004`, the internal named-human recording service,
+publication, real institution fact, binding reviewer action workflow,
+projection, or agent in this slice. Migration `regulatory.0004`, the internal
+named-human recording service,
 separate view/review permissions, related-user masking, and this read action are
 implemented. With this slice included, all 72 regulatory tests pass both with
 migrations disabled and through the real project migration graph. An isolated

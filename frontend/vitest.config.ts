@@ -1,9 +1,10 @@
 import { configDefaults, defineConfig } from 'vitest/config';
+import { svelteTesting } from '@testing-library/svelte/vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import path from 'path';
 
 export default defineConfig({
-	plugins: [svelte({ hot: !process.env.VITEST })],
+	plugins: [svelte({ hot: !process.env.VITEST }), svelteTesting()],
 	test: {
 		globals: true,
 		environment: 'jsdom',

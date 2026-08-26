@@ -31,6 +31,7 @@ applicability conclusion.
 | Regulatory JSON Schemas and official-source registers | Added in this fork | Explicitly draft contract; 76 metadata records across four packs remain legally unreviewed |
 | Controlled applicability-fact registry | Added in this fork | 56 fact definitions; unknown values route to review rather than non-applicability |
 | Temporal regulatory Django models and APIs | First bounded slice added | Synthetic metadata-only chain, fixed-rule applicability decision, independent named-human disposition, and read-only `/api/regulatory/v1/`; all remain non-binding |
+| Read-only regulatory register and viewer | Added in this fork | `/regulatory` exposes IAM-scoped metadata lineage, microsecond-anchored recorded-time selection, separately labelled valid time, non-binding applicability, and review state; browser projection is HTTPS/metadata-only and has no write, approval, publication, export, or submission controls |
 | Reviewed regulatory-to-library projection | Proposed | Projects approved obligations into frameworks and requirements |
 | General multi-rule applicability and action policy | Proposed | The implemented fixed synthetic rule remains bounded; unknown facts must route to review |
 | Continuous evidence and privacy/data integrations | Proposed external integration | Evidence providers must not become competing GRC masters |

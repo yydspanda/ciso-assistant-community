@@ -32,6 +32,18 @@ from .services.records import (
 )
 
 
+def _parse_aware_recorded_time(value: str):
+    try:
+        parsed = parse_datetime(value)
+    except (TypeError, ValueError):
+        parsed = None
+    if parsed is None or timezone.is_naive(parsed):
+        raise ValidationError(
+            {"recorded_as_of": "Use a timezone-aware RFC 3339 date-time."}
+        )
+    return parsed
+
+
 class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
     """IAM-filtered, read-only Phase 1 regulatory register."""
 
@@ -83,11 +95,7 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
                 raise ValidationError(
                     {"recorded_as_of": "Provide one non-empty timestamp."}
                 )
-            parsed = parse_datetime(values[0])
-            if parsed is None or timezone.is_naive(parsed):
-                raise ValidationError(
-                    {"recorded_as_of": ("Use a timezone-aware RFC 3339 date-time.")}
-                )
+            parsed = _parse_aware_recorded_time(values[0])
             if parsed > request_time:
                 raise ValidationError(
                     {"recorded_as_of": "A future recorded-time query is not allowed."}
@@ -159,13 +167,7 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
                 raise ValidationError(
                     {"recorded_as_of": "Provide one non-empty timestamp."}
                 )
-            requested_recorded_as_of = parse_datetime(recorded_values[0])
-            if requested_recorded_as_of is None or timezone.is_naive(
-                requested_recorded_as_of
-            ):
-                raise ValidationError(
-                    {"recorded_as_of": ("Use a timezone-aware RFC 3339 date-time.")}
-                )
+            requested_recorded_as_of = _parse_aware_recorded_time(recorded_values[0])
         return entity, requested_recorded_as_of
 
     @action(detail=True, methods=["get"], url_path="applicability")
