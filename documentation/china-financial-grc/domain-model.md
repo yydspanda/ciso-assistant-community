@@ -140,10 +140,12 @@ selection excludes it from r2. The new obligation safely returns unevaluated /
 three-row chain correction does not cascade-close applicability history.
 
 The entity-scoped read contract requires explicit entity identity, document
-and entity IAM, and `view_regulatoryapplicabilitydecision`. Mutation remains an
-internal service guarded by `record_regulatoryapplicability`; no public write,
-confirmation, approval, publication, real-entity fact, or agent capability is
-introduced.
+IAM, extension-owned `view_entitydocumentregistration` permission on the
+immutable registration folder, and `view_regulatoryapplicabilitydecision`.
+It returns the registered entity UUID without granting generic
+`tprm.view_entity`. Mutation remains an internal service guarded by
+`record_regulatoryapplicability`; no public write, confirmation, approval,
+publication, real-entity fact, or agent capability is introduced.
 
 ### RegulatoryApplicabilityReviewDisposition (implemented bounded persistence)
 

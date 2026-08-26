@@ -48,7 +48,7 @@ def _make_applicability_chain(suffix: str, *, folder=None, permissions=()):
         "ingest_regulatoryrecord",
         "view_regulatorydocument",
         "view_regulatoryapplicabilitydecision",
-        "view_entity",
+        "view_entitydocumentregistration",
         APPLICABILITY_PERMISSION,
         *permissions,
         email_prefix="applicability-analyst",
@@ -591,7 +591,7 @@ def test_applicability_floor_orders_review_and_correction_during_clock_rollback(
 
 
 @pytest.mark.django_db
-def test_applicability_is_entity_and_folder_scoped_and_requires_a_named_human(
+def test_applicability_is_registration_and_folder_scoped_and_requires_named_human(
     regulatory_root,
 ):
     folder_a, entity_a, actor_a, chain_a = _make_applicability_chain("IAM-A")
@@ -603,21 +603,22 @@ def test_applicability_is_entity_and_folder_scoped_and_requires_a_named_human(
         idempotency_key="applicability-iam-a",
     )
 
-    entity_blind = make_user_with_permissions(
+    registration_blind = make_user_with_permissions(
         folder_a,
         "view_regulatorydocument",
         "view_regulatoryapplicabilitydecision",
+        "view_entity",
         APPLICABILITY_PERMISSION,
     )
-    with pytest.raises(PermissionDenied, match="applicability entity"):
+    with pytest.raises(PermissionDenied, match="view_entitydocumentregistration"):
         get_regulatory_applicability(
-            actor=entity_blind,
+            actor=registration_blind,
             entity=entity_a,
             document_id=chain_a.document.id,
         )
-    with pytest.raises(PermissionDenied, match="applicability entity"):
+    with pytest.raises(PermissionDenied, match="view_entitydocumentregistration"):
         _record(
-            actor=entity_blind,
+            actor=registration_blind,
             entity=entity_a,
             chain=chain_a,
             payload=applicability_payload(
@@ -629,7 +630,7 @@ def test_applicability_is_entity_and_folder_scoped_and_requires_a_named_human(
                     first.decision
                 ),
             ),
-            idempotency_key="applicability-entity-blind",
+            idempotency_key="applicability-registration-blind",
         )
 
     folder_b = make_folder("Applicability IAM B")
@@ -637,7 +638,7 @@ def test_applicability_is_entity_and_folder_scoped_and_requires_a_named_human(
         folder_b,
         "view_regulatorydocument",
         "view_regulatoryapplicabilitydecision",
-        "view_entity",
+        "view_entitydocumentregistration",
         APPLICABILITY_PERMISSION,
     )
     with pytest.raises(PermissionDenied):
@@ -686,14 +687,14 @@ def test_applicability_is_entity_and_folder_scoped_and_requires_a_named_human(
         content_type__app_label="regulatory",
         codename=APPLICABILITY_PERMISSION,
     )
-    entity_view_permission = Permission.objects.get(
-        content_type__app_label="tprm",
-        codename="view_entity",
+    registration_view_permission = Permission.objects.get(
+        content_type__app_label="regulatory",
+        codename="view_entitydocumentregistration",
     )
     service_account, _ = provision_service_account(
         name="regulatory-applicability-test",
         description="Synthetic applicability service account",
-        permission_ids=[permission.id, entity_view_permission.id],
+        permission_ids=[permission.id, registration_view_permission.id],
         folder_ids=[folder_a.id],
         is_recursive=False,
         created_by=actor_a,

@@ -77,10 +77,18 @@ The public operation is read-only and requires an explicit entity:
 GET /api/regulatory/v1/documents/{uuid}/applicability/?entity=<uuid>&recorded_as_of=<aware-RFC-3339>
 ```
 
-It applies document and entity IAM and a separate
-`view_regulatoryapplicabilitydecision` permission. Recording or correcting a
-snapshot remains an internal, folder-scoped service protected by
-`record_regulatoryapplicability`; there is no public write action.
+It applies document IAM, the extension-owned
+`view_entitydocumentregistration` permission in the immutable registration
+folder, and a separate `view_regulatoryapplicabilitydecision` permission. It
+returns the registered entity UUID without granting access to generic Entity
+fields. Recording or correcting a snapshot remains an internal, folder-scoped
+service protected by `record_regulatoryapplicability`; there is no public write
+action.
+
+Upgrades synchronize this narrow permission for built-in roles only. Existing
+custom roles that legitimately handle applicability need an explicit
+administrator grant of `view_entitydocumentregistration`; the system does not
+silently broaden them or substitute generic Entity access.
 
 Recorded-time lookup first selects the exact obligation revision and then only
 a decision linked to that physical row. If obligation r1 is corrected to r2,
@@ -144,6 +152,15 @@ applicability response's microsecond-precise selection anchor. The projection
 accepts only HTTPS official-source links and strips provision text and free-text
 version notes; decision valid time is shown separately from recorded time. The
 interface contains no state-changing review or approval control.
+
+Regulatory records continue to produce the platform audit log, but they are not
+advertised or forwarded as generic workflow internal events. A legacy or queued
+event that identifies the regulatory app is also refused before a workflow run
+is created. This prevents workflow-instance payloads from becoming an alternate
+read path around the regulatory API's entity, related-object, and reviewer
+masking. A future regulatory workflow needs its own reviewed typed adapter,
+minimal payload, exact IAM checks, and human authority; audit logging by itself
+does not authorise automation.
 
 It first resolves the existing exact applicability decision, then selects its
 latest authorised disposition at the same recorded time. The response keeps

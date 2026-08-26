@@ -176,7 +176,7 @@ def _make_applicability_review_scope(suffix: str):
         "view_regulatorydocument",
         "view_regulatoryapplicabilitydecision",
         "record_regulatoryapplicability",
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix=f"pg-recorder-{suffix.lower()}",
     )
     chain = create_regulatory_chain(
@@ -202,7 +202,7 @@ def _make_reviewer(folder, suffix: str) -> User:
         "view_regulatoryapplicabilitydecision",
         _REVIEW_VIEW_PERMISSION,
         _REVIEW_PERMISSION,
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix=f"pg-reviewer-{suffix.lower()}",
     )
 

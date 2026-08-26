@@ -31,7 +31,7 @@ def _make_chain(suffix: str, *, permissions: tuple[str, ...] = ()):
         "ingest_regulatoryrecord",
         "view_regulatorydocument",
         "view_regulatoryapplicabilitydecision",
-        "view_entity",
+        "view_entitydocumentregistration",
         *permissions,
         email_prefix="applicability-api",
     )
@@ -59,7 +59,7 @@ def test_applicability_api_requires_separate_view_permission_and_is_read_only(
     reader = make_user_with_permissions(
         folder,
         "view_regulatorydocument",
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix="applicability-reader",
     )
     client = APIClient()
@@ -69,13 +69,14 @@ def test_applicability_api_requires_separate_view_permission_and_is_read_only(
 
     assert response.status_code == status.HTTP_403_FORBIDDEN
 
-    entity_blind = make_user_with_permissions(
+    registration_blind = make_user_with_permissions(
         folder,
         "view_regulatorydocument",
         "view_regulatoryapplicabilitydecision",
-        email_prefix="applicability-entity-blind",
+        "view_entity",
+        email_prefix="applicability-registration-blind",
     )
-    client.force_authenticate(entity_blind)
+    client.force_authenticate(registration_blind)
     response = client.get(_url(chain), {"entity": str(entity.id)})
     assert response.status_code == status.HTTP_403_FORBIDDEN
 
