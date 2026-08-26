@@ -186,9 +186,13 @@ masking, and recorded-time read action are implemented. All 72 regulatory tests
 pass both without migrations and through the real project migration graph. An
 isolated full-project SQLite rehearsal verified 0004 apply, empty
 rollback/reapply, populated reverse refusal, and post-refusal preservation.
-PostgreSQL migration,
-two-connection locking, query plans, backup/restore, database-role enforcement,
-and audit retention remain external production gates. See
+Repository-local PostgreSQL 16 technical acceptance subsequently passed 76
+regulatory tests, two-connection locking, exact-head review concurrency,
+existing-index usability, bounded database-role probes, populated reverse
+refusal, and synthetic backup/restore fingerprint equality. Representative
+production-volume plans, target deployment recovery, complete least-privilege
+integration, tamper-evident audit retention, and named operational approval
+remain external production gates. See
 [ADR 0004](adr/0004-bounded-synthetic-applicability-review-disposition.md).
 
 ### Phase 2 — internal policy and control bridge

@@ -3,7 +3,8 @@
 - Status: Accepted and implemented for the bounded Phase 1 synthetic slice
 - Implementation status: Implemented by additive migration `regulatory.0004`,
   an internal named-human recording service, and a separate read-only action;
-  production database and operational gates remain open
+  verified by the local synthetic PostgreSQL 16 acceptance harness, while
+  target production and operational gates remain open
 - Date: 2026-08-24
 - Scope: named-human review of one exact synthetic applicability-decision
   revision
@@ -408,18 +409,23 @@ Before reporting implementation complete, verify at least:
 - database constraints, append-only model/admin/service paths, migration drift,
   empty apply/rollback/reapply, populated reverse refusal, and absence of public
   mutation routes; and
-- focused and full SQLite suites plus PostgreSQL migration, two-connection lock
-  linearisation, representative current/historical query plans, backup/restore,
-  least-privilege database roles, and audit-retention controls.
+- focused and full SQLite suites plus local PostgreSQL migration,
+  two-connection lock linearisation, current-index usability, bounded
+  database-role probes, populated reverse refusal, and synthetic backup/restore
+  fingerprint equality.
 
 The bounded implementation has passed local Django system and migration-drift
 checks. Its 33-test focused review/migration-contract suite passes, and all 72
 regulatory tests pass both with migrations disabled and through the real
 project migration graph. An isolated full-project SQLite rehearsal verified
 0004 apply, empty rollback/reapply, populated-history reverse refusal, and
-post-refusal preservation. Those results do not satisfy the remaining
-PostgreSQL, operational, legal-review, real-pilot, Phase 1 completion, or
-customer-acceptance gates.
+post-refusal preservation. A later local synthetic PostgreSQL 16 run passed all
+76 regulatory tests and the PostgreSQL-specific gates listed above. These
+results do not satisfy representative target-volume plans, deployment
+PITR/RPO/RTO, complete role integration, tamper-evident audit retention, named
+operational approval, legal review, a real pilot, Phase 1 completion, or
+customer acceptance. See
+[PostgreSQL and operational acceptance](../postgresql-operational-acceptance.md).
 
 ## Product measures for a future reviewed pilot
 

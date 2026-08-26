@@ -1,7 +1,8 @@
 # ADR 0003: bounded synthetic applicability persistence
 
 - Status: Accepted and implemented for the bounded Phase 1 synthetic vertical slice
-- Implementation status: SQLite-verified; PostgreSQL production gates remain open
+- Implementation status: SQLite-verified and verified by the local synthetic
+  PostgreSQL 16 acceptance harness; target production gates remain open
 - Date: 2026-08-24
 - Scope: one synthetic legal entity, one exact physical obligation revision,
   and one fixed deterministic rule profile
@@ -310,10 +311,13 @@ guard refuses to discard populated history. Django system and migration-drift
 checks pass, and the final independent architecture/security review reports no
 remaining critical, high, or medium finding.
 
-This evidence is not production acceptance. PostgreSQL apply, two-connection
-folder-lock linearisation, representative current/historical query plans,
-backup/restore, database-role enforcement, and audit-retention controls remain
-external release gates.
+This evidence is not production acceptance. The later local synthetic
+PostgreSQL 16 harness passed migration, two-connection folder-lock
+linearisation, current-index usability, bounded database-role probes, populated
+reverse refusal, and backup/restore fingerprint equality. Representative-volume
+query plans, deployment PITR/RPO/RTO, complete role integration,
+tamper-evident retention, and named operational approval remain external release
+gates. See [PostgreSQL and operational acceptance](../postgresql-operational-acceptance.md).
 
 ## References
 
