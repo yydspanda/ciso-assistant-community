@@ -1,8 +1,7 @@
 # China Financial GRC Delivery Roadmap / 中国金融 GRC 交付路线
 
 > Status: **Authoritative / 权威阶段顺序**
-> Current phase: **Phase 1 — One-entity regulatory register / 单实体外规台账**
-> Updated: **2026-08-20**
+> Updated: **2026-08-26**
 
 This document owns product outcomes, phase order, dependencies, and entry/exit
 gates. `documentation/china-financial-grc/` owns target design and regulatory
@@ -23,7 +22,7 @@ approval lineage.
 ```mermaid
 flowchart LR
     P0["Phase 0<br/>Foundation<br/>Complete"]
-    P1["Phase 1<br/>Regulatory Register<br/>Current"]
+    P1["Phase 1<br/>Regulatory Register"]
     P2["Phase 2<br/>Policy & Control Bridge"]
     P3["Phase 3<br/>Read-only Bounded Agents"]
     P4["Phase 4<br/>Proposal-based Writes"]
@@ -62,6 +61,50 @@ gate is satisfied.
 | Later | Proposal-based writes and case automation | Shorten remediation workflows without bypassing IAM or maker-checker | Depends on adversarial and rollback gates |
 | Later | Continuous evidence and specialist domain packs | Improve monitoring depth across selected banking, insurance, fintech, privacy, cyber, audit, and cost workflows | Depends on proven ownership, connectors, and quality metrics |
 
+## Stage registry
+
+These IDs are stable machine-readable pointers to the phase headings below.
+They do not promote a phase or replace its entry and exit gates.
+
+| Stage ID | Roadmap stage |
+| --- | --- |
+| `CFGRC-P0` | Phase 0 — foundation |
+| `CFGRC-P1` | Phase 1 — one-entity regulatory register |
+| `CFGRC-P2` | Phase 2 — internal policy and control bridge |
+| `CFGRC-P3` | Phase 3 — read-only bounded agents |
+| `CFGRC-P4` | Phase 4 — proposal-based writes |
+| `CFGRC-P5` | Phase 5 — continuous evidence and reviewed domain depth |
+
+## Task registry
+
+The registry gives delivery work a stable identity. It owns intended outcome and
+roadmap parent only; execution status, evidence, and completion dates remain in
+`progress.md` and its monthly archives. Adding these IDs does not add product
+scope or change the phase gates.
+
+| Task ID | Stage ID | Roadmap parent | Intended outcome |
+| --- | --- | --- | --- |
+| `CFGRC-P0-FOUNDATION` | `CFGRC-P0` | Phase 0 foundation | Establish the public architecture, domain, library, schema, and governance baseline. |
+| `CFGRC-P0-SOURCE-PACKS` | `CFGRC-P0` | Phase 0 foundation | Establish bounded official-source metadata packs and deterministic artifact validation. |
+| `CFGRC-P0-AGENT-GOVERNANCE` | `CFGRC-P0` | Phase 0 foundation | Establish repository instructions, product/architecture skills, and authoritative delivery memory. |
+| `CFGRC-P1-ARCHITECTURE` | `CFGRC-P1` | Epic 1 — architecture and ownership gate | Choose the bounded owner and reuse existing IAM, audit, library, and workflow boundaries. |
+| `CFGRC-P1-PERSISTENCE` | `CFGRC-P1` | Epic 2 — temporal regulatory persistence | Persist the bounded synthetic regulatory identity chain with temporal lineage. |
+| `CFGRC-P1-READ-REVIEW` | `CFGRC-P1` | Epic 3 — read and review workflow | Provide entity-scoped reads and non-binding named-human review transitions. |
+| `CFGRC-P1-TEMPORAL-CORRECTION` | `CFGRC-P1` | Epics 2–3 | Preserve recorded-time correction and coherent historical reads without rewriting history. |
+| `CFGRC-P1-SUPERSESSION` | `CFGRC-P1` | Epic 2 — temporal regulatory persistence | Model source/legal-version supersession separately from recorded-time correction. |
+| `CFGRC-P1-APPLICABILITY` | `CFGRC-P1` | Epics 2–3 | Record a versioned fact snapshot and deterministic non-binding applicability result. |
+| `CFGRC-P1-REVIEW-DISPOSITION-DESIGN` | `CFGRC-P1` | Epic 3 — read and review workflow | Freeze the bounded applicability review-disposition authority and history contract. |
+| `CFGRC-P1-REVIEW-DISPOSITION` | `CFGRC-P1` | Epic 3 — read and review workflow | Implement the append-only named-human disposition model, service, migration, and read action. |
+| `CFGRC-P1-POSTGRES-ACCEPTANCE` | `CFGRC-P1` | Epic 5 — evaluation and release evidence | Produce local synthetic PostgreSQL migration, concurrency, privilege, backup, and restore evidence. |
+| `CFGRC-P1-TARGET-ACCEPTANCE` | `CFGRC-P1` | Epic 5 — evaluation and release evidence | Obtain a versioned target-environment acceptance charter and named operational/control owners. |
+| `CFGRC-P1-PILOT-CHARTER` | `CFGRC-P1` | Epic 4 — reviewed pilot source set | Establish accountable pilot scope, reviewers, source rights, and approved data/model location. |
+| `CFGRC-P1-PILOT-SOURCES` | `CFGRC-P1` | Epic 4 — reviewed pilot source set | Review a small rights-cleared official-source set without claiming broad coverage. |
+| `CFGRC-P1-REVIEWER-UI` | `CFGRC-P1` | Epic 3 — read and review workflow | Provide a reviewer UI/admin path after the review contract is stable. |
+| `CFGRC-P2-POLICY-BRIDGE` | `CFGRC-P2` | Phase 2 | Add the private versioned policy/control bridge after published obligations exist. |
+| `CFGRC-P3-AGENT-EVALUATION` | `CFGRC-P3` | Phase 3 | Evaluate read-only explanation assistance on reviewed knowledge and a gold set. |
+| `CFGRC-GOV-LEDGER` | `CFGRC-P1` | Cross-cutting delivery governance | Keep one current pointer, a bounded active ledger, and canonical monthly archives. |
+| `CFGRC-GOV-UPSTREAM` | `CFGRC-P1` | Cross-cutting fork governance | Measure freshly fetched upstream divergence and surface warning/failure thresholds without changing upstream source. |
+
 ## Phase 0 — foundation
 
 Status: **Complete for the public foundation branch.** This is not legal review
@@ -86,9 +129,10 @@ Exit gate:
 
 ## Phase 1 — one-entity regulatory register
 
-Status: **Current.** Begin with a synthetic entity profile and public metadata.
-A real institution profile and legal conclusions remain private and require
-named authorised reviewers.
+Execution status is owned by the single machine-readable pointer in
+`progress.md`. This phase begins with a synthetic entity profile and public
+metadata. A real institution profile and legal conclusions remain private and
+require named authorised reviewers.
 
 Outcome hypothesis:
 
@@ -238,6 +282,9 @@ Exit gate:
 ## Roadmap change control
 
 Change this file only when product outcome, phase order, dependency, metric, or
-gate changes. A feature implementation or bug fix normally belongs only in
-`progress.md`. Any phase promotion must cite verification evidence, unresolved
-risks, and the accountable human owner; an agent cannot promote its own work.
+gate changes, or when a stable stage/task ID must be registered for already
+authorised work. ID registration provides traceability and does not by itself
+change or reorder scope. A feature implementation or bug fix normally updates
+the current dashboard and its monthly archive, not roadmap outcomes. Any phase
+promotion must cite verification evidence, unresolved risks, and the accountable
+human owner; an agent cannot promote its own work.

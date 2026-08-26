@@ -35,6 +35,7 @@ a governed system of record with bounded AI capabilities:
 - [Financial regulatory source packs](regulatory-source-packs.md)
 - [Agent governance](agent-governance.md)
 - [Migration and delivery plan](migration-plan.md)
+- [PostgreSQL and operational acceptance](postgresql-operational-acceptance.md)
 - [Open-source decisions](open-source-decisions.md)
 - [ADR 0001: bounded regulatory persistence](adr/0001-regulatory-persistence-boundary.md)
 - [ADR 0002: controlled recorded-time correction and historical retrieval](adr/0002-recorded-time-correction.md)
@@ -112,7 +113,8 @@ Document detail supports coherent historical selection through a timezone-aware
 same folder boundary used by correction, resolves one joined chain, time-filters
 review events, and preserves CISO Assistant object and related-field IAM
 masking. See [ADR 0002](adr/0002-recorded-time-correction.md) for the exact
-contract and remaining PostgreSQL acceptance gates.
+contract and the split between local PostgreSQL evidence and remaining target-
+environment acceptance gates.
 
 The implemented Phase 1 boundary now also includes one synthetic-only,
 append-only `RegulatoryApplicabilityDecision` aggregate. It embeds a fixed,
@@ -145,14 +147,16 @@ This bounded implementation remains draft, non-binding, unpublished, and
 synthetic. It has separate view and internal record permissions and no public
 write route. It does not add a general `ApplicabilityRule` approval lifecycle,
 real institution facts, binding legal conclusions, approval/publication,
-source text, source/legal-version supersession, reviewer UI, an agent, or a
-library projection. Flattening regulatory history into `Framework` and
+source text, source/legal-version supersession, a binding reviewer action/admin
+workflow, an agent, or a library projection. Flattening regulatory history into `Framework` and
 `RequirementNode` remains prohibited; those objects receive only reviewed
 projections in a later gated phase. See
 [ADR 0003](adr/0003-bounded-synthetic-applicability-persistence.md) for the
 contract and migration guard. PostgreSQL apply, two-connection lock evidence,
-representative query plans, backup/restore, database-role enforcement, and
-audit-retention evidence remain external production gates.
+index usability, synthetic backup/restore, and a bounded database-role contract
+now have repository-local PostgreSQL 16 evidence. Representative-volume query
+plans, deployment recovery, full least-privilege integration, and tamper-
+evident audit retention remain external production gates.
 
 The bounded implementation also adds a separate append-only
 `RegulatoryApplicabilityReviewDisposition` stream for a
@@ -174,9 +178,32 @@ projection, or resolves a `needs_review` fact. See
 [ADR 0004](adr/0004-bounded-synthetic-applicability-review-disposition.md) for
 the accepted contract and remaining production gates.
 
+The frontend now provides a fork-specific, read-only `/regulatory` register and
+`/regulatory/{uuid}` viewer. It displays IAM-scoped metadata lineage, exact
+recorded-time context, the fixed-rule non-binding applicability result, and the
+separate human disposition. Server-load runtime contracts fail closed on drift,
+bind responses to the requested document/entity/obligation revision, and keep
+the metadata-only policy from hydrating provision text or free-text version
+notes. Official-source links are HTTPS-only. Current applicability and review
+panels share one microsecond-precise recorded-time anchor, while decision valid
+time is labelled separately. Entity search is only a discovery aid; backend IAM
+and registration checks remain authoritative. The viewer provides no create,
+correction, review mutation, approval, publication, export, or regulatory-
+submission action and is not the later binding reviewer workflow described by
+the roadmap.
+
 With the review-disposition slice included, all 72 regulatory tests pass both
 with migrations disabled and through the real project migration graph. A fresh
 isolated full-project SQLite rehearsal verified 0004 apply, empty rollback and
 reapply, refusal to reverse populated review history, and preservation of the
 applied migration and recorded event after that refusal. These local results do
-not satisfy the PostgreSQL, operations, legal-review, or real-pilot gates.
+not satisfy target-environment operations, legal-review, or real-pilot gates.
+
+A repeatable isolated PostgreSQL 16 run now extends this to 76 passing
+regulatory tests, real two-connection folder-lock observations, exact-head
+review concurrency, index-usability probes, bounded database-role denial
+probes, a synthetic runtime mutation, populated reverse refusal,
+component-level backup/restore equality, and a restored-runtime successor
+write. See
+[PostgreSQL and operational acceptance](postgresql-operational-acceptance.md).
+This is local synthetic technical evidence, not production approval.

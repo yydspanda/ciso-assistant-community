@@ -83,6 +83,24 @@ folder-consistent revision chain with half-open recorded intervals, and limits
 review events to the same selection time. The detail path preserves both object
 IAM and related-field masking. Missing or ambiguous aggregates fail closed.
 
+The fork-specific SvelteKit frontend now exposes the corresponding read-only
+register at `/regulatory` and document viewer at `/regulatory/{uuid}`. These
+routes make only server-side GET requests to the existing API, apply runtime
+response contracts, and keep the generic entity list as a discovery aid rather
+than an authorisation source. The backend remains authoritative for document,
+entity, registration, folder, decision, and reviewer IAM. A coherence gate
+binds successful responses to the requested document, entity, exact obligation
+revision, recorded-time selection, and decision digest; mismatched responses
+are discarded rather than combined. Metadata-only contracts do not hydrate
+provision text or free-text version notes into the browser, and official-source
+links must remain HTTPS. Current applicability is resolved first and its
+Django-microsecond selection instant anchors the review read; unique chain
+cardinality, parent reference, shared revision epoch, half-open intervals, and
+strict calendar timestamps fail closed. The UI presents decision valid time
+separately from recorded time. It can display the computed result and the
+independent human disposition, but it has no correction, approval, publication,
+export, submission, or other mutation action.
+
 Recorded-time repair is an internal deterministic domain operation, not an
 agent or public write endpoint. A named human with the folder-scoped correction
 permission may submit one complete typed successor set for a `SYNTHETIC-*`
@@ -98,13 +116,17 @@ time. Review/correction timestamps advance after the aggregate's latest known
 recorded event, and reads floor wall time at the latest committed aggregate
 time. This provides a defined before-or-after result for a concurrent current
 read and correction and prevents clock rollback from hiding committed state.
-PostgreSQL two-connection and query-plan evidence remains an external
-production gate; SQLite tests are not a substitute for it.
+Repository-local PostgreSQL 16 acceptance now proves two-connection
+linearisation and existing-index usability for the bounded synthetic slice;
+SQLite tests were not used as that evidence. Representative production-volume
+plans, target topology, recovery, retention, and named operational approval
+remain external production gates.
 
 This verified as-built subset does not own source bytes or legal supersession,
 binding decisions, approval/publication, real institution facts, library
-projections, UI writes, or agent execution. Those remain target components
-gated by the delivery roadmap. The exact correction decision is in
+projections, UI writes, a binding reviewer action workflow, or agent execution.
+Those remain target components gated by the delivery roadmap. The exact
+correction decision is in
 [ADR 0002](adr/0002-recorded-time-correction.md).
 
 ## Implemented bounded Phase 1 applicability boundary

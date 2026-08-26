@@ -30,7 +30,9 @@ or producing an assessment proves compliance.
 - `.notes/china_financial_grc/delivery-roadmap.md`: authoritative phase order,
   outcome targets, dependencies, and stage gates.
 - `.notes/china_financial_grc/progress.md`: factual execution ledger, current
-  status, verification evidence, blockers, and next action.
+  pointer, current status, blockers, next action, and recent-record index.
+- `.notes/china_financial_grc/progress-archive/`: canonical completed records and
+  verification evidence, partitioned by completion month.
 - `.agents/skills/`: repository-scoped Codex skills for product and architecture
   work.
 
@@ -56,12 +58,34 @@ The roadmap and progress ledger replace an informal project-manager memory:
 
 - `delivery-roadmap.md` owns why, ordering, outcome metrics, dependencies, and
   entry/exit gates. Do not turn it into a chronological activity log.
-- `progress.md` owns what is actually complete, the evidence that proves it,
-  current risks, and one explicit next action. Do not mark work complete from a
-  draft, an unrun test, or an agent claim.
-- Update `progress.md` after a material, verified delivery slice.
-- Update `delivery-roadmap.md` only when phase order, scope, metrics, dependencies,
-  or a gate changes.
+- `progress.md` owns current execution state, risks, one explicit next action,
+  and recent links. Monthly archives own canonical completed records and the
+  evidence that proves them. Do not mark work complete from a draft, an unrun
+  test, or an agent claim.
+- `delivery-roadmap.md` owns the stable stage and task registries. Every task ID
+  used by the progress ledger, a monthly archive, or an experiment must be
+  registered there; the registry does not own execution status.
+- Keep exactly one `Current Stage` pointer, one `In Progress Task` pointer, and
+  one matching active-board row in `progress.md`. Keep at most ten recent-record
+  links there and move canonical completed records into
+  `progress-archive/YYYY-MM.md` immediately after verification.
+- Treat every empirical comparison that varies or evaluates a model, prompt,
+  retrieval setup, config, dataset/evaluation set, hardware, or performance
+  claim as an experiment. Record it under a `#### CFGRC-EXP-YYYYMM-NNN`
+  heading in the matching monthly archive. Every experiment must record its
+  roadmap task, exact upstream commit, model identifier, model/config/data
+  SHA-256 hashes, hardware, reproducible command, and structured metrics.
+  Ordinary deterministic
+  validation or a one-off operational observation without such a comparison is
+  validation evidence, not an experiment.
+- Keep `progress.md` below the enforced line ceiling. Add current facts there;
+  put historical command output and completed-slice detail in the monthly
+  archive rather than appending indefinitely.
+- Update the current dashboard and matching monthly archive after a material,
+  verified delivery slice.
+- Update `delivery-roadmap.md` only when phase order, scope, metrics,
+  dependencies, a gate, or the stable stage/task registry changes. Registering
+  an ID provides traceability and does not by itself add or reorder scope.
 - Record dates, commits, commands, and residual risks without storing secrets,
   private customer facts, or internal source material.
 
@@ -73,6 +97,12 @@ implementation changes.
 
 ## Upstream isolation
 
+- Measure fork divergence only after explicitly fetching canonical upstream;
+  never trust a cached remote-tracking ref. Keep the weekly read-only monitor
+  active, investigate at 10 commits behind, and fail its gate at 20.
+- Reconcile upstream in a dedicated clean change with proportional regression
+  tests. Do not hide a merge/rebase inside an extension slice or automatically
+  rewrite fork source merely to make the count green.
 - Prefer an extension, adapter, new bounded Django app, library artifact, or
   public service boundary over changing upstream semantics.
 - Change generic CISO Assistant behavior only when the extension needs a small,
@@ -154,7 +184,8 @@ During implementation:
 After a material verified slice:
 
 - run the narrowest meaningful checks and broaden them in proportion to risk;
-- update `progress.md` with evidence and residual risk;
+- update `progress.md` with current facts/residual risk and the monthly archive
+  with the canonical completed record and verification evidence;
 - update the roadmap only if its owned facts changed;
 - report external, live, legal-review, browser, database, or production gates that
   were not run.
@@ -168,6 +199,15 @@ mutation tests:
 backend/.venv/bin/python tools/china_financial_grc/validate_artifacts.py
 backend/.venv/bin/python -m pytest tools/china_financial_grc/tests/test_validate_artifacts.py -q
 git diff --check
+```
+
+Project ledger, monthly archives, experiments, and upstream-divergence tooling:
+
+```bash
+backend/.venv/bin/python tools/china_financial_grc/validate_project_governance.py
+backend/.venv/bin/python -m pytest \
+  tools/china_financial_grc/tests/test_validate_project_governance.py \
+  tools/china_financial_grc/tests/test_check_upstream_divergence.py -q
 ```
 
 Backend changes, from `backend/`:
