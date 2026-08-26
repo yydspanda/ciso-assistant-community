@@ -44,7 +44,7 @@ if [[ -n "${HOME:-}" ]]; then
 fi
 evidence_dir="$(mktemp -d "$evidence_parent/ciso-china-grc-postgresql-$timestamp-XXXXXX")"
 
-for dependency in docker openssl sha256sum git rg; do
+for dependency in docker openssl sha256sum git grep; do
     if ! command -v "$dependency" >/dev/null 2>&1; then
         echo "missing required command: $dependency" >&2
         exit 1
@@ -210,7 +210,7 @@ expect_denied() {
         echo "expected SQL denial succeeded unexpectedly: $label" >&2
         return 1
     fi
-    if ! rg --quiet 'ERROR:[[:space:]]+42501:' \
+    if ! grep -Eq 'ERROR:[[:space:]]+42501:' \
         "$evidence_dir/$label.stderr.log"; then
         echo "SQL failed for a reason other than insufficient privilege: $label" >&2
         return 1

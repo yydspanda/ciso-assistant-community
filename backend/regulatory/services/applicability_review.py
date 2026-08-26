@@ -122,7 +122,7 @@ def _normalize_uuid(
         return None
     try:
         return str(UUID(value))
-    except (ValueError, TypeError, AttributeError):
+    except ValueError, TypeError, AttributeError:
         errors[field] = "A physical UUID string is required."
         return None
 

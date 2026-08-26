@@ -35,7 +35,7 @@ from .services.records import (
 def _parse_aware_recorded_time(value: str):
     try:
         parsed = parse_datetime(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         parsed = None
     if parsed is None or timezone.is_naive(parsed):
         raise ValidationError(

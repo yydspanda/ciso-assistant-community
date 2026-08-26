@@ -1442,7 +1442,7 @@ class RegulatoryApplicabilityDecision(TemporalRevisionMixin, RegulatoryFolderMod
         }
         try:
             expected_fact_digest = _canonical_json_sha256(fact_digest_payload)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             expected_fact_digest = None
         if self.fact_snapshot_sha256 != expected_fact_digest:
             errors["fact_snapshot_sha256"] = (
@@ -1527,7 +1527,7 @@ class RegulatoryApplicabilityDecision(TemporalRevisionMixin, RegulatoryFolderMod
                 expected_semantic_digest = _canonical_json_sha256(
                     self.applicability_semantic_payload()
                 )
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 expected_semantic_digest = None
             if self.semantic_payload_sha256 != expected_semantic_digest:
                 errors["semantic_payload_sha256"] = (
@@ -1865,7 +1865,7 @@ class RegulatoryApplicabilityReviewDisposition(RegulatoryFolderModel):
                 expected_decision_digest = _canonical_json_sha256(
                     decision.applicability_semantic_payload()
                 )
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 expected_decision_digest = None
             if decision.semantic_payload_sha256 != expected_decision_digest:
                 errors["decision"] = (
@@ -1998,7 +1998,7 @@ class RegulatoryApplicabilityReviewDisposition(RegulatoryFolderModel):
                 expected_event_digest = _canonical_json_sha256(
                     self.review_disposition_event_payload()
                 )
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 expected_event_digest = None
             if self.event_payload_sha256 != expected_event_digest:
                 errors["event_payload_sha256"] = (
@@ -2008,7 +2008,7 @@ class RegulatoryApplicabilityReviewDisposition(RegulatoryFolderModel):
                 expected_request_digest = _canonical_json_sha256(
                     self.review_disposition_request_payload()
                 )
-            except (TypeError, ValueError):
+            except TypeError, ValueError:
                 expected_request_digest = None
             if self.request_sha256 != expected_request_digest:
                 errors["request_sha256"] = (
