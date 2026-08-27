@@ -101,7 +101,7 @@ def _seed() -> None:
         "view_regulatoryapplicabilitydecision",
         "view_regulatoryapplicabilityreviewdisposition",
         "record_regulatoryapplicability",
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix="pg-acceptance-maker",
     )
     reviewer = make_user_with_permissions(
@@ -110,7 +110,7 @@ def _seed() -> None:
         "view_regulatoryapplicabilitydecision",
         "view_regulatoryapplicabilityreviewdisposition",
         "review_regulatoryapplicability",
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix="pg-acceptance-reviewer",
     )
 

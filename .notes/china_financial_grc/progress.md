@@ -1,8 +1,8 @@
 # China Financial GRC Progress Ledger / 中国金融 GRC 进度台账
 
 > Status: **Authoritative current execution record / 权威当前执行记录**
-> Updated: **2026-08-26**
-> Branch: `agent/cfgrc-governance-activation-evidence`
+> Updated: **2026-08-27**
+> Branch: `agent/cfgrc-regulatory-workflow-isolation-20260826`
 
 This file is the bounded current dashboard: one stage pointer, one active task,
 current facts, risks, one next action, and recent links. The roadmap owns stable
@@ -25,8 +25,9 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | Database evidence | SQLite suites and a local synthetic PostgreSQL 16.11 acceptance harness passed; target-environment capacity, PITR/RPO/RTO, topology, retention, and operations approval remain open. |
 | Regulatory content | The public source seed remains metadata-only and legally unreviewed; no real institution profile or reviewed pilot source set exists. |
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
+| Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
 | Production acceptance | Legal, privacy, security, records, audit, operations, and production acceptance have not been performed. |
-| Hosted project governance | PR #1 landed the fork slices on protected `main`; an active no-bypass ruleset requires the GitHub-Actions-sourced `validate-project-governance` check, and the weekly read-only upstream monitor is explicitly enabled. |
+| Hosted project governance | PR #1 landed the fork slices and PR #2 landed the retained activation evidence on protected `main`; an active no-bypass ruleset requires the GitHub-Actions-sourced `validate-project-governance` check, and the weekly read-only upstream monitor is explicitly enabled. |
 
 ## Current verification summary
 
@@ -35,7 +36,7 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   commands, test counts, residual gates, PostgreSQL fingerprints, and evidence
   digests.
 - The latest local PostgreSQL slice passed the isolated PostgreSQL 16.11 harness,
-  76 regulatory tests, migration/drift/rollback checks, bounded role probes,
+  80 regulatory tests, migration/drift/rollback checks, bounded role probes,
   synthetic backup/restore equality, and a restored successor write. This is
   local synthetic evidence, not a production RPO/RTO or WORM claim.
 - The source-pack validator last recorded 56 facts, 76 documents, and 76
@@ -47,16 +48,39 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 - Before hosted activation, the project-governance validator passed with six
   stages, 20 roadmap tasks, one matching active task, ten recent links, and 12
   archived records; all 49 governance mutation tests and all nine upstream-
-  checker tests passed locally. This dashboard update registers the dedicated
-  reconciliation task and its 13th archived record and must pass the same gate.
-- Hosted PR runs passed `validate-project-governance`, the PostgreSQL synthetic
-  technical acceptance, backend Ruff, frontend unit/coverage/lint, migration,
-  startup, and multiple functional checks. The default-branch manual governance
-  run `32982655658` passed on merge commit `73e720af21f1665964eb8a0aa2f85ec1b0169ea8`.
+  checker tests passed locally. The archive now contains 14 completed records
+  and must pass the same gate after this update.
+- Earlier hosted PR #1 runs passed `validate-project-governance`, the PostgreSQL
+  synthetic technical acceptance, backend Ruff, frontend unit/coverage/lint,
+  migration, startup, and multiple functional checks. The default-branch manual
+  governance run `32982655658` passed on merge commit
+  `73e720af21f1665964eb8a0aa2f85ec1b0169ea8`.
 - Default-branch manual upstream run `32982660229` passed after fetching
   canonical `c6906fd07bb4b626a156762bbf4c097fc6ab2b11`; it truthfully warned that
   fork `main` was 17 behind and 15 ahead. Warning is success; 20 behind remains
   the enforced failure threshold.
+- PR #2 used the native pull-request context to pass required governance run
+  `33036424852` before merging as
+  `430c7d591c698c359fa4c318b1a02495e9ef5d53`; the no-bypass ruleset remained
+  active. A fresh local canonical fetch on 2026-08-27 resolved upstream to
+  `ec3cf7d0386fd8d328d7f4623032a351538e23ce` and measured fork `main` ahead 17 /
+  behind 22, truthfully crossing the configured failure threshold.
+- The final workflow-isolation code passed 24 focused event-boundary tests and
+  preserves audit registration for all ten regulatory models. It rejects stale,
+  queued, identity-stripped, and forged regulatory events before a workflow
+  instance is created; Django checks, migration-drift checks, Ruff, and diff
+  checks also passed.
+- PR #3's first hosted candidate completed 167 checks with 164 passing. Its
+  three failures exposed two bounded defects now remediated: Approver's
+  accidental generic Entity visibility was replaced by extension-owned
+  registration-scope IAM, and the enterprise command-palette button received
+  an accessible name. On remediation candidate `ef81a921`, both permission
+  jobs and enterprise accessibility passed; 167 of 168 hosted checks passed.
+  The sole failure exposed a stale PostgreSQL custom-role fixture still granting
+  generic `view_entity`. Replacing its two grants with the narrow registration
+  permission passed the complete local PostgreSQL harness, including 80 tests,
+  backup/restore fingerprint equality, and a restored successor write. A new
+  complete hosted matrix remains required before merge.
 
 ## Current limitations and risks
 
@@ -83,13 +107,13 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 9. **Only local synthetic PostgreSQL evidence exists.** Representative plans,
    complete upstream-table privileges, production topology, monitoring,
    encryption/key custody, PITR/RPO/RTO, and operations approval remain open.
-10. **The fork is close to the upstream failure threshold.** Hosted fresh-fetch
-    evidence on 2026-08-26 resolved canonical upstream `main` to
-    `c6906fd07bb4b626a156762bbf4c097fc6ab2b11` and fork `main` to
-    `73e720af21f1665964eb8a0aa2f85ec1b0169ea8`: 17 behind and 15 ahead. Only
-    three commits remain before the configured 20-behind failure gate. Any
-    reconciliation must be a dedicated clean PR with proportional regression;
-    it must not be hidden in an extension slice.
+10. **The fork has crossed the upstream failure threshold.** A fresh canonical
+    fetch on 2026-08-27 resolved upstream `main` to
+    `ec3cf7d0386fd8d328d7f4623032a351538e23ce` and fork `main` to
+    `430c7d591c698c359fa4c318b1a02495e9ef5d53`: 22 behind and 17 ahead. This
+    fails the configured 20-behind gate. Reconciliation is the sole active task
+    and must remain a dedicated clean PR with proportional regression; it must
+    not be hidden in the workflow-isolation slice.
 11. **Inherited workflow activation still needs an owner policy.** Opening PR #1
     registered inherited validation workflows as well as the three fork jobs.
     The write-scoped CLA and OIDC/security-events Plumber workflows were
@@ -98,24 +122,38 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
     the workflow API because GitHub did not register it. It and inherited
     release workflows require an explicit owner decision before any manual,
     tag, or scheduled activation.
+12. **Historical workflow payloads need a read-only deployment inventory.** New
+    regulatory audit entries cannot create generic workflow instances, but no
+    target database was inspected for instances created before this boundary.
+    Any discovered payload must be handled through named IAM, records, privacy,
+    and retention owners; audit history must not be deleted automatically.
+13. **Custom applicability roles require an explicit narrow upgrade grant.**
+    Built-in roles synchronize `view_entitydocumentregistration` after migrate,
+    but existing custom roles are not auto-expanded. An administrator must
+    grant that extension-owned permission only where registered applicability
+    access is intended; generic `tprm.view_entity` is not a substitute.
 
 ## Current next action
 
-Land this activation-evidence update through the protected-main PR path. Then
-fresh-fetch canonical upstream again and reconcile the measured 17-behind state
-in a new dedicated clean branch. Review the exact upstream commits and conflicts,
-preserve the bounded extension and existing IAM/GRC ownership, run proportional
-backend/frontend/governance/PostgreSQL checks, and merge only through a PR whose
-required governance check passes. Do not mix target-environment work or new
-product features into that reconciliation. After the drift gate is restored,
-return the product pointer to `CFGRC-P1-TARGET-ACCEPTANCE`; that charter remains
-blocked on named operations, security, privacy, records, legal, and audit owners.
+Complete the upstream-reconciliation task without bypassing the protected-main
+gate: amend PR #3 with the locally verified PostgreSQL fixture correction and
+land it only after the new complete hosted matrix passes. Then branch cleanly
+from updated `main`, fetch canonical upstream again, reconcile the measured
+22-behind failure,
+and review the exact upstream commits and conflicts. Preserve the bounded
+extension and existing IAM/GRC ownership, run proportional backend/frontend/
+governance/PostgreSQL checks, and merge only through a PR whose required
+governance check passes. Do not mix target-environment work or new product
+features into that reconciliation. After the drift gate is restored, return
+the product pointer to
+`CFGRC-P1-TARGET-ACCEPTANCE`; that charter remains blocked on named operations,
+security, privacy, records, legal, and audit owners.
 
 ## Active task board
 
 | Task ID | Priority | Slice | Dependency | State |
 | --- | --- | --- | --- | --- |
-| `CFGRC-GOV-UPSTREAM-RECONCILIATION` | P0 | Dedicated reconciliation of the hosted 17-behind warning | Clean branch, fresh canonical fetch, conflict review, proportional regression, protected-main PR | In Progress |
+| `CFGRC-GOV-UPSTREAM-RECONCILIATION` | P0 | Dedicated reconciliation of the fresh-fetch 22-behind failure | Clean branch after PR #3, fresh canonical fetch, conflict review, proportional regression, protected-main PR | In Progress |
 | `CFGRC-P1-TARGET-ACCEPTANCE` | P0 | Versioned target-environment charter, representative plans, PITR/RPO/RTO, role integration, retention, and audit-export acceptance | Named operations/security/privacy/records/legal owners | Pending external owners |
 | `CFGRC-P1-SUPERSESSION` | P0 | Source/legal-version supersession | Reviewed source evidence and legal lifecycle contract | Pending |
 | `CFGRC-P1-PILOT-CHARTER` | P0 | Real-pilot ownership charter | Accountable business/legal/content-rights/privacy/security/product owners | Blocked on external ownership |
@@ -131,6 +169,7 @@ the ten most recent records and does not duplicate their evidence.
 
 | Completed | Record | Task IDs | Result |
 | --- | --- | --- | --- |
+| 2026-08-27 | [CFGRC-REC-20260827-01](progress-archive/2026-08.md#cfgrc-rec-20260827-01) | `CFGRC-P1-READ-REVIEW` | Regulatory audit events isolated from generic workflows without weakening auditlog. |
 | 2026-08-26 | [CFGRC-REC-20260826-04](progress-archive/2026-08.md#cfgrc-rec-20260826-04) | `CFGRC-GOV-LEDGER`, `CFGRC-GOV-UPSTREAM` | Protected-main ruleset and hosted governance/upstream checks activated with retained run evidence. |
 | 2026-08-26 | [CFGRC-REC-20260826-03](progress-archive/2026-08.md#cfgrc-rec-20260826-03) | `CFGRC-P1-READ-REVIEW` | Read-only regulatory register/viewer implemented with fail-closed temporal, metadata, IAM, and non-binding presentation contracts. |
 | 2026-08-26 | [CFGRC-REC-20260826-02](progress-archive/2026-08.md#cfgrc-rec-20260826-02) | `CFGRC-GOV-LEDGER`, `CFGRC-GOV-UPSTREAM` | Bounded ledger, monthly archive, reproducible-experiment checks, and upstream monitoring implemented. |
@@ -140,7 +179,6 @@ the ten most recent records and does not duplicate their evidence.
 | 2026-08-24 | [CFGRC-REC-20260824-03](progress-archive/2026-08.md#cfgrc-rec-20260824-03) | `CFGRC-P1-REVIEW-DISPOSITION-DESIGN` | Review-disposition architecture accepted. |
 | 2026-08-24 | [CFGRC-REC-20260824-02](progress-archive/2026-08.md#cfgrc-rec-20260824-02) | `CFGRC-P1-APPLICABILITY` | Bounded synthetic applicability persistence verified. |
 | 2026-08-24 | [CFGRC-REC-20260824-01](progress-archive/2026-08.md#cfgrc-rec-20260824-01) | `CFGRC-P1-TEMPORAL-CORRECTION` | Controlled recorded-time correction and historical reads verified. |
-| 2026-08-21 | [CFGRC-REC-20260821-01](progress-archive/2026-08.md#cfgrc-rec-20260821-01) | `CFGRC-P1-ARCHITECTURE`, `CFGRC-P1-PERSISTENCE`, `CFGRC-P1-READ-REVIEW` | Architecture owner accepted and first bounded database-backed regulatory chain delivered. |
 
 ## Ledger update rules
 

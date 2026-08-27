@@ -179,10 +179,12 @@ GET /api/regulatory/v1/documents/{uuid}/applicability/
 
 The entity parameter is required, non-empty, and single-valued. The optional
 `recorded_as_of` follows the existing detail rules: one timezone-aware,
-non-future RFC 3339 date-time. The action applies document object IAM, Entity
-IAM, folder consistency, and the separate Django
+non-future RFC 3339 date-time. The action applies document object IAM, the
+extension-owned `view_entitydocumentregistration` permission in the immutable
+registration folder, folder consistency, and the separate Django
 `view_regulatoryapplicabilitydecision` permission before returning facts or a
-result.
+result. It returns the registered entity UUID, not generic Entity fields, and
+does not grant or require the broader `tprm.view_entity` permission.
 
 The read locks the entity and immutable registration-folder boundary before
 capturing its selection time. Its clock floor includes the selected chain and the selected

@@ -57,7 +57,7 @@ def _make_review_chain(suffix: str):
         REVIEW_VIEW_PERMISSION,
         "record_regulatoryapplicability",
         REVIEW_PERMISSION,
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix="applicability-review-recorder",
     )
     reviewer = make_user_with_permissions(
@@ -66,7 +66,7 @@ def _make_review_chain(suffix: str):
         "view_regulatoryapplicabilitydecision",
         REVIEW_VIEW_PERMISSION,
         REVIEW_PERMISSION,
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix="applicability-review-checker",
     )
     chain = create_regulatory_chain(
@@ -186,7 +186,7 @@ def test_review_read_fails_closed_without_decision_or_with_unknown_facts(
         REVIEW_VIEW_PERMISSION,
         "record_regulatoryapplicability",
         REVIEW_PERMISSION,
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix="applicability-review-not-reviewable",
     )
     chain = create_regulatory_chain(
@@ -222,7 +222,7 @@ def test_review_read_fails_closed_without_decision_or_with_unknown_facts(
         "view_regulatoryapplicabilitydecision",
         REVIEW_VIEW_PERMISSION,
         REVIEW_PERMISSION,
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix="applicability-review-unknown-checker",
     )
     _record_review(
@@ -285,7 +285,7 @@ def test_review_successors_require_exact_head_and_material_change(regulatory_roo
         "view_regulatoryapplicabilitydecision",
         REVIEW_VIEW_PERMISSION,
         REVIEW_PERMISSION,
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix="applicability-review-replay-checker",
     )
     with pytest.raises(IdempotencyConflict):
@@ -519,7 +519,7 @@ def test_review_maker_checker_service_identity_and_permission_boundaries(
         "view_regulatorydocument",
         "view_regulatoryapplicabilitydecision",
         REVIEW_VIEW_PERMISSION,
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix="applicability-review-no-transition",
     )
     with pytest.raises(PermissionDenied):
@@ -529,6 +529,24 @@ def test_review_maker_checker_service_identity_and_permission_boundaries(
             document_id=chain.document.id,
             payload=payload,
             idempotency_key="applicability-review-no-permission",
+        )
+
+    registration_blind_reviewer = make_user_with_permissions(
+        folder,
+        "view_regulatorydocument",
+        "view_regulatoryapplicabilitydecision",
+        REVIEW_VIEW_PERMISSION,
+        REVIEW_PERMISSION,
+        "view_entity",
+        email_prefix="applicability-review-registration-blind",
+    )
+    with pytest.raises(PermissionDenied, match="view_entitydocumentregistration"):
+        record_regulatory_applicability_review_disposition(
+            actor=registration_blind_reviewer,
+            entity=entity,
+            document_id=chain.document.id,
+            payload=payload,
+            idempotency_key="applicability-review-registration-blind",
         )
 
     permission_codenames = (
@@ -545,8 +563,8 @@ def test_review_maker_checker_service_identity_and_permission_boundaries(
     )
     permissions.append(
         Permission.objects.get(
-            content_type__app_label="tprm",
-            codename="view_entity",
+            content_type__app_label="regulatory",
+            codename="view_entitydocumentregistration",
         ).id
     )
     service_account, _ = provision_service_account(
@@ -589,7 +607,7 @@ def test_review_rechecks_active_role_and_immutable_folder_scope(regulatory_root)
         "view_regulatoryapplicabilitydecision",
         REVIEW_VIEW_PERMISSION,
         REVIEW_PERMISSION,
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix="applicability-review-revoked-checker",
     )
     RoleAssignment.objects.filter(user=revoked_reviewer).delete()
@@ -609,7 +627,7 @@ def test_review_rechecks_active_role_and_immutable_folder_scope(regulatory_root)
         "view_regulatoryapplicabilitydecision",
         REVIEW_VIEW_PERMISSION,
         REVIEW_PERMISSION,
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix="applicability-review-sibling-checker",
     )
     with pytest.raises(PermissionDenied):
@@ -627,7 +645,7 @@ def test_review_rechecks_active_role_and_immutable_folder_scope(regulatory_root)
         "view_regulatoryapplicabilitydecision",
         REVIEW_VIEW_PERMISSION,
         REVIEW_PERMISSION,
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix="applicability-review-live-scope-checker",
     )
     entity.__class__.objects.filter(pk=entity.pk).update(ref_id="REAL-SCOPE-REMOVED")
@@ -897,7 +915,7 @@ def test_review_read_states_and_reviewer_user_iam_masking(regulatory_root):
         "view_regulatorydocument",
         "view_regulatoryapplicabilitydecision",
         REVIEW_VIEW_PERMISSION,
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix="applicability-review-masked-reader",
     )
     masked = get_regulatory_applicability_review(
@@ -920,7 +938,7 @@ def test_review_read_states_and_reviewer_user_iam_masking(regulatory_root):
         "view_regulatorydocument",
         "view_regulatoryapplicabilitydecision",
         REVIEW_VIEW_PERMISSION,
-        "view_entity",
+        "view_entitydocumentregistration",
         "view_user",
         email_prefix="applicability-review-visible-reader",
     )
@@ -938,7 +956,7 @@ def test_review_read_states_and_reviewer_user_iam_masking(regulatory_root):
         folder,
         "view_regulatorydocument",
         "view_regulatoryapplicabilitydecision",
-        "view_entity",
+        "view_entitydocumentregistration",
         email_prefix="applicability-review-hidden-reader",
     )
     with pytest.raises(PermissionDenied):

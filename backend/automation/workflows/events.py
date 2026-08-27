@@ -53,6 +53,72 @@ def make_event_key(model_name, verb):
     return f"{model_name}.{verb}"
 
 
+def _model_allows_internal_events(model):
+    """Whether an audited model may feed the workflow event bus.
+
+    Audit retention and workflow automation are separate authorities. Models
+    opt out with ``workflow_internal_events_enabled = False`` while remaining
+    registered with django-auditlog. The default preserves the existing
+    behavior for upstream models.
+    """
+    return getattr(model, "workflow_internal_events_enabled", True) is True
+
+
+def _payload_allows_internal_events(event_key, payload):
+    """Validate model identity and apply opt-out to every audit-event shape."""
+    app_label = payload.get("app_label") if isinstance(payload, dict) else None
+    model_name = payload.get("model") if isinstance(payload, dict) else None
+    operation = payload.get("operation") if isinstance(payload, dict) else None
+    payload_event_key = payload.get("event_key") if isinstance(payload, dict) else None
+
+    try:
+        event_model, event_operation = event_key.rsplit(".", 1)
+    except ValueError:
+        return not any((app_label, model_name, operation)) and payload_event_key in (
+            None,
+            event_key,
+        )
+
+    # The event key is the trigger identity. Resolve it independently of
+    # caller-supplied payload fields so stripping or forging model/app_label
+    # cannot bypass an audited model's opt-out.
+    from auditlog.registry import auditlog
+
+    candidates = [
+        model
+        for model in auditlog.get_models()
+        if model._meta.model_name == event_model
+    ]
+    if any(not _model_allows_internal_events(model) for model in candidates):
+        return False
+
+    if payload_event_key and payload_event_key != event_key:
+        return False
+    if app_label and not model_name:
+        return False
+    if operation and event_operation != operation:
+        return False
+    if model_name and event_model != model_name:
+        return False
+    if not model_name:
+        # Preserve the generic seam for producers that do not represent a model.
+        return True
+
+    from django.apps import apps
+
+    if app_label:
+        try:
+            model = apps.get_model(app_label, model_name)
+        except LookupError:
+            return False
+        return model is not None and _model_allows_internal_events(model)
+
+    # Older audit payloads did not carry app_label. The event-key lookup above
+    # already resolved every registered candidate and rejected any opt-out. A
+    # future non-audit producer may still use a model-shaped event key.
+    return True
+
+
 def event_key_catalog():
     """All CUD event keys, derived from the auditlog registry so new model
     registrations appear automatically."""
@@ -60,6 +126,8 @@ def event_key_catalog():
 
     keys = []
     for model in sorted(auditlog.get_models(), key=lambda m: m._meta.model_name):
+        if not _model_allows_internal_events(model):
+            continue
         # Skip the workflow engine's own bookkeeping models: triggering on them
         # is either circular (instances) or pointless (graph rows). Keyed on
         # the defining module, not the app label, since the engine now shares
@@ -79,6 +147,9 @@ def event_key_catalog():
 
 def dispatch_internal_event(event_key, payload, folder_id, origin_depth=0):
     """Match triggers and start workflows. Returns started instances."""
+    if not _payload_allows_internal_events(event_key, payload):
+        return []
+
     from .engine import EngineError, create_instance
     from .tasks import run_instance_task
 
@@ -361,6 +432,9 @@ def forward_log_entry(sender, instance, created, **kwargs):
         return
     verb = _log_entry_verb(instance.action)
     if verb is None or instance.content_type_id is None:
+        return
+    model = instance.content_type.model_class()
+    if model is None or not _model_allows_internal_events(model):
         return
     key = make_event_key(instance.content_type.model, verb)
     # Cheap indexed gate: one query per audited save, no enqueue when nothing

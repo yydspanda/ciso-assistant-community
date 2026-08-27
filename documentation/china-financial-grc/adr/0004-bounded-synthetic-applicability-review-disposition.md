@@ -190,10 +190,13 @@ The accepted permissions remain independent:
 | Approver | yes | yes | no | yes |
 | Administrator | yes | yes | yes | yes, but never their own decision revision |
 
-The review service requires document view, entity view, decision view,
-disposition view, and the separate folder-scoped
+The review service requires document view, the extension-owned
+`view_entitydocumentregistration` permission in the immutable registration
+folder, decision view, disposition view, and the separate folder-scoped
 `review_regulatoryapplicability` permission. Permission possession never
-overrides the actor-separation check. The disposition-view permission is
+overrides the actor-separation check. The registration permission authorizes
+the already-registered applicability scope without exposing generic Entity
+fields or granting `tprm.view_entity`. The disposition-view permission is
 separate so custom roles do not gain reviewer identity or rationale merely from
 document metadata access.
 
@@ -398,8 +401,9 @@ Before reporting implementation complete, verify at least:
   decision, stale predecessor event, semantic no-op, atomic rollback, and host-
   clock regression;
 - decision recorder self-review rejection, service-account rejection, revoked
-  actor/role rejection, built-in and custom permission matrices, Entity IAM,
-  sibling-folder isolation, and related-user masking;
+  actor/role rejection, built-in and custom permission matrices,
+  registration-scope IAM without generic Entity visibility, sibling-folder
+  isolation, and related-user masking;
 - two registrations for one document, entity rename/move historical access,
   exact retry after a move, and rejection of a new review after live scope
   changes;

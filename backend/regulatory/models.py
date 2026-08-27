@@ -115,6 +115,12 @@ class AuthorityLevel(models.TextChoices):
 class RegulatoryFolderModel(AbstractBaseModel):
     """IAM-compatible base that protects regulatory history from folder deletion."""
 
+    # Keep the complete django-auditlog record, but do not expose regulatory
+    # changes as generic workflow triggers. Workflow instances retain their
+    # trigger payload and have a broader read surface than the regulatory APIs,
+    # whose related-object and reviewer masking rules remain authoritative.
+    workflow_internal_events_enabled = False
+
     folder = models.ForeignKey(
         Folder,
         on_delete=models.PROTECT,

@@ -8,12 +8,20 @@ from automation.workflows.events import (
     MAX_TRIGGER_DEPTH,
     dispatch_internal_event,
     event_key_catalog,
+    forward_log_entry,
 )
 from automation.workflows.graph import save_graph
 from automation.workflows.models import Workflow, WorkflowTrigger, WorkflowVersion
 from automation.workflows.tasks import dispatch_internal_event_task
 from automation.workflows.validation import validate_graph
 from automation.workflows.tests.helpers import publisher_user
+
+
+class OptedOutAuditModel:
+    workflow_internal_events_enabled = False
+
+    class _meta:
+        model_name = "sensitiverecord"
 
 
 @pytest.fixture
@@ -372,6 +380,89 @@ class TestCudProducer:
         assert "asset.deleted" in keys
         # Workflows' own models are excluded (no circular triggering).
         assert not any(key.startswith("workflowinstance.") for key in keys)
+
+    def test_event_key_catalog_excludes_opted_out_audited_models(self, monkeypatch):
+        from auditlog.registry import auditlog
+
+        monkeypatch.setattr(
+            auditlog,
+            "get_models",
+            lambda: {AppliedControl, OptedOutAuditModel},
+        )
+
+        keys = {entry["key"] for entry in event_key_catalog()}
+        assert "appliedcontrol.created" in keys
+        assert not any(key.startswith("sensitiverecord.") for key in keys)
+
+    def test_opted_out_model_is_not_forwarded_from_auditlog(self, monkeypatch):
+        from auditlog.models import LogEntry
+
+        class ContentType:
+            model = "sensitiverecord"
+
+            @staticmethod
+            def model_class():
+                return OptedOutAuditModel
+
+        class LogEntryStub:
+            action = LogEntry.Action.CREATE
+            content_type_id = 1
+            content_type = ContentType()
+            pk = uuid.uuid4()
+
+        def unexpected_trigger_lookup(*args, **kwargs):
+            pytest.fail("an opted-out audit record reached the workflow registry")
+
+        monkeypatch.setattr(
+            WorkflowTrigger.objects, "filter", unexpected_trigger_lookup
+        )
+        forward_log_entry(None, LogEntryStub(), created=True)
+
+    def test_opted_out_model_rejects_a_stale_direct_dispatch(
+        self, capture_runs, monkeypatch
+    ):
+        from django.apps import apps
+        from auditlog.registry import auditlog
+
+        make_workflow(event_key="sensitiverecord.created")
+        monkeypatch.setattr(
+            apps, "get_model", lambda *args, **kwargs: OptedOutAuditModel
+        )
+        monkeypatch.setattr(auditlog, "get_models", lambda: {OptedOutAuditModel})
+        event = payload(operation="created", model="sensitiverecord")
+        event["app_label"] = "sensitive"
+
+        assert not dispatch_internal_event(
+            "sensitiverecord.created", event, folder_id=None
+        )
+
+        legacy_event = dict(event)
+        legacy_event.pop("app_label")
+        assert not dispatch_internal_event(
+            "sensitiverecord.created", legacy_event, folder_id=None
+        )
+
+        stripped_event = dict(legacy_event)
+        stripped_event.pop("model")
+        assert not dispatch_internal_event(
+            "sensitiverecord.created", stripped_event, folder_id=None
+        )
+        assert not dispatch_internal_event(
+            "sensitiverecord.created", {}, folder_id=None
+        )
+
+        forged_event = dict(event)
+        forged_event.update(
+            {
+                "app_label": "core",
+                "model": "appliedcontrol",
+                "event_key": "sensitiverecord.created",
+            }
+        )
+        assert not dispatch_internal_event(
+            "sensitiverecord.created", forged_event, folder_id=None
+        )
+        assert capture_runs == []
 
 
 @pytest.mark.django_db

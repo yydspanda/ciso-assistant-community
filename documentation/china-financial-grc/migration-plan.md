@@ -99,8 +99,15 @@ physical obligation revision. It applies the fixed rule
 `SYNTHETIC-ENTITY-INSTITUTION-TYPE-BANK-001` version 1, recomputes one of
 `applicable`, `not_applicable`, or `needs_review`, and appends revision,
 idempotency, provenance, and digest evidence. An entity-scoped read-only GET
-exposes the selected non-binding result under document/entity IAM and the
-separate applicability-view permission.
+exposes the selected non-binding result under document IAM, the extension-owned
+registration-scope permission, and the separate applicability-view permission;
+it does not grant generic Entity visibility.
+
+Built-in roles receive the registration-scope permission through the existing
+post-migrate role synchronization. Existing custom roles are not changed
+automatically: an administrator must explicitly grant
+`view_entitydocumentregistration` where that role is intended to read or
+record applicability. Do not backfill the broader `tprm.view_entity` permission.
 
 This increment cannot represent source/legal supersession and does not add
 binding decisions, rejection, approval/publication, source text, real

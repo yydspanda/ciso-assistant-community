@@ -33,9 +33,9 @@ from .factories import (
 
 READ_PERMISSIONS = (
     "view_regulatorydocument",
+    "view_entitydocumentregistration",
     "view_regulatoryapplicabilitydecision",
     "view_regulatoryapplicabilityreviewdisposition",
-    "view_entity",
 )
 
 
@@ -47,8 +47,8 @@ def _make_scope(suffix: str, *, record_decision: bool = False, observations=None
         "ingest_regulatoryrecord",
         "record_regulatoryapplicability",
         "view_regulatorydocument",
+        "view_entitydocumentregistration",
         "view_regulatoryapplicabilitydecision",
-        "view_entity",
         email_prefix="applicability-review-maker",
     )
     chain = create_regulatory_chain(
@@ -163,7 +163,7 @@ def test_applicability_review_api_requires_every_read_gate_and_derives_absence(
             (
                 "view_regulatoryapplicabilitydecision",
                 "view_regulatoryapplicabilityreviewdisposition",
-                "view_entity",
+                "view_entitydocumentregistration",
             ),
             status.HTTP_404_NOT_FOUND,
         ),
@@ -171,7 +171,7 @@ def test_applicability_review_api_requires_every_read_gate_and_derives_absence(
             (
                 "view_regulatorydocument",
                 "view_regulatoryapplicabilitydecision",
-                "view_entity",
+                "view_entitydocumentregistration",
             ),
             status.HTTP_403_FORBIDDEN,
         ),
@@ -179,7 +179,7 @@ def test_applicability_review_api_requires_every_read_gate_and_derives_absence(
             (
                 "view_regulatorydocument",
                 "view_regulatoryapplicabilityreviewdisposition",
-                "view_entity",
+                "view_entitydocumentregistration",
             ),
             status.HTTP_403_FORBIDDEN,
         ),
@@ -188,6 +188,7 @@ def test_applicability_review_api_requires_every_read_gate_and_derives_absence(
                 "view_regulatorydocument",
                 "view_regulatoryapplicabilitydecision",
                 "view_regulatoryapplicabilityreviewdisposition",
+                "view_entity",
             ),
             status.HTTP_403_FORBIDDEN,
         ),

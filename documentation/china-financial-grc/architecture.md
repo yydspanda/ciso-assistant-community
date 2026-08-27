@@ -101,6 +101,17 @@ separately from recorded time. It can display the computed result and the
 independent human disposition, but it has no correction, approval, publication,
 export, submission, or other mutation action.
 
+Regulatory models remain registered with `django-auditlog`, but they explicitly
+opt out of the generic workflow internal-event bus. The workflow catalog omits
+their create/update/delete keys, the audit forwarder does not enqueue their log
+entries, and dispatch rejects a queued or legacy model event carrying the
+regulatory app identity. This separation is required because a workflow
+instance retains its trigger payload and has a broader read contract than the
+regulatory APIs' related-object and reviewer masking. Enabling a future
+regulatory workflow requires a reviewed, typed adapter with payload
+minimisation, exact regulatory IAM, and the applicable human authority; audit
+registration alone never grants automation authority.
+
 Recorded-time repair is an internal deterministic domain operation, not an
 agent or public write endpoint. A named human with the folder-scoped correction
 permission may submit one complete typed successor set for a `SYNTHETIC-*`
@@ -163,8 +174,11 @@ The public surface remains read-only. The implemented entity-scoped action is:
 GET /api/regulatory/v1/documents/{uuid}/applicability/?entity=<uuid>&recorded_as_of=<aware-RFC-3339>
 ```
 
-It requires document and entity IAM plus the separate Django
-`view_regulatoryapplicabilitydecision` permission. The internal write service
+It requires document IAM, the extension-owned
+`view_entitydocumentregistration` permission in the immutable registration
+folder, and the separate Django `view_regulatoryapplicabilitydecision`
+permission. It returns the registered entity UUID without exposing generic
+Entity fields or granting `tprm.view_entity`. The internal write service
 requires folder-scoped `record_regulatoryapplicability`; it is not a public API
 and accepts only an authenticated named human. It cannot approve, confirm,
 publish, or bind a legal conclusion. The stable entity UUID is the scope

@@ -172,6 +172,14 @@ def test_initial_migration_tables_constraints_and_permissions_exist(regulatory_r
     assert applicability_view_permission.content_type.model == (
         "regulatoryapplicabilitydecision"
     )
+    registration_view_permission = Permission.objects.get(
+        content_type__app_label="regulatory",
+        content_type__model="entitydocumentregistration",
+        codename="view_entitydocumentregistration",
+    )
+    assert registration_view_permission.content_type.model == (
+        "entitydocumentregistration"
+    )
     applicability_record_permission = Permission.objects.get(
         content_type__app_label="regulatory",
         codename="record_regulatoryapplicability",
@@ -224,15 +232,17 @@ def test_builtin_roles_keep_regulatory_write_authority_bounded():
     assert "record_regulatoryapplicability" not in READER_PERMISSIONS_LIST
     assert "view_regulatorydocument" in APPROVER_PERMISSIONS_LIST
     assert "view_regulatoryapplicabilitydecision" in APPROVER_PERMISSIONS_LIST
+    assert "view_entitydocumentregistration" in APPROVER_PERMISSIONS_LIST
     assert "view_regulatoryapplicabilityreviewdisposition" in APPROVER_PERMISSIONS_LIST
     assert "review_regulatoryapplicability" in APPROVER_PERMISSIONS_LIST
-    assert "view_entity" in APPROVER_PERMISSIONS_LIST
+    assert "view_entity" not in APPROVER_PERMISSIONS_LIST
     assert "record_regulatoryapplicability" not in APPROVER_PERMISSIONS_LIST
     for permissions in (
         ANALYST_PERMISSIONS_LIST,
         DOMAIN_MANAGER_PERMISSIONS_LIST,
     ):
         assert "view_regulatorydocument" in permissions
+        assert "view_entitydocumentregistration" in permissions
         assert "view_regulatoryapplicabilitydecision" in permissions
         assert "view_regulatoryapplicabilityreviewdisposition" in permissions
         assert "record_regulatoryapplicability" in permissions
@@ -242,6 +252,7 @@ def test_builtin_roles_keep_regulatory_write_authority_bounded():
         assert "transition_regulatoryobligation" in permissions
         assert "legal_review_regulatoryobligation" not in permissions
     assert "view_regulatorydocument" in ADMINISTRATOR_PERMISSIONS_LIST
+    assert "view_entitydocumentregistration" in ADMINISTRATOR_PERMISSIONS_LIST
     assert "view_regulatoryapplicabilitydecision" in ADMINISTRATOR_PERMISSIONS_LIST
     assert (
         "view_regulatoryapplicabilityreviewdisposition"

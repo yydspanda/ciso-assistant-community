@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone as datetime_timezone
 from typing import Any
 
-from django.contrib.auth.models import Permission
 from django.core.exceptions import (
     MultipleObjectsReturned,
     ObjectDoesNotExist,
@@ -14,9 +13,8 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
-from rest_framework.exceptions import PermissionDenied
 
-from iam.models import Folder, RoleAssignment, ServiceAccount, User
+from iam.models import Folder, ServiceAccount, User
 from tprm.models import Entity
 
 from regulatory.contracts import RegulatoryApplicabilityPayload
@@ -563,21 +561,11 @@ def _locked_scope(
     # may move later; reads and exact retries must remain auditable in the folder
     # that owns the protected registration and decision history.
     folder = Folder.objects.select_for_update().get(pk=registration_folder_id)
-    for codename in permission_codenames:
-        require_regulatory_permission(actor=actor, codename=codename, folder=folder)
-    try:
-        entity_view_permission = Permission.objects.get(
-            content_type__app_label="tprm",
-            codename="view_entity",
-        )
-    except Permission.DoesNotExist as exc:
-        raise PermissionDenied("Entity view permission is unavailable.") from exc
-    if not RoleAssignment.is_access_allowed(
-        user=actor,
-        perm=entity_view_permission,
-        folder=folder,
+    for codename in (
+        "view_entitydocumentregistration",
+        *permission_codenames,
     ):
-        raise PermissionDenied("The actor cannot view the applicability entity.")
+        require_regulatory_permission(actor=actor, codename=codename, folder=folder)
     registration = (
         EntityDocumentRegistration.objects.select_for_update(of=("self",))
         .select_related("document", "entity")
