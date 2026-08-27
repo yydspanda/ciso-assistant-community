@@ -104,6 +104,7 @@ scope or change the phase gates.
 | `CFGRC-P3-AGENT-EVALUATION` | `CFGRC-P3` | Phase 3 | Evaluate read-only explanation assistance on reviewed knowledge and a gold set. |
 | `CFGRC-GOV-LEDGER` | `CFGRC-P1` | Cross-cutting delivery governance | Keep one current pointer, a bounded active ledger, and canonical monthly archives. |
 | `CFGRC-GOV-UPSTREAM` | `CFGRC-P1` | Cross-cutting fork governance | Measure freshly fetched upstream divergence and surface warning/failure thresholds without changing upstream source. |
+| `CFGRC-GOV-UPSTREAM-RECONCILIATION` | `CFGRC-P1` | Cross-cutting fork governance | Reconcile a measured upstream warning in a dedicated clean change with proportional regression evidence. |
 
 ## Phase 0 — foundation
 
