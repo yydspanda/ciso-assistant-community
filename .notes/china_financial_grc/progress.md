@@ -27,7 +27,7 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
 | Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
 | Production acceptance | Legal, privacy, security, records, audit, operations, and production acceptance have not been performed. |
-| Hosted project governance | PRs #1-#3 landed through protected `main`; PR #3 passed all 168 checks before merge. An active no-bypass ruleset requires the GitHub-Actions-sourced `validate-project-governance` check, and the weekly read-only upstream monitor is explicitly enabled. |
+| Hosted project governance | PRs #1-#3 landed through protected `main`; PR #4 is the active upstream-reconciliation candidate. The active no-bypass ruleset has no bypass actors, requires the GitHub-Actions-sourced `validate-project-governance` check, and keeps the weekly read-only upstream monitor explicitly enabled. |
 
 ## Current verification summary
 
@@ -100,6 +100,11 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   index SHA-256 `8255608d8d56a481eb693c086c38a102aeffbb7a5f449e8c30cef80b000c3dd5`.
   Post-merge artifact and governance gates then passed 25 tests plus 12 subtests
   and 58 tests plus 55 subtests respectively.
+- PR #4 opened from clean candidate `4fe3efd9a`; required governance run
+  `33145956090` / job `98766932904` passed on that opening head. Its inherited
+  one-shot version checker failed because it still names removed path
+  `ciso_assistant/VERSION`; this stale, non-required check also failed on prior
+  PR opening heads and is not accepted as candidate evidence.
 
 ## Current limitations and risks
 
@@ -129,10 +134,11 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 10. **The local drift gate is restored; hosted merge authority remains.** A
     fresh fetch on 2026-08-28 resolved canonical upstream to `9aac30df8` and
     fork `main` to `d1ff1e461`; code merge `9b8ecfd98` measures 23 ahead / 0
-    behind, and this final fork-only governance record makes the pushed branch
-    24 ahead / 0 behind. The task remains active until that branch passes the
-    full protected-PR matrix and lands without bypass. The weekly monitor must
-    keep measuring a freshly fetched remote after merge.
+    behind. The two fork-only governance records for opening and monitoring the
+    protected PR make the updated branch 25 ahead / 0 behind. The task remains
+    active until that exact branch passes the full protected-PR matrix and lands
+    without bypass. The weekly monitor must keep measuring a freshly fetched
+    remote after merge.
 11. **Inherited workflow activation still needs an owner policy.** Opening PR #1
     registered inherited validation workflows as well as the three fork jobs.
     The write-scoped CLA and OIDC/security-events Plumber workflows were
@@ -156,18 +162,23 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
     and PostgreSQL outbox claim competition were not exercised locally. Those
     integrations require environment-scoped credentials, monitoring, and named
     operations/security acceptance; no local result is a production guarantee.
+15. **The inherited one-shot version checker is stale.** It checks removed path
+    `ciso_assistant/VERSION` only when a PR is opened, so it failed on PR #4's
+    opening head just as it did on earlier fork PR opening heads. It is not a
+    required ruleset check and must not be made green by fabricating an upstream
+    version file. A separate CI-owner change should retire or correctly scope it;
+    the exact updated reconciliation head still requires every job it triggers.
 
 ## Current next action
 
 Complete the upstream-reconciliation task without bypassing the protected-main
-gate: push the clean branch containing code merge `9b8ecfd98` and this final
-governance record, open a dedicated PR, confirm the required GitHub-Actions
-governance check and complete hosted matrix, and merge only when every required
-job passes under the no-bypass ruleset. Re-fetch and remeasure canonical
-upstream before merge if the PR remains open long enough for upstream to
-advance. Do not mix target-environment work or new product features into this
-reconciliation. After protected merge, add the canonical completed record and
-return the product pointer to
+gate: push this factual PR-gate update, then monitor every job triggered for the
+exact updated PR #4 head. Investigate and remediate any candidate failure; merge
+only when the required governance check and the complete current-head matrix
+pass under the no-bypass ruleset. Re-fetch and remeasure canonical upstream
+before merge if it advances. Do not mix target-environment work or new product
+features into this reconciliation. After protected merge, add the canonical
+completed record and return the product pointer to
 `CFGRC-P1-TARGET-ACCEPTANCE`; that charter remains blocked on named operations,
 security, privacy, records, legal, and audit owners.
 
