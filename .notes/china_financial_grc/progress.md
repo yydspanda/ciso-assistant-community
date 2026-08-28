@@ -1,8 +1,8 @@
 # China Financial GRC Progress Ledger / 中国金融 GRC 进度台账
 
 > Status: **Authoritative current execution record / 权威当前执行记录**
-> Updated: **2026-08-27**
-> Branch: `agent/cfgrc-regulatory-workflow-isolation-20260826`
+> Updated: **2026-08-28**
+> Branch: `agent/cfgrc-upstream-reconciliation-20260827`
 
 This file is the bounded current dashboard: one stage pointer, one active task,
 current facts, risks, one next action, and recent links. The roadmap owns stable
@@ -27,7 +27,7 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
 | Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
 | Production acceptance | Legal, privacy, security, records, audit, operations, and production acceptance have not been performed. |
-| Hosted project governance | PR #1 landed the fork slices and PR #2 landed the retained activation evidence on protected `main`; an active no-bypass ruleset requires the GitHub-Actions-sourced `validate-project-governance` check, and the weekly read-only upstream monitor is explicitly enabled. |
+| Hosted project governance | PRs #1-#3 landed through protected `main`; PR #3 passed all 168 checks before merge. An active no-bypass ruleset requires the GitHub-Actions-sourced `validate-project-governance` check, and the weekly read-only upstream monitor is explicitly enabled. |
 
 ## Current verification summary
 
@@ -79,8 +79,15 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   The sole failure exposed a stale PostgreSQL custom-role fixture still granting
   generic `view_entity`. Replacing its two grants with the narrow registration
   permission passed the complete local PostgreSQL harness, including 80 tests,
-  backup/restore fingerprint equality, and a restored successor write. A new
-  complete hosted matrix remains required before merge.
+  backup/restore fingerprint equality, and a restored successor write. Final
+  candidate `fced7716` then passed all 168 checks and all nine workflow runs;
+  PR #3 merged without bypass as `d1ff1e461d58f6bb2dff77d312b160d475d2ff3e`.
+- The reconciliation branch preserved pure merge `11e9e9455` against canonical
+  upstream `ec3cf7d03`; the separately reviewed IAM, mapping, formal-export,
+  respondent-tree, and durable assignment-mail hardening is committed as
+  `f69cec3a2`. Canonical upstream subsequently advanced by one commit to
+  `9aac30df8`, leaving the local candidate 21 ahead / 1 behind before the final
+  clean merge.
 
 ## Current limitations and risks
 
@@ -107,13 +114,12 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 9. **Only local synthetic PostgreSQL evidence exists.** Representative plans,
    complete upstream-table privileges, production topology, monitoring,
    encryption/key custody, PITR/RPO/RTO, and operations approval remain open.
-10. **The fork has crossed the upstream failure threshold.** A fresh canonical
-    fetch on 2026-08-27 resolved upstream `main` to
-    `ec3cf7d0386fd8d328d7f4623032a351538e23ce` and fork `main` to
-    `430c7d591c698c359fa4c318b1a02495e9ef5d53`: 22 behind and 17 ahead. This
-    fails the configured 20-behind gate. Reconciliation is the sole active task
-    and must remain a dedicated clean PR with proportional regression; it must
-    not be hidden in the workflow-isolation slice.
+10. **The reconciliation candidate needs one final canonical merge.** The branch
+    has preserved pure merge `11e9e9455` for the original 22-behind boundary,
+    but canonical upstream advanced to `9aac30df8` after that merge. The current
+    measurement is 21 ahead / 1 behind. The final fetch and merge must remain a
+    dedicated clean commit with proportional regression and must not be hidden
+    in another extension slice.
 11. **Inherited workflow activation still needs an owner policy.** Opening PR #1
     registered inherited validation workflows as well as the three fork jobs.
     The write-scoped CLA and OIDC/security-events Plumber workflows were
@@ -136,16 +142,13 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 ## Current next action
 
 Complete the upstream-reconciliation task without bypassing the protected-main
-gate: amend PR #3 with the locally verified PostgreSQL fixture correction and
-land it only after the new complete hosted matrix passes. Then branch cleanly
-from updated `main`, fetch canonical upstream again, reconcile the measured
-22-behind failure,
-and review the exact upstream commits and conflicts. Preserve the bounded
-extension and existing IAM/GRC ownership, run proportional backend/frontend/
-governance/PostgreSQL checks, and merge only through a PR whose required
-governance check passes. Do not mix target-environment work or new product
-features into that reconciliation. After the drift gate is restored, return
-the product pointer to
+gate: fetch canonical upstream again, review and merge the one new
+`9aac30df8` library-builder commit as a pure upstream change, and remeasure to
+zero behind. Then rerun the affected frontend, focused backend, artifact, and
+project-governance gates and push only this dedicated reconciliation candidate.
+Merge only through a PR whose complete hosted matrix passes; do not mix target-
+environment work or new product features into the reconciliation. After the
+drift gate is restored, return the product pointer to
 `CFGRC-P1-TARGET-ACCEPTANCE`; that charter remains blocked on named operations,
 security, privacy, records, legal, and audit owners.
 
