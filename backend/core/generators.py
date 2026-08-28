@@ -12,6 +12,7 @@ from library.helpers import get_referential_translation
 
 from .models import (
     AppliedControl,
+    Actor,
     ComplianceAssessment,
     RequirementAssessment,
     RequirementNode,
@@ -337,7 +338,7 @@ def calculate_depths(framework):
     return depth_map
 
 
-def gen_audit_context(id, doc, tree, lang):
+def gen_audit_context(id, doc, tree, lang, *, user):
     def count_category_results(data):
         def recursive_result_count(node_data):
             # Initialize result counts for this node
@@ -453,15 +454,32 @@ def gen_audit_context(id, doc, tree, lang):
             ],
         }
 
+    from iam.models import RoleAssignment
+
+    from core.utils import is_field_visible_to
+
     audit = ComplianceAssessment.objects.get(id=id)
+    visible_actor_ids = RoleAssignment.get_viewable_object_ids(user, Actor)
+    visible_ra_ids = set(
+        RoleAssignment.get_viewable_object_ids(user, RequirementAssessment)
+    )
+    visible_control_ids = RoleAssignment.get_viewable_object_ids(user, AppliedControl)
 
     context = dict()
 
     authors = ", ".join(
-        dict.fromkeys(email for a in audit.authors.all() for email in a.get_emails())
+        dict.fromkeys(
+            email
+            for a in audit.authors.filter(id__in=visible_actor_ids)
+            for email in a.get_emails()
+        )
     )
     reviewers = ", ".join(
-        dict.fromkeys(email for r in audit.reviewers.all() for email in r.get_emails())
+        dict.fromkeys(
+            email
+            for r in audit.reviewers.filter(id__in=visible_actor_ids)
+            for email in r.get_emails()
+        )
     )
 
     spider_data = list()
@@ -477,8 +495,6 @@ def gen_audit_context(id, doc, tree, lang):
         if node.get("max_score") is not None:
             max_score = node["max_score"]
             break
-    print(category_scores)
-
     for key, content in tree.items():
         total = sum(result_counts[content["urn"]].values())
         ok_items = result_counts[content["urn"]].get("compliant", 0) + result_counts[
@@ -504,9 +520,6 @@ def gen_audit_context(id, doc, tree, lang):
                 aggregated[status] += count
 
     total = sum([v for v in aggregated.values()])
-    if total == 0:
-        print("Error:: No requirments found, something is wrong. aborting ..")
-        # NOTICE: We aren't aborting here, lead to a division by zero in the plot_donut function
     aggregated["total"] = total
 
     # temporary hack since the gettext_lazy wasn't consistent
@@ -624,9 +637,11 @@ def gen_audit_context(id, doc, tree, lang):
     )
     chart_category_radar = InlineImage(doc, category_radar_buffer, width=Cm(15))
 
-    requirement_assessments_objects = audit.get_requirement_assessments(
-        include_non_assessable=True
-    )
+    requirement_assessments_objects = [
+        ra
+        for ra in audit.get_requirement_assessments(include_non_assessable=True)
+        if ra.id in visible_ra_ids
+    ]
 
     # Build flat list of requirement assessments for Word template
     requirement_assessments_list = []
@@ -642,21 +657,40 @@ def gen_audit_context(id, doc, tree, lang):
                     ra.requirement, "description", lang
                 )
                 or "-",
-                "status": safe_translate(lang, ra.status),
-                "result": safe_translate(lang, ra.result),
-                "extended_result": safe_translate(lang, ra.extended_result),
-                "score": ra.score,
-                "max_score": audit.framework.max_score if ra.is_scored else None,
-                "observation": ra.observation or "-",
+                "status": safe_translate(lang, ra.status)
+                if is_field_visible_to(audit, "status", "auditor")
+                else "-",
+                "result": safe_translate(lang, ra.result)
+                if is_field_visible_to(audit, "result", "auditor")
+                else "-",
+                "extended_result": safe_translate(lang, ra.extended_result)
+                if is_field_visible_to(audit, "extended_result", "auditor")
+                else "-",
+                "score": ra.score
+                if is_field_visible_to(audit, "score", "auditor")
+                and is_field_visible_to(audit, "is_scored", "auditor")
+                else None,
+                "max_score": audit.framework.max_score
+                if ra.is_scored
+                and is_field_visible_to(audit, "score", "auditor")
+                and is_field_visible_to(audit, "is_scored", "auditor")
+                else None,
+                "observation": ra.observation or "-"
+                if is_field_visible_to(audit, "observation", "auditor")
+                else "-",
                 "applied_controls": ", ".join(
-                    ac.name for ac in ra.applied_controls.all()
+                    ac.name
+                    for ac in ra.applied_controls.filter(id__in=visible_control_ids)
                 )
-                or "-",
+                or "-"
+                if is_field_visible_to(audit, "applied_controls", "auditor")
+                else "-",
             }
         )
 
     applied_controls = AppliedControl.objects.filter(
-        requirement_assessments__in=requirement_assessments_objects
+        requirement_assessments__in=requirement_assessments_objects,
+        id__in=visible_control_ids,
     ).distinct()
     ac_total = applied_controls.count()
     status_cnt = applied_controls.values("status").annotate(count=Count("id"))
@@ -675,7 +709,6 @@ def gen_audit_context(id, doc, tree, lang):
             .filter(applied_controls=ac.id)
             .count()
         )
-        print(f"[{ac.name}] {ac.category}: {type(ac.category)}")
         p1_controls.append(
             {
                 "name": ac.name,

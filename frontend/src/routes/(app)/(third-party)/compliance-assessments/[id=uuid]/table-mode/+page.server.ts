@@ -42,24 +42,28 @@ export const load = (async ({ fetch, params }) => {
 	const requirement_assessments = await Promise.all(
 		tableMode.requirement_assessments.map(async (requirementAssessment) => {
 			// TODO: merge initial data ?
-			const measureInitialData = {
-				requirement_assessments: [requirementAssessment.id],
-				folder: requirementAssessment.folder.id
-			};
-			const measureCreateForm = await superValidate(measureInitialData, zod(measureCreateSchema), {
-				errors: false
-			});
-			const evidenceInitialData = {
-				requirement_assessments: [requirementAssessment.id],
-				folder: requirementAssessment.folder.id
-			};
-			const evidenceCreateForm = await superValidate(
-				evidenceInitialData,
-				zod(evidenceCreateSchema),
-				{
-					errors: false
-				}
-			);
+			const { folder, ...requirementAssessmentWithoutFolder } = requirementAssessment;
+			const folderId = folder?.id;
+			const measureCreateForm = folderId
+				? await superValidate(
+						{
+							requirement_assessments: [requirementAssessment.id],
+							folder: folderId
+						},
+						zod(measureCreateSchema),
+						{ errors: false }
+					)
+				: null;
+			const evidenceCreateForm = folderId
+				? await superValidate(
+						{
+							requirement_assessments: [requirementAssessment.id],
+							folder: folderId
+						},
+						zod(evidenceCreateSchema),
+						{ errors: false }
+					)
+				: null;
 			const observationBuffer = requirementAssessment.observation;
 			const scoreForm = await superValidate(
 				{
@@ -72,8 +76,8 @@ export const load = (async ({ fetch, params }) => {
 			const updateSchema = modelSchema('requirement-assessments');
 			const updatedModel: ModelInfo = getModelInfo('requirement-assessments');
 			const object = {
-				...requirementAssessment,
-				folder: requirementAssessment.folder.id,
+				...requirementAssessmentWithoutFolder,
+				...(folderId ? { folder: folderId } : {}),
 				requirement: requirementAssessment.requirement.id,
 				compliance_assessment: requirementAssessment.compliance_assessment.id,
 				...(requirementAssessment.evidences !== undefined && {
@@ -120,7 +124,7 @@ export const load = (async ({ fetch, params }) => {
 		requirements,
 		measureModel,
 		evidenceModel,
-		viewerRole: tableMode.viewer_role ?? 'auditor',
+		viewerRole: tableMode.viewer_role === 'auditor' ? 'auditor' : 'respondent',
 		title: m.tableMode()
 	};
 }) satisfies PageServerLoad;

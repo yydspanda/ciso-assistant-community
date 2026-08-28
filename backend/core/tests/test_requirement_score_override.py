@@ -433,6 +433,11 @@ def admin_client_with_audit(framework_with_alternatives):
         folder=folder,
         perimeter=perimeter,
     )
+    # The endpoint now enforces the exact field policy before score
+    # validation. Keep this fixture authorized so the tests below exercise the
+    # resolved-scale validator rather than the policy gate.
+    ca.scoring_enabled = True
+    ca.save(update_fields=["field_visibility"])
     binary_node = RequirementNode.objects.create(
         urn="urn:test:update-req-binary",
         framework=framework_with_alternatives,
@@ -460,6 +465,23 @@ class TestUpdateRequirementEndpointScoreValidation:
         return reverse(
             "compliance-assessments-update-requirement", kwargs={"pk": str(ca.pk)}
         )
+
+    def test_rejects_score_when_field_policy_is_hidden(self, admin_client_with_audit):
+        """Full object access does not bypass the audit's score field policy."""
+        ctx = admin_client_with_audit
+        ctx["ca"].scoring_enabled = False
+        ctx["ca"].save(update_fields=["field_visibility"])
+        before = (ctx["ra"].result, ctx["ra"].score, ctx["ra"].is_scored)
+
+        response = ctx["client"].post(
+            self._url(ctx["ca"]),
+            {"urn": ctx["urn"], "result": "compliant", "score": 1},
+            format="json",
+        )
+
+        assert response.status_code == 403
+        ctx["ra"].refresh_from_db()
+        assert (ctx["ra"].result, ctx["ra"].score, ctx["ra"].is_scored) == before
 
     def test_rejects_score_above_node_override(self, admin_client_with_audit):
         ctx = admin_client_with_audit

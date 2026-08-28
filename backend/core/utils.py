@@ -1307,6 +1307,42 @@ AUDITOR_VIEW_PERM = "view_compliance_assessment_full"
 AUDIT_ACCESS_PERM = "view_complianceassessment"
 
 
+def get_full_view_compliance_assessment_ids(user):
+    """Return lazy IDs readable both generically and with full auditor scope."""
+    from django.contrib.auth.models import Permission
+
+    from core.models import ComplianceAssessment
+    from iam.models import RoleAssignment
+
+    generic_ids = RoleAssignment.get_viewable_object_ids(user, ComplianceAssessment)
+    full_permission = Permission.objects.get(
+        codename=AUDITOR_VIEW_PERM,
+        content_type__app_label="core",
+        content_type__model="complianceassessment",
+    )
+    full_folder_ids = RoleAssignment.get_allowed_folder_ids(user, full_permission)
+    return ComplianceAssessment.objects.filter(
+        id__in=generic_ids,
+        folder_id__in=full_folder_ids,
+    ).values_list("id", flat=True)
+
+
+def has_full_view_compliance_assessment(user, compliance_assessment) -> bool:
+    """Return whether *user* may consume the assessment's complete data set.
+
+    Callers normally already proved generic access to ``compliance_assessment``.
+    Keeping this as an explicit second gate makes published/future read paths
+    default to the respondent boundary unless the dedicated full-view
+    permission is also present.
+    """
+    from core.models import ComplianceAssessment
+
+    return ComplianceAssessment.objects.filter(
+        id=compliance_assessment.id,
+        id__in=get_full_view_compliance_assessment_ids(user),
+    ).exists()
+
+
 def get_respondent_scoped_folder_ids(user) -> set[UUID]:
     """Return folder IDs where *user* sees audits as a **respondent** — i.e. the
     scoped, field-stripped view applies.
@@ -1331,6 +1367,85 @@ def get_respondent_scoped_folder_ids(user) -> set[UUID]:
         for folder_id, codenames in perms_per_folder.items()
         if AUDIT_ACCESS_PERM in codenames and AUDITOR_VIEW_PERM not in codenames
     }
+
+
+def get_authorized_requirement_assessment_ids(
+    user,
+    compliance_assessment,
+    *,
+    respondent_scope: bool | None = None,
+):
+    """Return a lazy queryset of requirement-assessment IDs *user* may consume.
+
+    Generic folder IAM is always enforced.  A respondent is additionally
+    restricted to requirement assignments naming one of their actors.  The
+    queryset is deliberately suitable for use as an ORM subquery so callers
+    can constrain relationship queries without materialising broad ID lists.
+    """
+    from core.models import (
+        Actor,
+        ComplianceAssessment,
+        RequirementAssessment,
+        RequirementAssignment,
+    )
+    from iam.models import RoleAssignment
+
+    if respondent_scope is None:
+        respondent_scope = not has_full_view_compliance_assessment(
+            user, compliance_assessment
+        )
+
+    authorized = RequirementAssessment.objects.filter(
+        compliance_assessment=compliance_assessment,
+        compliance_assessment_id__in=RoleAssignment.get_viewable_object_ids(
+            user, ComplianceAssessment
+        ),
+        id__in=RoleAssignment.get_viewable_object_ids(user, RequirementAssessment),
+    )
+    if respondent_scope:
+        user_actors = Actor.get_all_for_user(user)
+        assigned_ids = RequirementAssignment.objects.filter(
+            compliance_assessment=compliance_assessment,
+            actor__in=user_actors,
+        ).values_list("requirement_assessments__id", flat=True)
+        authorized = authorized.filter(id__in=assigned_ids)
+    else:
+        # Re-prove the authority-bearing full-view grant in the same lazy SQL
+        # that returns rows.  A grant revoked after the role classification
+        # above therefore fails closed instead of widening to the full audit.
+        authorized = authorized.filter(
+            compliance_assessment_id__in=get_full_view_compliance_assessment_ids(user)
+        )
+
+    return authorized.values_list("id", flat=True)
+
+
+def scope_requirement_assessments_for_user(
+    user, compliance_assessment, requirement_assessments
+) -> tuple[list, bool]:
+    """Preserve audit order while applying the respondent assignment boundary.
+
+    Returns ``(scoped_rows, is_respondent)`` so response builders can also
+    suppress auditor-only overlays without recomputing the classification.
+    Every caller crosses generic ``view_requirementassessment`` IAM; respondents
+    additionally cross the actor-assignment boundary.
+    """
+    is_respondent = not has_full_view_compliance_assessment(user, compliance_assessment)
+    authorized_ids = get_authorized_requirement_assessment_ids(
+        user,
+        compliance_assessment,
+        respondent_scope=is_respondent,
+    )
+    if hasattr(requirement_assessments, "filter"):
+        return (
+            list(requirement_assessments.filter(id__in=authorized_ids)),
+            is_respondent,
+        )
+
+    authorized_id_set = set(authorized_ids)
+    return [
+        row for row in requirement_assessments if row.id in authorized_id_set
+    ], is_respondent
 
 
 # --- Field Visibility ---
@@ -1392,6 +1507,14 @@ def resolve_visibility_from_overrides(overrides, field_name):
 def resolve_field_visibility(compliance_assessment, field_name):
     """Return the per-role visibility pair for a field on a CA instance."""
     overrides = getattr(compliance_assessment, "field_visibility", None) or {}
+    # Legacy assessments may have an entirely empty snapshot.  Their detail
+    # serializer and progress calculation already fall back to the framework
+    # template; authority-bearing runtime checks must resolve the same policy.
+    # A non-empty assessment snapshot remains authoritative even when one key
+    # is absent, preserving the normal DEFAULT_VISIBILITY fallback semantics.
+    if not overrides:
+        framework = getattr(compliance_assessment, "framework", None)
+        overrides = getattr(framework, "field_visibility", None) or {}
     return resolve_visibility_from_overrides(overrides, field_name)
 
 
@@ -1403,6 +1526,675 @@ def _role_access(compliance_assessment, field_name, role):
 def is_field_visible_to(compliance_assessment, field_name, role):
     """Whether a field is readable by the given role."""
     return _role_access(compliance_assessment, field_name, role) != "hidden"
+
+
+def get_authorized_compliance_progress_projections(user, assessments):
+    """Return caller-scoped progress projections for a bounded CA collection.
+
+    ``ComplianceAssessment.progress`` is intentionally the complete-audit
+    metric.  API list/detail callers can instead be assignment-scoped and can
+    have independent IAM on requirement nodes, questions, choices, and answers.
+    Computing a percentage before crossing those boundaries discloses hidden
+    work through the numerator or denominator.  This projector applies the
+    exact full-view/assignment axis, generic IAM for every carrier, and the
+    caller's field-visibility axis before deriving either percentage.
+
+    The caller is expected to pass the current page (or one detail object), so
+    the hydrated row set remains bounded by an API response rather than the
+    complete assessment table.
+    """
+    from collections import defaultdict
+
+    from django.db.models import Prefetch, Q
+
+    from core.models import (
+        Actor,
+        Answer,
+        ComplianceAssessment,
+        Question,
+        QuestionChoice,
+        RequirementAssessment,
+        RequirementAssignment,
+        RequirementNode,
+    )
+    from iam.models import RoleAssignment
+
+    assessment_list = list(assessments)
+    if not assessment_list:
+        return {}
+    if user is None or not getattr(user, "is_authenticated", False):
+        return {assessment.id: None for assessment in assessment_list}
+
+    assessment_ids = [assessment.id for assessment in assessment_list]
+    visible_assessment_ids = set(
+        ComplianceAssessment.objects.filter(id__in=assessment_ids)
+        .filter(
+            id__in=RoleAssignment.get_viewable_object_ids(user, ComplianceAssessment)
+        )
+        .values_list("id", flat=True)
+    )
+    full_view_ids = set(
+        ComplianceAssessment.objects.filter(id__in=visible_assessment_ids)
+        .filter(id__in=get_full_view_compliance_assessment_ids(user))
+        .values_list("id", flat=True)
+    )
+    respondent_ids = visible_assessment_ids - full_view_ids
+    assigned_ra_ids = RequirementAssignment.objects.filter(
+        compliance_assessment_id__in=respondent_ids,
+        actor__in=Actor.get_all_for_user(user),
+    ).values_list("requirement_assessments__id", flat=True)
+
+    visible_ra_ids = set(
+        RoleAssignment.get_viewable_object_ids(user, RequirementAssessment)
+    )
+    visible_requirement_ids = set(
+        RoleAssignment.get_viewable_object_ids(user, RequirementNode)
+    )
+    visible_question_ids = set(RoleAssignment.get_viewable_object_ids(user, Question))
+    visible_choice_ids = set(
+        RoleAssignment.get_viewable_object_ids(user, QuestionChoice)
+    )
+    visible_answer_ids = set(RoleAssignment.get_viewable_object_ids(user, Answer))
+
+    # Start from the rows belonging to the exact authority axis before applying
+    # related-object IAM.  The difference between this set and the hydrated
+    # visible set is a completeness signal, not a row that may be silently
+    # treated as absent/unfinished in a plausible percentage.
+    candidate_rows = list(
+        RequirementAssessment.objects.filter(
+            compliance_assessment_id__in=visible_assessment_ids,
+            requirement__assessable=True,
+        )
+        .filter(
+            Q(compliance_assessment_id__in=full_view_ids) | Q(id__in=assigned_ra_ids)
+        )
+        .select_related("requirement")
+    )
+
+    rows = (
+        RequirementAssessment.objects.filter(
+            compliance_assessment_id__in=assessment_ids,
+            requirement__assessable=True,
+            id__in=visible_ra_ids,
+            requirement_id__in=visible_requirement_ids,
+        )
+        .filter(
+            compliance_assessment_id__in=RoleAssignment.get_viewable_object_ids(
+                user, ComplianceAssessment
+            )
+        )
+        .filter(
+            Q(compliance_assessment_id__in=full_view_ids) | Q(id__in=assigned_ra_ids)
+        )
+        .select_related("requirement")
+        .prefetch_related(
+            Prefetch(
+                "requirement__questions",
+                queryset=Question.objects.filter(id__in=visible_question_ids),
+            ),
+            Prefetch(
+                "answers",
+                queryset=(
+                    Answer.objects.filter(
+                        id__in=visible_answer_ids,
+                        question_id__in=visible_question_ids,
+                    )
+                    .select_related("question")
+                    .prefetch_related(
+                        Prefetch(
+                            "selected_choices",
+                            queryset=QuestionChoice.objects.filter(
+                                id__in=visible_choice_ids
+                            ),
+                        )
+                    )
+                ),
+            ),
+        )
+    )
+    rows_by_assessment = defaultdict(list)
+    for row in rows:
+        rows_by_assessment[row.compliance_assessment_id].append(row)
+
+    candidate_rows_by_assessment = defaultdict(list)
+    relevant_requirement_ids = set()
+    relevant_ra_ids = set()
+    for assessment in assessment_list:
+        candidates = [
+            row
+            for row in candidate_rows
+            if row.compliance_assessment_id == assessment.id
+            and assessment.requirement_matches_selected_groups(row.requirement)
+        ]
+        candidate_rows_by_assessment[assessment.id] = candidates
+        relevant_requirement_ids.update(row.requirement_id for row in candidates)
+        relevant_ra_ids.update(row.id for row in candidates)
+
+    all_question_ids_by_requirement = defaultdict(set)
+    for requirement_id, question_id in Question.objects.filter(
+        requirement_node_id__in=relevant_requirement_ids
+    ).values_list("requirement_node_id", "id"):
+        all_question_ids_by_requirement[requirement_id].add(question_id)
+
+    relevant_question_ids = (
+        set().union(*all_question_ids_by_requirement.values())
+        if all_question_ids_by_requirement
+        else set()
+    )
+    all_choice_ids_by_question = defaultdict(set)
+    for question_id, choice_id in QuestionChoice.objects.filter(
+        question_id__in=relevant_question_ids
+    ).values_list("question_id", "id"):
+        all_choice_ids_by_question[question_id].add(choice_id)
+
+    all_answer_ids_by_ra = defaultdict(set)
+    for ra_id, answer_id in Answer.objects.filter(
+        requirement_assessment_id__in=relevant_ra_ids
+    ).values_list("requirement_assessment_id", "id"):
+        all_answer_ids_by_ra[ra_id].add(answer_id)
+
+    projections = {}
+    for assessment in assessment_list:
+        if assessment.id not in visible_assessment_ids:
+            projections[assessment.id] = None
+            continue
+        viewer_role = "auditor" if assessment.id in full_view_ids else "respondent"
+        scoped_rows = [
+            row
+            for row in rows_by_assessment[assessment.id]
+            if assessment.requirement_matches_selected_groups(row.requirement)
+        ]
+        question_counts = {
+            row.id: row.get_visible_questions_counts() for row in scoped_rows
+        }
+
+        answers_visible = is_field_visible_to(assessment, "answers", viewer_role)
+        status_visible = is_field_visible_to(assessment, "status", viewer_role)
+        result_visible = is_field_visible_to(assessment, "result", viewer_role)
+        score_visible = is_field_visible_to(assessment, "score", viewer_role)
+        min_score_fallback = (
+            assessment.min_score if assessment.min_score is not None else 0
+        )
+        candidates = candidate_rows_by_assessment[assessment.id]
+        base_complete = all(
+            row.id in visible_ra_ids and row.requirement_id in visible_requirement_ids
+            for row in candidates
+        )
+        questions_complete = all(
+            all_question_ids_by_requirement[row.requirement_id] <= visible_question_ids
+            for row in candidates
+        )
+        choices_complete = all(
+            all_choice_ids_by_question[question_id] <= visible_choice_ids
+            for row in candidates
+            for question_id in all_question_ids_by_requirement[row.requirement_id]
+        )
+        answers_complete = all(
+            all_answer_ids_by_ra[row.id] <= visible_answer_ids for row in candidates
+        )
+        progress_complete = base_complete and (
+            status_visible
+            or (
+                questions_complete
+                and (not answers_visible or (choices_complete and answers_complete))
+            )
+        )
+        answer_projection_complete = (
+            base_complete
+            and questions_complete
+            and choices_complete
+            and answers_complete
+        )
+
+        assessed_count = 0
+        for row in scoped_rows:
+            total_questions, answered_questions = question_counts[row.id]
+            if status_visible:
+                assessed = row.status == RequirementAssessment.Status.DONE
+            else:
+                result_assessed = (
+                    result_visible
+                    and row.result != RequirementAssessment.Result.NOT_ASSESSED
+                )
+                if total_questions:
+                    assessed = (
+                        result_assessed
+                        or (score_visible and row.score is not None)
+                        or (answers_visible and answered_questions == total_questions)
+                    )
+                elif result_visible:
+                    assessed = result_assessed
+                elif score_visible:
+                    resolved_min = (
+                        row.requirement.min_score
+                        if row.requirement.min_score is not None
+                        else min_score_fallback
+                    )
+                    assessed = row.score is not None and row.score > resolved_min
+                else:
+                    assessed = False
+            if assessed:
+                assessed_count += 1
+
+        visible_question_count = sum(total for total, _ in question_counts.values())
+        answered_question_count = sum(
+            answered for _, answered in question_counts.values()
+        )
+        projections[assessment.id] = {
+            "viewer_role": viewer_role,
+            "complete": progress_complete,
+            "answers_complete": answer_projection_complete,
+            "total_requirements": len(scoped_rows) if progress_complete else None,
+            "assessed_requirements": assessed_count if progress_complete else None,
+            "progress": (
+                int(assessed_count / len(scoped_rows) * 100) if scoped_rows else 0
+            )
+            if progress_complete
+            else None,
+            "answers_progress": (
+                int(answered_question_count / visible_question_count * 100)
+                if answers_visible
+                and answer_projection_complete
+                and visible_question_count
+                else None
+            ),
+        }
+
+    return projections
+
+
+def _stored_library_mapping_sets(stored_library):
+    """Yield mapping-set dictionaries owned by one StoredLibrary artifact."""
+
+    content = stored_library.content
+    if not isinstance(content, dict):
+        return
+    single = content.get("requirement_mapping_set")
+    if isinstance(single, dict):
+        yield single
+    multiple = content.get("requirement_mapping_sets")
+    if isinstance(multiple, list):
+        yield from (item for item in multiple if isinstance(item, dict))
+
+
+def get_mapping_authorization(user):
+    """Build an exact generic-IAM snapshot for StoredLibrary-backed mappings.
+
+    ``RequirementMappingSet`` is deliberately absent here. The runtime engine
+    consumes mapping entries directly from ``StoredLibrary.content`` and the
+    API resource at ``/requirement-mapping-sets/`` is likewise backed by
+    ``StoredLibrary``. An edge is admitted only if its owner, both Frameworks,
+    and every source/target RequirementNode in the mapping set are readable.
+    """
+
+    from core.mappings.engine import (
+        MappingAuthorization,
+        canonical_mapping_edge_identity,
+        mapping_set_with_owner,
+    )
+    from core.models import Framework, RequirementNode, StoredLibrary
+    from django.db.models import Q
+    from iam.models import RoleAssignment
+
+    visible_framework_ids = RoleAssignment.get_viewable_object_ids(user, Framework)
+    framework_urns = frozenset(
+        str(urn).lower()
+        for urn in Framework.objects.filter(id__in=visible_framework_ids)
+        .exclude(urn__isnull=True)
+        .values_list("urn", flat=True)
+    )
+    visible_node_ids = RoleAssignment.get_viewable_object_ids(user, RequirementNode)
+    node_frameworks = {
+        str(urn).lower(): str(framework_urn).lower()
+        for urn, framework_urn in RequirementNode.objects.filter(
+            id__in=visible_node_ids,
+            urn__isnull=False,
+            framework__urn__isnull=False,
+        ).values_list("urn", "framework__urn")
+    }
+    visible_stored_library_ids = RoleAssignment.get_viewable_object_ids(
+        user, StoredLibrary
+    )
+    edge_identities = set()
+    for stored_library in StoredLibrary.objects.filter(
+        id__in=visible_stored_library_ids,
+        is_loaded=True,
+    ).filter(
+        Q(content__requirement_mapping_set__isnull=False)
+        | Q(content__requirement_mapping_sets__isnull=False)
+    ):
+        for raw_mapping_set in _stored_library_mapping_sets(stored_library):
+            mapping_set = mapping_set_with_owner(raw_mapping_set, stored_library)
+            source_urn = mapping_set.get("source_framework_urn")
+            target_urn = mapping_set.get("target_framework_urn")
+            if not isinstance(source_urn, str) or not isinstance(target_urn, str):
+                continue
+            source_urn = source_urn.lower()
+            target_urn = target_urn.lower()
+            if source_urn not in framework_urns or target_urn not in framework_urns:
+                continue
+            mappings = mapping_set.get("requirement_mappings")
+            if not isinstance(mappings, list) or not mappings:
+                continue
+            complete = True
+            for mapping in mappings:
+                if not isinstance(mapping, dict):
+                    complete = False
+                    break
+                source_node_urn = mapping.get("source_requirement_urn")
+                target_node_urn = mapping.get("target_requirement_urn")
+                if not isinstance(source_node_urn, str) or not isinstance(
+                    target_node_urn, str
+                ):
+                    complete = False
+                    break
+                if (
+                    node_frameworks.get(source_node_urn.lower()) != source_urn
+                    or node_frameworks.get(target_node_urn.lower()) != target_urn
+                ):
+                    complete = False
+                    break
+            identity = canonical_mapping_edge_identity(mapping_set)
+            if complete and identity is not None:
+                edge_identities.add(identity)
+
+    return MappingAuthorization(
+        framework_urns=framework_urns,
+        requirement_node_urns=frozenset(node_frameworks),
+        edge_identities=frozenset(edge_identities),
+    )
+
+
+def get_mapping_inference_visibility_context(user, mapping_inferences) -> dict:
+    """Resolve a complete, canonical mapping-provenance authorization view."""
+    from core.mappings.engine import (
+        canonical_mapping_edge_identity,
+        mapping_set_with_owner,
+    )
+    from core.models import (
+        Framework,
+        RequirementAssessment,
+        RequirementNode,
+        StoredLibrary,
+    )
+    from iam.models import RoleAssignment
+
+    source_ids: set[UUID] = set()
+    source_urns: set[str] = set()
+    framework_urns: set[str] = set()
+    stored_library_ids: set[UUID] = set()
+    for inference in mapping_inferences:
+        if not isinstance(inference, dict):
+            continue
+        used_path = inference.get("used_path")
+        if isinstance(used_path, list):
+            framework_urns.update(
+                item.lower() for item in used_path if isinstance(item, str)
+            )
+        sources = inference.get("source_requirement_assessments") or {}
+        if not isinstance(sources, dict):
+            continue
+        for source in sources.values():
+            if not isinstance(source, dict):
+                continue
+            try:
+                source_ids.add(UUID(str(source.get("id"))))
+            except TypeError, ValueError:
+                pass
+            source_urn = source.get("urn")
+            if isinstance(source_urn, str):
+                source_urns.add(source_urn.lower())
+            source_framework = source.get("source_framework")
+            if isinstance(source_framework, dict):
+                framework_urn = source_framework.get("urn")
+                if isinstance(framework_urn, str):
+                    framework_urns.add(framework_urn.lower())
+            mapping_set = source.get("used_mapping_set")
+            if isinstance(mapping_set, dict):
+                try:
+                    stored_library_ids.add(UUID(str(mapping_set.get("id"))))
+                except TypeError, ValueError:
+                    pass
+
+    authorization = get_mapping_authorization(user)
+    visible_ra_ids = RoleAssignment.get_viewable_object_ids(user, RequirementAssessment)
+    full_ca_ids = get_full_view_compliance_assessment_ids(user)
+    visible_node_ids = RoleAssignment.get_viewable_object_ids(user, RequirementNode)
+    source_assessments = {
+        ra.id: ra
+        for ra in RequirementAssessment.objects.filter(
+            id__in=source_ids,
+            compliance_assessment_id__in=full_ca_ids,
+            requirement_id__in=visible_node_ids,
+        )
+        .filter(id__in=visible_ra_ids)
+        .select_related(
+            "requirement",
+            "compliance_assessment",
+            "compliance_assessment__framework",
+        )
+    }
+    requirement_nodes = {
+        node.urn.lower(): node
+        for node in RequirementNode.objects.filter(
+            urn__in=source_urns,
+            id__in=visible_node_ids,
+        ).select_related("framework")
+    }
+    visible_framework_ids = RoleAssignment.get_viewable_object_ids(user, Framework)
+    frameworks = {
+        framework.urn.lower(): framework
+        for framework in Framework.objects.filter(
+            urn__in=framework_urns,
+            id__in=visible_framework_ids,
+        )
+    }
+
+    visible_stored_library_ids = RoleAssignment.get_viewable_object_ids(
+        user, StoredLibrary
+    )
+    mapping_edges = {}
+    duplicate_edges = set()
+    for stored_library in StoredLibrary.objects.filter(
+        id__in=stored_library_ids,
+        is_loaded=True,
+    ).filter(id__in=visible_stored_library_ids):
+        for raw_mapping_set in _stored_library_mapping_sets(stored_library):
+            mapping_set = mapping_set_with_owner(raw_mapping_set, stored_library)
+            identity = canonical_mapping_edge_identity(mapping_set)
+            mapping_urn = mapping_set.get("urn")
+            if identity not in authorization.edge_identities or not isinstance(
+                mapping_urn, str
+            ):
+                continue
+            key = (stored_library.id, mapping_urn.lower())
+            if key in mapping_edges:
+                duplicate_edges.add(key)
+            else:
+                mapping_edges[key] = mapping_set
+    for key in duplicate_edges:
+        mapping_edges.pop(key, None)
+
+    return {
+        "authorization": authorization,
+        "source_assessments": source_assessments,
+        "requirement_nodes": requirement_nodes,
+        "frameworks": frameworks,
+        "mapping_edges": mapping_edges,
+    }
+
+
+def sanitize_mapping_inference_for_viewer(
+    mapping_inference,
+    compliance_assessment,
+    *,
+    viewer_role: str,
+    visibility_context: dict | None,
+    target_result=None,
+):
+    """Return least-privilege mapping provenance, or ``None`` if unprovable."""
+    if viewer_role != "auditor" or not isinstance(mapping_inference, dict):
+        return None
+    if not isinstance(visibility_context, dict):
+        return None
+
+    authorization = visibility_context.get("authorization")
+    source_assessments = visibility_context.get("source_assessments") or {}
+    requirement_nodes = visibility_context.get("requirement_nodes") or {}
+    frameworks = visibility_context.get("frameworks") or {}
+    mapping_edges = visibility_context.get("mapping_edges") or {}
+    raw_sources = mapping_inference.get("source_requirement_assessments") or {}
+    if not isinstance(raw_sources, dict) or not raw_sources:
+        return None
+
+    used_path = mapping_inference.get("used_path")
+    if (
+        authorization is None
+        or not isinstance(used_path, list)
+        or len(used_path) < 2
+        or not all(isinstance(item, str) and item for item in used_path)
+    ):
+        return None
+    canonical_path = [item.lower() for item in used_path]
+    if len(canonical_path) != len(set(canonical_path)):
+        return None
+    target_framework_urn = getattr(compliance_assessment.framework, "urn", None)
+    if (
+        not isinstance(target_framework_urn, str)
+        or canonical_path[-1] != target_framework_urn.lower()
+        or any(
+            urn not in frameworks or not authorization.allows_framework(urn)
+            for urn in canonical_path
+        )
+    ):
+        return None
+
+    sanitized_sources = {}
+    used_edge_identities = set()
+    for source_key, source in raw_sources.items():
+        if not isinstance(source_key, str) or not isinstance(source, dict):
+            return None
+        source_urn = source.get("urn")
+        if not isinstance(source_urn, str) or source_key.lower() != source_urn.lower():
+            return None
+        source_urn = source_urn.lower()
+        source_node = requirement_nodes.get(source_urn)
+        if source_node is None or not authorization.allows_requirement_node(source_urn):
+            return None
+
+        node_framework_urn = getattr(source_node.framework, "urn", None)
+        if not isinstance(node_framework_urn, str):
+            return None
+        node_framework_urn = node_framework_urn.lower()
+        if node_framework_urn not in canonical_path:
+            return None
+        path_index = canonical_path.index(node_framework_urn)
+        if path_index >= len(canonical_path) - 1:
+            return None
+
+        raw_framework = source.get("source_framework")
+        if not isinstance(raw_framework, dict):
+            return None
+        try:
+            raw_framework_id = UUID(str(raw_framework.get("id")))
+        except TypeError, ValueError:
+            return None
+        if raw_framework_id != source_node.framework_id:
+            return None
+
+        raw_mapping_set = source.get("used_mapping_set")
+        if not isinstance(raw_mapping_set, dict):
+            return None
+        try:
+            owner_id = UUID(str(raw_mapping_set.get("id")))
+        except TypeError, ValueError:
+            return None
+        mapping_urn = raw_mapping_set.get("urn")
+        if not isinstance(mapping_urn, str):
+            return None
+        mapping_set = mapping_edges.get((owner_id, mapping_urn.lower()))
+        if mapping_set is None:
+            return None
+        from core.mappings.engine import canonical_mapping_edge_identity
+
+        identity = canonical_mapping_edge_identity(mapping_set)
+        if identity is None or identity not in authorization.edge_identities:
+            return None
+        _, owner_urn, _, edge_source, edge_target, _ = identity
+        if (
+            edge_source != node_framework_urn
+            or edge_target != canonical_path[path_index + 1]
+        ):
+            return None
+        raw_owner_urn = raw_mapping_set.get("library_urn")
+        if raw_owner_urn is not None and (
+            not isinstance(raw_owner_urn, str) or raw_owner_urn.lower() != owner_urn
+        ):
+            return None
+        used_edge_identities.add(identity)
+
+        source_copy = {
+            "urn": source_node.urn,
+            "str": str(source_node.safe_display_str),
+            "source_framework": {
+                "id": str(source_node.framework_id),
+                "name": source_node.framework.get_name_translated
+                or source_node.framework.name,
+            },
+            "used_mapping_set": {
+                "id": str(owner_id),
+                "name": mapping_set.get("name"),
+                "ref_id": mapping_set.get("ref_id"),
+                "urn": mapping_set.get("urn"),
+            },
+        }
+        if source.get("coverage") in {"full", "partial"}:
+            source_copy["coverage"] = source["coverage"]
+
+        raw_source_id = source.get("id")
+        if raw_source_id is not None:
+            try:
+                source_id = UUID(str(raw_source_id))
+            except TypeError, ValueError:
+                return None
+            source_assessment = source_assessments.get(source_id)
+            if (
+                source_assessment is None
+                or source_assessment.requirement_id != source_node.id
+                or source_assessment.compliance_assessment.framework_id
+                != source_node.framework_id
+            ):
+                return None
+            source_ca = source_assessment.compliance_assessment
+            source_copy["id"] = str(source_assessment.id)
+            source_copy["str"] = str(source_assessment)
+            if is_field_visible_to(source_ca, "score", "auditor"):
+                source_copy["score"] = source_assessment.score
+            if is_field_visible_to(source_ca, "is_scored", "auditor"):
+                source_copy["is_scored"] = source_assessment.is_scored
+        elif path_index == 0:
+            # The first hop must be anchored to an actual authorized source RA.
+            return None
+
+        sanitized_sources[source_node.urn] = source_copy
+
+    path_edges = {
+        (canonical_path[index], canonical_path[index + 1])
+        for index in range(len(canonical_path) - 1)
+    }
+    represented_edges = {
+        (identity[3], identity[4]) for identity in used_edge_identities
+    }
+    if represented_edges != path_edges or len(sanitized_sources) != len(raw_sources):
+        return None
+    sanitized = {"source_requirement_assessments": sanitized_sources}
+    if is_field_visible_to(compliance_assessment, "result", viewer_role):
+        sanitized["result"] = target_result
+    sanitized["used_path"] = canonical_path
+    annotation = mapping_inference.get("annotation")
+    if isinstance(annotation, str):
+        sanitized["annotation"] = annotation
+    return sanitized
 
 
 def is_field_editable_by(compliance_assessment, field_name, role):

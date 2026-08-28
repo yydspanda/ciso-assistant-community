@@ -10,8 +10,9 @@ from uuid import UUID
 from django.core.exceptions import NON_FIELD_ERRORS as DJ_NON_FIELD_ERRORS
 from django.core.exceptions import ValidationError as DjValidationError
 from django.conf import settings
-from django.db.models import Count
+from django.db.models import Count, Exists, OuterRef, Prefetch, Q
 from django.shortcuts import get_object_or_404
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.views import api_settings
 from rest_framework.views import exception_handler as drf_exception_handler
@@ -23,7 +24,15 @@ from statistics import mean
 import math
 
 from .models import *
-from .utils import build_answers_dict, camel_case
+from .utils import (
+    build_answers_dict,
+    camel_case,
+    get_authorized_requirement_assessment_ids,
+    get_full_view_compliance_assessment_ids,
+    get_mapping_inference_visibility_context,
+    is_field_visible_to,
+    sanitize_mapping_inference_for_viewer,
+)
 
 DRF_NON_FIELD_ERRORS = api_settings.NON_FIELD_ERRORS_KEY
 
@@ -232,6 +241,8 @@ def get_sorted_requirement_nodes(
     requirements_assessed: Optional[list] = None,
     max_score: int = 0,
     min_score: int = 0,
+    *,
+    user=None,
 ) -> dict:
     """
     Recursive function to build framework groups tree
@@ -246,13 +257,110 @@ def get_sorted_requirement_nodes(
     If order_id is missing, sorting is based on created_at
     """
 
+    requirement_nodes = list(requirement_nodes)
+    requirements_assessed = list(requirements_assessed or [])
+
+    visible_question_urns = None
+    visible_choice_urns_by_question: dict[str, set] = defaultdict(set)
+    visible_answers_by_ra: dict[UUID, list] = defaultdict(list)
+    if user is not None:
+        node_ids = [node.id for node in requirement_nodes]
+        visible_question_ids = RoleAssignment.get_viewable_object_ids(user, Question)
+        visible_questions = list(
+            Question.objects.filter(
+                requirement_node_id__in=node_ids,
+                id__in=visible_question_ids,
+            ).values_list("id", "urn")
+        )
+        visible_question_urns = {urn for _, urn in visible_questions}
+        question_urn_by_id = dict(visible_questions)
+        visible_choice_ids = RoleAssignment.get_viewable_object_ids(
+            user, QuestionChoice
+        )
+        for question_id, choice_urn in QuestionChoice.objects.filter(
+            question_id__in=question_urn_by_id,
+            id__in=visible_choice_ids,
+        ).values_list("question_id", "urn"):
+            visible_choice_urns_by_question[question_urn_by_id[question_id]].add(
+                choice_urn
+            )
+
+        visible_answer_ids = RoleAssignment.get_viewable_object_ids(user, Answer)
+        answers = (
+            Answer.objects.filter(
+                requirement_assessment_id__in=[ra.id for ra in requirements_assessed],
+                question_id__in=question_urn_by_id,
+                id__in=visible_answer_ids,
+            )
+            .select_related("question")
+            .prefetch_related(
+                Prefetch(
+                    "selected_choices",
+                    queryset=QuestionChoice.objects.filter(id__in=visible_choice_ids),
+                )
+            )
+        )
+        for answer in answers:
+            visible_answers_by_ra[answer.requirement_assessment_id].append(answer)
+
+    def _questions_for(node):
+        data = node.get_questions_translated
+        if data is None or visible_question_urns is None:
+            return data
+        filtered = {}
+        for question_urn, question_data in data.items():
+            if question_urn not in visible_question_urns:
+                continue
+            question_data = dict(question_data)
+            depends_on = question_data.get("depends_on")
+            if isinstance(depends_on, dict):
+                dependency_urn = depends_on.get("question")
+                if dependency_urn not in visible_question_urns:
+                    continue
+                depends_on = dict(depends_on)
+                dependency_choices = visible_choice_urns_by_question.get(
+                    dependency_urn, set()
+                )
+                if isinstance(depends_on.get("answers"), list):
+                    depends_on["answers"] = [
+                        answer
+                        for answer in depends_on["answers"]
+                        if answer in dependency_choices
+                    ]
+                question_data["depends_on"] = depends_on
+            if "choices" in question_data:
+                allowed_choice_urns = visible_choice_urns_by_question.get(
+                    question_urn, set()
+                )
+                choices = [
+                    choice
+                    for choice in question_data["choices"]
+                    if choice.get("urn") in allowed_choice_urns
+                ]
+                if choices:
+                    question_data["choices"] = choices
+                else:
+                    question_data.pop("choices", None)
+            filtered[question_urn] = question_data
+        return filtered or None
+
+    def _answers_for(requirement_assessment):
+        if requirement_assessment is None:
+            return None
+        answers = (
+            visible_answers_by_ra.get(requirement_assessment.id, [])
+            if user is not None
+            else requirement_assessment.answers.all()
+        )
+        return build_answers_dict(answers)
+
     # Cope for old version not creating order_id correctly
     for req in requirement_nodes:
         if req.order_id is None:
             req.order_id = req.created_at
 
     requirement_assessment_from_requirement_id = {
-        str(ra.requirement_id): ra for ra in (requirements_assessed or [])
+        str(ra.requirement_id): ra for ra in requirements_assessed
     }
 
     def _resolved_max(req_node):
@@ -299,8 +407,8 @@ def get_sorted_requirement_nodes(
                 "max_score": _resolved_max(node) if req_as else None,
                 "min_score": _resolved_min(node) if req_as else None,
                 "weight": node.weight if node.weight else 1,
-                "questions": node.get_questions_translated,
-                "answers": build_answers_dict(req_as.answers.all()) if req_as else None,
+                "questions": _questions_for(node),
+                "answers": _answers_for(req_as),
                 "mapping_inference": req_as.mapping_inference if req_as else None,
                 "status_display": req_as.get_status_display() if req_as else None,
                 "status_i18n": camel_case(req_as.status) if req_as else None,
@@ -344,10 +452,8 @@ def get_sorted_requirement_nodes(
                     "max_score": _resolved_max(child) if child_req_as else None,
                     "min_score": _resolved_min(child) if child_req_as else None,
                     "weight": child.weight if child.weight else 1,
-                    "questions": child.get_questions_translated,
-                    "answers": build_answers_dict(child_req_as.answers.all())
-                    if child_req_as
-                    else None,
+                    "questions": _questions_for(child),
+                    "answers": _answers_for(child_req_as),
                     "mapping_inference": child_req_as.mapping_inference
                     if child_req_as
                     else None,
@@ -629,7 +735,13 @@ def filter_graph_by_implementation_groups(
     return filtered_graph
 
 
-def annotate_tree_with_coverage(tree: dict[str, dict], compliance_assessment) -> dict:
+def annotate_tree_with_coverage(
+    tree: dict[str, dict],
+    compliance_assessment,
+    *,
+    user,
+    viewer_role: str | None = None,
+) -> dict:
     """Flag each assessed node with whether it is covered by applied controls
     and by evidence.
 
@@ -640,21 +752,52 @@ def annotate_tree_with_coverage(tree: dict[str, dict], compliance_assessment) ->
     Keys are only emitted when True, so an uncovered audit — the case the
     coverage filter exists for — costs nothing in payload size.
     """
-    ac_through = RequirementAssessment.applied_controls.through.objects.filter(
-        requirementassessment__compliance_assessment=compliance_assessment
+    authorized_ra_ids = get_authorized_requirement_assessment_ids(
+        user, compliance_assessment
     )
-    with_controls = set(ac_through.values_list("requirementassessment_id", flat=True))
-    with_evidence = set(
-        RequirementAssessment.evidences.through.objects.filter(
-            requirementassessment__compliance_assessment=compliance_assessment
-        ).values_list("requirementassessment_id", flat=True)
-    ) | set(
-        ac_through.filter(appliedcontrol__evidences__isnull=False).values_list(
-            "requirementassessment_id", flat=True
+    if viewer_role is None:
+        viewer_role = (
+            "auditor"
+            if compliance_assessment.id in get_full_view_compliance_assessment_ids(user)
+            else "respondent"
         )
+    controls_visible = is_field_visible_to(
+        compliance_assessment, "applied_controls", viewer_role
     )
+    evidences_visible = is_field_visible_to(
+        compliance_assessment, "evidences", viewer_role
+    )
+    visible_control_ids = RoleAssignment.get_viewable_object_ids(user, AppliedControl)
+    visible_evidence_ids = RoleAssignment.get_viewable_object_ids(user, Evidence)
+
+    ac_through = RequirementAssessment.applied_controls.through.objects.none()
+    if controls_visible:
+        ac_through = RequirementAssessment.applied_controls.through.objects.filter(
+            requirementassessment_id__in=authorized_ra_ids,
+            appliedcontrol_id__in=visible_control_ids,
+        )
+    with_controls = set(ac_through.values_list("requirementassessment_id", flat=True))
+    with_evidence = set()
+    if evidences_visible:
+        with_evidence = set(
+            RequirementAssessment.evidences.through.objects.filter(
+                requirementassessment_id__in=authorized_ra_ids,
+                evidence_id__in=visible_evidence_ids,
+            ).values_list("requirementassessment_id", flat=True)
+        )
+        if controls_visible:
+            with_evidence |= set(
+                ac_through.filter(
+                    appliedcontrol__evidences__id__in=visible_evidence_ids
+                ).values_list("requirementassessment_id", flat=True)
+            )
 
     def _annotate(node: dict):
+        # Callers may reuse an already-annotated tree.  Coverage is
+        # request-specific, so stale truthy flags must never survive a narrower
+        # principal or changed relationship.
+        node.pop("has_applied_controls", None)
+        node.pop("has_evidence", None)
         ra_id = node.get("ra_id")
         if ra_id:
             ra_uuid = UUID(ra_id)
@@ -668,6 +811,148 @@ def annotate_tree_with_coverage(tree: dict[str, dict], compliance_assessment) ->
     for node in tree.values():
         _annotate(node)
 
+    return tree
+
+
+_TREE_VISIBILITY_ALIASES = {
+    "status_display": "status",
+    "status_i18n": "status",
+    "result_i18n": "result",
+    "aggregated_score": "score",
+    "aggregated_min_score": "score",
+    "aggregated_max_score": "score",
+    "aggregated_documentation_score": "documentation_score",
+    "min_score": "score",
+    "max_score": "score",
+    "weight": "score",
+    "has_applied_controls": "applied_controls",
+    "has_evidence": "evidences",
+}
+
+_TREE_COMPOSITE_VISIBILITY = {
+    "aggregated_score": ("score", "is_scored"),
+    "aggregated_documentation_score": (
+        "documentation_score",
+        "score",
+        "is_scored",
+    ),
+}
+
+
+def strip_tree_fields_for_viewer(
+    tree: dict[str, dict], compliance_assessment, *, viewer_role: str, user=None
+) -> dict[str, dict]:
+    """Apply the RequirementAssessment serializer's field-visibility rule.
+
+    Tree nodes are hand-built dictionaries rather than serializer output.  Use
+    the same deterministic field resolver as ``RequirementAssessmentReadSerializer``
+    and map only tree-specific derived keys back to their authoritative field.
+    Keys are removed (not nulled), matching the serializer contract.
+    """
+
+    mapping_inferences = []
+
+    def _collect(node: dict) -> None:
+        if isinstance(node.get("mapping_inference"), dict):
+            mapping_inferences.append(node["mapping_inference"])
+        for child in (node.get("children") or {}).values():
+            _collect(child)
+
+    for root in tree.values():
+        _collect(root)
+    mapping_visibility = (
+        get_mapping_inference_visibility_context(user, mapping_inferences)
+        if user is not None and viewer_role == "auditor" and mapping_inferences
+        else None
+    )
+
+    def _strip(node: dict) -> None:
+        children = node.get("children") or {}
+        for child in children.values():
+            _strip(child)
+
+        if "mapping_inference" in node:
+            sanitized_mapping = sanitize_mapping_inference_for_viewer(
+                node.get("mapping_inference"),
+                compliance_assessment,
+                viewer_role=viewer_role,
+                visibility_context=mapping_visibility,
+                target_result=node.get("result"),
+            )
+            if sanitized_mapping is None:
+                node.pop("mapping_inference", None)
+            else:
+                node["mapping_inference"] = sanitized_mapping
+
+        for key in tuple(node):
+            if key == "children":
+                continue
+            policy_fields = _TREE_COMPOSITE_VISIBILITY.get(
+                key, (_TREE_VISIBILITY_ALIASES.get(key, key),)
+            )
+            if not all(
+                is_field_visible_to(compliance_assessment, field, viewer_role)
+                for field in policy_fields
+            ):
+                node.pop(key, None)
+
+    for root in tree.values():
+        _strip(root)
+    return tree
+
+
+def strip_inheritance_overlay_fields_for_viewer(
+    overlay: dict, compliance_assessment, *, viewer_role: str
+) -> dict:
+    """Remove hidden result/score fields from one inheritance overlay."""
+    result_visible = is_field_visible_to(compliance_assessment, "result", viewer_role)
+    score_visible = is_field_visible_to(compliance_assessment, "score", viewer_role)
+    is_scored_visible = is_field_visible_to(
+        compliance_assessment, "is_scored", viewer_role
+    )
+
+    def _strip_entry(entry: dict | None) -> None:
+        if not isinstance(entry, dict):
+            return
+        if not result_visible:
+            entry.pop("result", None)
+        if not score_visible:
+            entry.pop("score", None)
+            entry.pop("raw_score", None)
+            entry.pop("scale", None)
+        if not is_scored_visible:
+            entry.pop("is_scored", None)
+
+    if not result_visible:
+        overlay.pop("effective_result", None)
+    if not score_visible:
+        overlay.pop("effective_score", None)
+        overlay.pop("scale", None)
+    _strip_entry(overlay.get("own"))
+    _strip_entry(overlay.get("source"))
+    for entry in overlay.get("path") or []:
+        _strip_entry(entry)
+    return overlay
+
+
+def strip_inheritance_fields_for_viewer(
+    tree: dict[str, dict], compliance_assessment, *, viewer_role: str
+) -> dict[str, dict]:
+    """Remove hidden result/score fields nested inside tree overlays."""
+
+    def _walk(node: dict) -> None:
+        overlay = node.get("inheritance")
+        if isinstance(overlay, dict):
+            strip_inheritance_overlay_fields_for_viewer(
+                overlay,
+                compliance_assessment,
+                viewer_role=viewer_role,
+            )
+        for child in (node.get("children") or {}).values():
+            _walk(child)
+
+    for root in tree.values():
+        _walk(root)
     return tree
 
 
@@ -1060,8 +1345,18 @@ def assessment_per_status(
         "done": "#46D39A",
         "deprecated": "#E55759",
     }
-    object_ids_view = RoleAssignment.get_viewable_object_ids(user, model)
-    viewable_applied_controls = model.objects.filter(id__in=object_ids_view)
+    if model is ComplianceAssessment:
+        # Assessment-wide status totals are a complete-audit projection. Use
+        # the shared aggregate contract so exact full-view does not silently
+        # override an auditor-side hidden status field or a partial child-row
+        # scope.
+        viewable_applied_controls, _ = _get_compliance_aggregate_scope(
+            user,
+            required_fields=("status",),
+        )
+    else:
+        object_ids_view = RoleAssignment.get_viewable_object_ids(user, model)
+        viewable_applied_controls = model.objects.filter(id__in=object_ids_view)
     undefined_count = viewable_applied_controls.filter(status__isnull=True).count()
     values.append(
         {"value": undefined_count, "itemStyle": {"color": color_map["undefined"]}}
@@ -1108,11 +1403,17 @@ def combined_assessments_per_status(
     ]
 
     for series_name, model in assessment_types:
-        # Get accessible objects
-        object_ids_view = RoleAssignment.get_viewable_object_ids(
-            user, model, scoped_folder
-        )
-        viewable_assessments = model.objects.filter(id__in=object_ids_view)
+        if model is ComplianceAssessment:
+            viewable_assessments, _ = _get_compliance_aggregate_scope(
+                user,
+                scoped_folder.id,
+                required_fields=("status",),
+            )
+        else:
+            object_ids_view = RoleAssignment.get_viewable_object_ids(
+                user, model, scoped_folder
+            )
+            viewable_assessments = model.objects.filter(id__in=object_ids_view)
 
         # Count by status in a single query
         status_counts = dict(
@@ -1425,18 +1726,118 @@ def build_audits_tree_metrics(user):
     return tree
 
 
-def build_audits_stats(user, folder_id=None, object_ids=None):
-    if object_ids is None:
-        scoped_folder = (
-            Folder.objects.get(id=folder_id) if folder_id else Folder.get_root_folder()
+_COMPLIANCE_AGGREGATE_SCOPE_ERROR = (
+    "Compliance aggregates require complete full-view access to every included "
+    "assessment, requirement assessment, and disclosed relationship."
+)
+
+_COMPLIANCE_AGGREGATE_RELATED_MODELS = {
+    "framework": Framework,
+    "folder": Folder,
+    "perimeter": Perimeter,
+}
+
+
+def _get_compliance_aggregate_scope(
+    user: User,
+    folder_id=None,
+    *,
+    object_ids=None,
+    required_fields: tuple[str, ...] = (),
+    required_relations: tuple[str, ...] = (),
+):
+    """Return a complete, full-view assessment scope and its visible RAs.
+
+    Compliance aggregates must never reinterpret a permission-filtered subset
+    of RequirementAssessment rows as a complete audit.  The candidate scope is
+    therefore explicit: assessments that are generically viewable in the
+    requested folder *and* carry the dedicated exact full-view grant.  Within
+    that scope, a hidden authority-bearing field, an independently hidden
+    related object, or even one non-viewable RequirementAssessment fails the
+    whole aggregate closed with HTTP 403 semantics.
+
+    ``object_ids`` is only an additional narrowing hint.  It never bypasses the
+    generic or exact-full gates, which keeps ``build_audits_stats`` safe when it
+    is called directly rather than through ``get_audits_metrics``.
+    """
+
+    unknown_relations = set(required_relations) - set(
+        _COMPLIANCE_AGGREGATE_RELATED_MODELS
+    )
+    if unknown_relations:
+        raise ValueError(
+            f"Unsupported compliance aggregate relations: {sorted(unknown_relations)}"
         )
-        object_ids = RoleAssignment.get_viewable_object_ids(
+
+    scoped_folder = (
+        Folder.objects.get(id=folder_id) if folder_id else Folder.get_root_folder()
+    )
+    candidate_assessments = ComplianceAssessment.objects.filter(
+        id__in=RoleAssignment.get_viewable_object_ids(
             user, ComplianceAssessment, scoped_folder
         )
+    ).filter(id__in=get_full_view_compliance_assessment_ids(user))
+    if object_ids is not None:
+        candidate_assessments = candidate_assessments.filter(id__in=object_ids)
+
+    # Field visibility is stored per assessment and is authoritative at read
+    # time.  Exact-full identifies the auditor projection but does not override
+    # an explicit auditor-side ``hidden`` value.
+    for assessment in candidate_assessments.only("id", "field_visibility"):
+        if any(
+            not is_field_visible_to(assessment, field, "auditor")
+            for field in required_fields
+        ):
+            raise PermissionDenied(_COMPLIANCE_AGGREGATE_SCOPE_ERROR)
+
+    complete_assessments = candidate_assessments
+    for relation in required_relations:
+        related_model = _COMPLIANCE_AGGREGATE_RELATED_MODELS[relation]
+        viewable_related_ids = RoleAssignment.get_viewable_object_ids(
+            user, related_model
+        )
+        relation_filter = Q(**{f"{relation}_id__in": viewable_related_ids})
+        if ComplianceAssessment._meta.get_field(relation).null:
+            relation_filter |= Q(**{f"{relation}_id__isnull": True})
+        complete_assessments = complete_assessments.filter(relation_filter)
+
+    viewable_ra_ids = RoleAssignment.get_viewable_object_ids(
+        user, RequirementAssessment
+    )
+    viewable_requirement_ids = RoleAssignment.get_viewable_object_ids(
+        user, RequirementNode
+    )
+    inaccessible_ra = RequirementAssessment.objects.filter(
+        compliance_assessment_id=OuterRef("pk")
+    ).exclude(
+        id__in=viewable_ra_ids,
+        requirement_id__in=viewable_requirement_ids,
+    )
+    complete_assessments = complete_assessments.annotate(
+        _has_inaccessible_requirement_assessment=Exists(inaccessible_ra)
+    ).filter(_has_inaccessible_requirement_assessment=False)
+
+    # Reject rather than silently dropping an assessment whose related-object
+    # or child-row scope is incomplete.  This comparison also makes the scope
+    # contract observable to API callers as a 403 instead of plausible-looking
+    # partial counts.
+    if candidate_assessments.exclude(id__in=complete_assessments.values("id")).exists():
+        raise PermissionDenied(_COMPLIANCE_AGGREGATE_SCOPE_ERROR)
+
+    visible_requirement_assessments = RequirementAssessment.objects.filter(
+        compliance_assessment_id__in=complete_assessments.values("id"),
+        id__in=viewable_ra_ids,
+    )
+    return complete_assessments, visible_requirement_assessments
+
+
+def _build_audits_stats_from_scope(assessments, requirement_assessments):
+    """Build result buckets from a previously proved complete IAM scope."""
+
     top_audits = list(
-        ComplianceAssessment.objects.filter(id__in=object_ids)
-        .order_by("-updated_at")
-        .only("id", "name", "selected_implementation_groups")[:10]
+        assessments.order_by("-updated_at").only(
+            "id", "name", "selected_implementation_groups"
+        )[:10]
     )
     if not top_audits:
         return {"data": [], "names": [], "uuids": []}
@@ -1452,7 +1853,7 @@ def build_audits_stats(user, folder_id=None, object_ids=None):
         for a in top_audits
     }
     counts_by_audit: dict = {aid: {} for aid in top_ids}
-    ra_qs = RequirementAssessment.objects.filter(
+    ra_qs = requirement_assessments.filter(
         compliance_assessment_id__in=top_ids,
         requirement__assessable=True,
     ).values_list(
@@ -1474,6 +1875,23 @@ def build_audits_stats(user, folder_id=None, object_ids=None):
     names = [a.name for a in top_audits]
     uuids = [a.id for a in top_audits]
     return {"data": data, "names": names, "uuids": uuids}
+
+
+def build_audits_stats(user, folder_id=None, object_ids=None):
+    """Return result buckets for complete, exact-full audit scopes only."""
+
+    assessments, requirement_assessments = _get_compliance_aggregate_scope(
+        user,
+        folder_id,
+        object_ids=object_ids,
+        required_fields=(
+            "name",
+            "result",
+            "selected_implementation_groups",
+            "updated_at",
+        ),
+    )
+    return _build_audits_stats_from_scope(assessments, requirement_assessments)
 
 
 def csf_functions(user, folder_id=None):
@@ -1503,6 +1921,15 @@ def csf_functions(user, folder_id=None):
 
 
 def get_metrics(user: User, folder_id):
+    """Return dashboard metrics within each model's independently proved IAM.
+
+    Compliance counts deliberately use the complete exact-full assessment
+    scope.  They fail closed if any included assessment hides a consumed field,
+    references a non-viewable Framework, or contains even one generically
+    hidden RequirementAssessment.  Other dashboard categories retain their
+    existing per-model scopes.
+    """
+
     def viewable_items(model, folder_id=None):
         scoped_folder = (
             Folder.objects.get(id=folder_id) if folder_id else Folder.get_root_folder()
@@ -1512,12 +1939,19 @@ def get_metrics(user: User, folder_id):
 
     viewable_controls = viewable_items(AppliedControl, folder_id)
     viewable_risk_assessments = viewable_items(RiskAssessment, folder_id)
-    viewable_compliance_assessments = viewable_items(ComplianceAssessment, folder_id)
     viewable_risk_scenarios = viewable_items(RiskScenario, folder_id)
     viewable_threats = viewable_items(Threat, folder_id)
     viewable_risk_acceptances = viewable_items(RiskAcceptance, folder_id)
     viewable_evidences = viewable_items(Evidence, folder_id)
-    viewable_requirement_assessments = viewable_items(RequirementAssessment, folder_id)
+    (
+        viewable_compliance_assessments,
+        viewable_requirement_assessments,
+    ) = _get_compliance_aggregate_scope(
+        user,
+        folder_id,
+        required_fields=("framework", "result", "status"),
+        required_relations=("framework",),
+    )
     controls_count = viewable_controls.count()
     missed_eta_count = (
         viewable_controls.filter(
@@ -1566,26 +2000,34 @@ def get_metrics(user: User, folder_id):
     return data
 
 
-def _compute_progress_by_assessment(assessment_ids: QuerySet[UUID]) -> dict[UUID, int]:
+def _compute_progress_by_assessment(
+    assessments, requirement_assessments
+) -> dict[UUID, int]:
     """
-    Bulk-compute progress (% assessed) for a set of ComplianceAssessment ids,
+    Bulk-compute progress (% assessed) for a complete compliance IAM scope,
     honoring each assessment's selected_implementation_groups. Mirrors the
     .progress property semantics (assessed = result != NOT_ASSESSED OR score
     is not None) but in two queries instead of N heavy prefetched ones.
+
+    Callers must obtain both querysets from
+    ``_get_compliance_aggregate_scope`` with ``result``, ``score`` and
+    ``selected_implementation_groups`` declared as required fields.  Keeping
+    both inputs explicit prevents this low-level aggregator from falling back
+    to raw RequirementAssessment rows.
     """
-    if not assessment_ids.exists():
+
+    assessment_rows = list(
+        assessments.values_list("id", "selected_implementation_groups")
+    )
+    if not assessment_rows:
         return {}
 
-    ig_by_audit = {
-        ca_id: set(igs) if igs else None
-        for ca_id, igs in ComplianceAssessment.objects.filter(
-            id__in=assessment_ids
-        ).values_list("id", "selected_implementation_groups")
-    }
+    ig_by_audit = {ca_id: set(igs) if igs else None for ca_id, igs in assessment_rows}
+    assessment_ids = tuple(ig_by_audit)
 
     totals = {aid: 0 for aid in assessment_ids}
     assessed = {aid: 0 for aid in assessment_ids}
-    rows = RequirementAssessment.objects.filter(
+    rows = requirement_assessments.filter(
         compliance_assessment_id__in=assessment_ids,
         requirement__assessable=True,
     ).values_list(
@@ -1609,17 +2051,28 @@ def _compute_progress_by_assessment(assessment_ids: QuerySet[UUID]) -> dict[UUID
 
 
 def get_audits_metrics(user: User, folder_id=None):
-    scoped_folder = (
-        Folder.objects.get(id=folder_id) if folder_id else Folder.get_root_folder()
+    """Return result/progress metrics for a complete exact-full audit scope."""
+
+    assessments, requirement_assessments = _get_compliance_aggregate_scope(
+        user,
+        folder_id,
+        required_fields=(
+            "name",
+            "result",
+            "score",
+            "selected_implementation_groups",
+            "updated_at",
+        ),
     )
-    object_ids = RoleAssignment.get_viewable_object_ids(
-        user, ComplianceAssessment, scoped_folder
+    progresses = list(
+        _compute_progress_by_assessment(assessments, requirement_assessments).values()
     )
-    progresses = list(_compute_progress_by_assessment(object_ids).values())
     progress_avg = math.ceil(mean(progresses)) if progresses else 0
     return {
         "progress_avg": progress_avg,
-        "audits_stats": build_audits_stats(user, folder_id, object_ids=object_ids),
+        "audits_stats": _build_audits_stats_from_scope(
+            assessments, requirement_assessments
+        ),
     }
 
 
@@ -1654,19 +2107,29 @@ def get_compliance_analytics(user: User, folder_id=None):
     }
     """
 
-    def viewable_items[T: models.Model](model: type[T], folder_id=None) -> QuerySet[T]:
-        scoped_folder = (
-            Folder.objects.get(id=folder_id) if folder_id else Folder.get_root_folder()
+    viewable_assessments, viewable_requirement_assessments = (
+        _get_compliance_aggregate_scope(
+            user,
+            folder_id,
+            required_fields=(
+                "folder",
+                "framework",
+                "name",
+                "perimeter",
+                "result",
+                "score",
+                "selected_implementation_groups",
+                "status",
+            ),
+            required_relations=("framework", "folder", "perimeter"),
         )
-        object_ids = RoleAssignment.get_viewable_object_ids(user, model, scoped_folder)
-        return model.objects.filter(id__in=object_ids)
-
-    viewable_assessments = viewable_items(
-        ComplianceAssessment, folder_id
-    ).select_related("framework", "folder", "perimeter")
+    )
+    viewable_assessments = viewable_assessments.select_related(
+        "framework", "folder", "perimeter"
+    )
 
     progress_by_id = _compute_progress_by_assessment(
-        viewable_assessments.values_list("id", flat=True)
+        viewable_assessments, viewable_requirement_assessments
     )
 
     framework_data = {}

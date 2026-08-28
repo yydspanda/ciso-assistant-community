@@ -33,6 +33,36 @@ logging.config.dictConfig(settings.LOGGING)
 logger = structlog.getLogger(__name__)
 
 
+@task()
+def deliver_requirement_assignment_mail(outbox_id):
+    """Deliver one durable assignment-mail intent after a CAS claim."""
+
+    from core.assignment_mailing import deliver_requirement_assignment_mail_outbox
+
+    return deliver_requirement_assignment_mail_outbox(outbox_id)
+
+
+@db_periodic_task(crontab(minute="*/5"))
+def sweep_requirement_assignment_mail_outbox():
+    """Re-enqueue committed rows missed during the transaction/queue window."""
+
+    from core.assignment_mailing import (
+        fail_stale_requirement_assignment_mail_claims,
+        get_due_requirement_assignment_mail_ids,
+    )
+
+    stale_claims = fail_stale_requirement_assignment_mail_claims()
+    if stale_claims:
+        logger.warning(
+            "requirement_assignment_mail_claims_timed_out",
+            count=stale_claims,
+        )
+    outbox_ids = get_due_requirement_assignment_mail_ids()
+    for outbox_id in outbox_ids:
+        deliver_requirement_assignment_mail(str(outbox_id))
+    return len(outbox_ids)
+
+
 # @db_periodic_task(crontab(minute="*/1"))  # for testing
 @db_periodic_task(crontab(hour="6", minute="0"))
 def check_controls_with_expired_eta():

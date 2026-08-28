@@ -500,7 +500,7 @@ class TestBestMappingInferences:
         )
 
         inferences, best_path = engine.best_mapping_inferences(
-            source, "urn:fw:A", "urn:fw:C"
+            source, "urn:fw:A", "urn:fw:C", authorization=None
         )
 
         assert best_path == ["urn:fw:A", "urn:fw:B", "urn:fw:C"]
@@ -576,7 +576,7 @@ class TestBestMappingInferences:
         )
 
         inferences, best_path = engine.best_mapping_inferences(
-            source, "urn:fw:A", "urn:fw:C"
+            source, "urn:fw:A", "urn:fw:C", authorization=None
         )
 
         assert best_path == ["urn:fw:A", "urn:fw:B", "urn:fw:C"]
@@ -650,7 +650,11 @@ class TestBestMappingInferences:
         )
 
         inferences, best_path = engine.best_mapping_inferences(
-            source, "urn:fw:A", "urn:fw:D", max_depth=3
+            source,
+            "urn:fw:A",
+            "urn:fw:D",
+            max_depth=3,
+            authorization=None,
         )
 
         assert best_path == ["urn:fw:A", "urn:fw:C", "urn:fw:D"]

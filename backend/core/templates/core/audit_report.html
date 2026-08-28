@@ -139,18 +139,16 @@
     <hr class="dotted">
     <div class="flex flex-row space-x-4 justify-center items-center mb-4">
         <h1 class='text-3xl'>{{ compliance_assessment.name }}: {{ compliance_assessment.framework }}</h1>
-        {% with scores=compliance_assessment.get_global_score %}
-        {% if scores.maturity_score > -1 %}
-            <p class='font-semibold'>{% trans "Score:" %}</p> <span class="font-semibold">{{ scores.maturity_score|floatformat }}</span>
+        {% if global_score.maturity_score > -1 %}
+            <p class='font-semibold'>{% trans "Score:" %}</p> <span class="font-semibold">{{ global_score.maturity_score|floatformat }}</span>
         {% endif %}
-        {% endwith %}
         {% bar_graph assessments ancestors %}
     </div>
     <div class="flex flex-row space-x-4 mb-4">
         <div>
             <p class='font-semibold'>{% trans "Authors "%}</p>
             <ul>
-                {% for author in compliance_assessment.authors.all %}
+                {% for author in authors %}
                     <li>{{ author }}</li>
                 {% endfor %}
             </ul>
@@ -158,7 +156,7 @@
         <div>
             <p class='font-semibold'>{%trans "Reviewers" %}</p>
             <ul>
-                {% for group in compliance_assessment.reviewers.all %}
+                {% for group in reviewers %}
                     <li>{{ group }}</li>
                 {% endfor %}
             </ul>

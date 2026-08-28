@@ -5,13 +5,17 @@ instead of the display name when the referenced framework was not imported
 (present only as a StoredLibrary, not as a Framework object).
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from core.models import StoredLibrary
 from core.serializers import RequirementMappingSetReadSerializer
+from iam.models import Folder, User
 
 
 def _make_framework_library(urn, name):
+    Folder._init_root_folder()
     return StoredLibrary.objects.create(
         urn=urn,
         name=name,
@@ -19,6 +23,7 @@ def _make_framework_library(urn, name):
         locale="en",
         hash_checksum=name,
         content={"framework": {"urn": urn, "name": name}},
+        folder=Folder.get_root_folder(),
     )
 
 
@@ -54,6 +59,20 @@ class TestRequirementMappingSetFrameworkName:
         """No library and no map entry: str equals urn (frameworks_available=False)."""
         urn = "urn:test:risk:framework:missing"
         serializer = RequirementMappingSetReadSerializer()
+        assert serializer._framework_info(urn) == {"str": urn, "urn": urn}
+
+    def test_request_path_does_not_resolve_hidden_library_name(self):
+        """A request cannot use the trusted no-request library fallback."""
+        urn = "urn:test:risk:framework:hidden-library-only"
+        _make_framework_library(urn, "Hidden Framework Name")
+        user = User.objects.create_user("mapping-name-no-access@example.com")
+        user.folder = Folder.get_root_folder()
+        user.save(update_fields=["folder"])
+
+        serializer = RequirementMappingSetReadSerializer(
+            context={"request": SimpleNamespace(user=user)}
+        )
+
         assert serializer._framework_info(urn) == {"str": urn, "urn": urn}
 
     def test_get_source_and_target_framework(self):

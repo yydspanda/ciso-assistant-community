@@ -24,10 +24,16 @@ Event Trigger (serializer / periodic cron)
         |
         v
   django.core.mail.send_mail()
-  - Primary server -> Rescue server (fallback)
+  - Primary server -> Rescue server (fallback on generic mail paths)
 ```
 
-There is **no notification model** in the database. Notifications are fire-and-forget emails. Frontend toast notifications are independent and handled client-side only.
+Most notifications are fire-and-forget emails and have no notification model in
+the database. Requirement-assignment activation mail is the exception: it uses
+`RequirementAssignmentMailOutbox` as a durable delivery intent. That path does
+not immediately fall back to the rescue SMTP host after a primary failure,
+because the primary server may already have accepted the message. The intent is
+marked failed for explicit operator review instead of risking a duplicate send.
+Frontend toast notifications are independent and handled client-side only.
 
 ---
 
@@ -80,6 +86,7 @@ Worker command: `uv run python manage.py run_huey -w 2 -k process`
 | File | Role |
 |------|------|
 | `backend/core/tasks.py` | All Huey tasks: periodic crons + async notification senders |
+| `backend/core/assignment_mailing.py` | Durable requirement-assignment activation outbox and single-attempt delivery |
 | `backend/core/email_utils.py` | Template loading, rendering, formatting helpers |
 | `backend/core/serializers.py` | Where assignment notifications are triggered (in serializer `create`/`update`) |
 | `backend/iam/models.py` | `User.mailing()` for password reset / welcome emails |

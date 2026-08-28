@@ -46,6 +46,7 @@ def merge_requirement(
     is_full_coverage,
     same_framework,
     allowed_scalars=None,
+    allowed_m2m=None,
     observation_allowed=True,
 ):
     """Merge one source RA into one target RA, in memory.
@@ -96,13 +97,20 @@ def merge_requirement(
     if is_full_coverage or same_framework:
         m2m_fields += ["evidences", "security_exceptions"]
     for m2m_field in m2m_fields:
+        if allowed_m2m is not None and m2m_field not in allowed_m2m:
+            continue
         new_ids = set(source_ra.get(m2m_field, [])) - set(current.get(m2m_field, []))
         if new_ids:
             m2m_added[m2m_field] = len(new_ids)
 
-    # Carry the new mapping_inference (cross-framework only) so the RA is
-    # included in merged_target -- this is what gates the M2M apply step.
-    if not same_framework and source_ra.get("mapping_inference"):
+    # Carry provenance only when an authorized target value or relationship
+    # actually changes. Read-only target fields must not be used as a side
+    # door for a provenance-only write.
+    if (
+        (field_changes or m2m_added)
+        and not same_framework
+        and source_ra.get("mapping_inference")
+    ):
         merged_fields["mapping_inference"] = source_ra["mapping_inference"]
 
     return merged_fields, field_changes, m2m_added
@@ -127,7 +135,13 @@ def map_from_sources(urn, source_ra, same_framework):
     ]
 
 
-def compute_map_from_merge(target_audit, source_audit):
+def compute_map_from_merge(
+    target_audit,
+    source_audit,
+    *,
+    user,
+    mapping_authorization,
+):
     """
     Compute the merge of source audit data into a target audit.
 
@@ -143,13 +157,14 @@ def compute_map_from_merge(target_audit, source_audit):
     Returns (None, None, None, None) when no mapping path exists.
     """
     from core.mappings.engine import engine
+    from core.utils import is_field_editable_by
     from core.views import get_mapping_max_depth
 
     source_urn = source_audit.framework.urn
     dest_urn = target_audit.framework.urn
     origin_fw_id = str(source_audit.framework_id)
 
-    audit_from_results = engine.load_audit_fields(source_audit)
+    audit_from_results = engine.load_audit_fields(source_audit, user=user)
 
     same_framework = source_audit.framework_id == target_audit.framework_id
 
@@ -158,25 +173,37 @@ def compute_map_from_merge(target_audit, source_audit):
     else:
         max_depth = get_mapping_max_depth()
         mapped_results, _ = engine.best_mapping_inferences(
-            audit_from_results, source_urn, dest_urn, max_depth
+            audit_from_results,
+            source_urn,
+            dest_urn,
+            max_depth,
+            authorization=mapping_authorization,
         )
 
     if not mapped_results or not mapped_results.get("requirement_assessments"):
         return None, None, None, None
 
-    target_data = engine.load_audit_fields(target_audit)
+    target_data = engine.load_audit_fields(target_audit, user=user)
     target_ras = target_data.get("requirement_assessments", {})
 
-    # Only merge fields visible on both audits: the source must expose
-    # the data and the target must accept it.
+    # Source data must be readable; the corresponding target field must be
+    # editable. Full-view is read authority and does not override a target's
+    # auditor read-only policy.
     allowed_scalars = {
         f
         for f in SCALAR_DEFAULTS
-        if source_audit._auditor_visible(f) and target_audit._auditor_visible(f)
+        if source_audit._auditor_visible(f)
+        and is_field_editable_by(target_audit, f, "auditor")
     }
     observation_allowed = source_audit._auditor_visible(
         "observation"
-    ) and target_audit._auditor_visible("observation")
+    ) and is_field_editable_by(target_audit, "observation", "auditor")
+    allowed_m2m = {
+        field
+        for field in ("applied_controls", "evidences", "security_exceptions")
+        if source_audit._auditor_visible(field)
+        and is_field_editable_by(target_audit, field, "auditor")
+    }
 
     merged_target = {}
     merge_details = []
@@ -193,6 +220,7 @@ def compute_map_from_merge(target_audit, source_audit):
             is_full_coverage=is_full,
             same_framework=same_framework,
             allowed_scalars=allowed_scalars,
+            allowed_m2m=allowed_m2m,
             observation_allowed=observation_allowed,
         )
         meaningful = bool(field_changes) or bool(m2m_added)

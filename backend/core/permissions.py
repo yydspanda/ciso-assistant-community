@@ -40,24 +40,42 @@ class RBACPermissions(permissions.DjangoObjectPermissions):
         perms = self.get_required_permissions(request.method, type(obj))
         if not perms:
             return False
-        _codename = perms[0].split(".")[1]
+        default_codename = perms[0].split(".")[1]
+        _codename = default_codename
+        permission_app_label = type(obj)._meta.app_label
+        permission_model = type(obj)._meta.model_name
 
         # Check for view action permission overrides
         current_action = getattr(view, "action", None)
 
         if current_action:
             permission_overrides = getattr(view, "permission_overrides", {})
-            _codename = permission_overrides.get(current_action, _codename)
+            override = permission_overrides.get(current_action)
+            if override:
+                if "." in override:
+                    permission_app_label, _codename = override.split(".", 1)
+                    permission_model = None
+                else:
+                    _codename = override
+                    permission_app_label = None
+                    permission_model = None
 
-        perm = Permission.objects.get(codename=_codename)
+        permission_filter = {"codename": _codename}
+        if permission_app_label is not None:
+            permission_filter["content_type__app_label"] = permission_app_label
+        if permission_model is not None:
+            permission_filter["content_type__model"] = permission_model
+        perm = Permission.objects.get(**permission_filter)
 
         # any user is allowed to view itself
         if obj == request.user and perm.codename == "view_user":
             return True
 
         # for view, use is_object_readable to implement is_published correctly
-        if request.method in ["GET", "OPTIONS", "HEAD"] and getattr(
-            obj, "is_published", False
+        if (
+            request.method in ["GET", "OPTIONS", "HEAD"]
+            and getattr(obj, "is_published", False)
+            and _codename == default_codename
         ):
             return RoleAssignment.is_object_readable(request.user, type(obj), obj.id)
 
