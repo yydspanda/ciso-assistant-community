@@ -2,6 +2,7 @@
 	import type { PageData } from './$types';
 	import { safeTranslate } from '$lib/utils/i18n';
 	import { m } from '$paraglide/messages';
+	import { ctaModeForAudit, hasDisplayableProgress } from './dashboard-card';
 
 	interface Props {
 		data: PageData;
@@ -33,27 +34,25 @@
 		changes_requested: () => m.assignmentStatusChangesRequested()
 	};
 
-	function getCtaLabel(audit: { assignment_status?: string; progress_percent: number }): string {
-		switch (audit.assignment_status) {
-			case 'draft':
+	function getCtaLabel(audit: PageData['dashboard'][number]): string {
+		switch (ctaModeForAudit(audit)) {
+			case 'awaiting-start':
 				return m.assignmentAwaitingStart();
-			case 'submitted':
-			case 'closed':
+			case 'start':
+				return m.startAssessment();
+			case 'review':
 				return m.reviewResponses();
-			case 'in_progress':
-			case 'changes_requested':
-				return audit.progress_percent === 0 ? m.startAssessment() : m.continueAssessment();
 			default:
-				return audit.progress_percent === 0 ? m.startAssessment() : m.continueAssessment();
+				return m.continueAssessment();
 		}
 	}
 
-	function isCtaDisabled(audit: { assignment_status?: string }): boolean {
-		return audit.assignment_status === 'draft';
+	function isCtaDisabled(audit: PageData['dashboard'][number]): boolean {
+		return ctaModeForAudit(audit) === 'awaiting-start';
 	}
 
-	function isCtaReadOnly(audit: { assignment_status?: string }): boolean {
-		return audit.assignment_status === 'submitted' || audit.assignment_status === 'closed';
+	function isCtaReadOnly(audit: PageData['dashboard'][number]): boolean {
+		return ctaModeForAudit(audit) === 'review';
 	}
 
 	// Group audits by folder (domain)
@@ -128,19 +127,28 @@
 									class="flex justify-between items-baseline text-xs text-surface-500-500 mb-1.5"
 								>
 									<span>{m.progress()}</span>
-									<span class="font-semibold text-surface-700-300 tabular-nums"
-										>{audit.assessed_requirements}/{audit.total_requirements}</span
-									>
+									{#if hasDisplayableProgress(audit)}
+										<span class="font-semibold text-surface-700-300 tabular-nums"
+											>{audit.assessed_requirements}/{audit.total_requirements}</span
+										>
+									{:else}
+										<span
+											class="font-medium text-surface-500-500"
+											title={m.informationNotAvailable()}>{m.undefined()}</span
+										>
+									{/if}
 								</div>
-								<div class="w-full bg-surface-100-900 rounded-full h-2 overflow-hidden">
-									<div
-										class="h-2 rounded-full transition-all duration-500 ease-out"
-										style="width: {audit.progress_percent}%; background: linear-gradient(90deg, var(--color-primary-500), var(--color-primary-400));"
-									></div>
-								</div>
-								<p class="text-[11px] text-surface-400-600 mt-1 tabular-nums">
-									{audit.progress_percent}%
-								</p>
+								{#if hasDisplayableProgress(audit)}
+									<div class="w-full bg-surface-100-900 rounded-full h-2 overflow-hidden">
+										<div
+											class="h-2 rounded-full transition-all duration-500 ease-out"
+											style="width: {audit.progress_percent}%; background: linear-gradient(90deg, var(--color-primary-500), var(--color-primary-400));"
+										></div>
+									</div>
+									<p class="text-[11px] text-surface-400-600 mt-1 tabular-nums">
+										{audit.progress_percent}%
+									</p>
+								{/if}
 							</div>
 
 							{#if isCtaDisabled(audit)}

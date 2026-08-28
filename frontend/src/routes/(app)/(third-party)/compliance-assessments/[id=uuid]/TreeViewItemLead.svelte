@@ -83,7 +83,7 @@
 						: 0}
 					min={0}
 					max={100}
-					data-testid="progress-ring-svg"
+					data-testid="tree-item-score-progress-ring"
 				>
 					<Progress.Circle class="[--size:--spacing(12)]">
 						<Progress.CircleTrack />

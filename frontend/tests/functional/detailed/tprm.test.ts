@@ -238,10 +238,14 @@ test('third-party representative can fill their assigned audit', async ({
 	});
 
 	await test.step('third party representative can open their assigned audit', async () => {
-		await expect(
-			page.getByRole('heading', { name: entityAssessment.name, exact: true })
-		).toBeVisible();
-		await page.getByRole('link', { name: m.startAssessment() }).first().click();
+		const assignedAuditCard = page.locator('.audit-card').filter({
+			has: page.getByRole('heading', { name: entityAssessment.name, exact: true })
+		});
+		await expect(assignedAuditCard).toBeVisible();
+		const assignmentLink = assignedAuditCard.locator('a[href^="/auditee-assessments/"]');
+		await expect(assignmentLink).toBeVisible();
+		await expect(assignmentLink).toHaveAttribute('href', /^\/auditee-assessments\/[0-9a-f-]+$/);
+		await assignmentLink.click();
 		await page.waitForURL('/auditee-assessments/**');
 	});
 

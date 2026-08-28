@@ -222,8 +222,6 @@ class TestComplianceAssessmentsAuthenticated:
                         {"id": str(rc["id"]), "str": rc["str"], "urn": rc["urn"]}
                         for rc in Framework.objects.all()[0].reference_controls
                     ],
-                    "min_score": Framework.objects.all()[0].min_score,
-                    "max_score": Framework.objects.all()[0].max_score,
                     "ref_id": str(Framework.objects.all()[0].ref_id),
                     "has_update": False,
                 },
@@ -400,7 +398,13 @@ class TestComplianceAssessmentListProgress:
         audit = _make_audit(
             Folder.get_root_folder(),
             framework,
-            field_visibility=_content_mode(hide=["result"]),
+            field_visibility={
+                **_content_mode(hide=["result"]),
+                # The caller-aware projector must never infer progress from a
+                # hidden score. Make this a genuine score-only audit instead
+                # of relying on the legacy optimized pre-pass behavior.
+                "score": {"auditor": "read", "respondent": "hidden"},
+            },
         )
         audit.create_requirement_assessments()
 
@@ -839,7 +843,20 @@ class TestComplianceAssessmentDetailActionAuthorization:
         domain = Folder.objects.create(
             name="idor-domain", parent_folder=Folder.get_root_folder()
         )
-        audit = _make_audit(domain, framework)
+        audit = _make_audit(
+            domain,
+            framework,
+            field_visibility={
+                field_name: {"auditor": "read", "respondent": "hidden"}
+                for field_name in (
+                    "status",
+                    "result",
+                    "score",
+                    "is_scored",
+                    "answers",
+                )
+            },
+        )
         audit.create_requirement_assessments()
         HistoricalMetric.objects.create(
             model="ComplianceAssessment",
@@ -878,6 +895,27 @@ class TestComplianceAssessmentDetailActionAuthorization:
         # Snapshots are date-ordered; creating the audit auto-records one for
         # today, so only pin the synthetic (oldest) point.
         assert resp.json()["data"][0] == ["2026-01-01", 42]
+
+    @pytest.mark.parametrize(
+        "field_name", ("status", "result", "score", "is_scored", "answers")
+    )
+    def test_progress_ts_rejects_hidden_authority_field(
+        self, authenticated_client, audit, field_name
+    ):
+        audit.field_visibility = {
+            **audit.field_visibility,
+            field_name: {"auditor": "hidden", "respondent": "hidden"},
+        }
+        audit.save(update_fields=["field_visibility"])
+
+        resp = authenticated_client.get(
+            f"/api/compliance-assessments/{audit.id}/progress_ts/"
+        )
+
+        assert resp.status_code == status.HTTP_403_FORBIDDEN
+        assert resp.json() == {
+            "detail": "Complete audit data is unavailable for this caller."
+        }
 
     def test_unknown_audit_is_404(self, authenticated_client):
         """Nonexistent UUIDs must 404: `frameworks` used to raise a bare
