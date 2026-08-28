@@ -27,7 +27,7 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
 | Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
 | Production acceptance | Legal, privacy, security, records, audit, operations, and production acceptance have not been performed. |
-| Hosted project governance | PRs #1-#3 landed through protected `main`; PR #4 is the active upstream-reconciliation candidate. The active no-bypass ruleset has no bypass actors, requires the GitHub-Actions-sourced `validate-project-governance` check, and keeps the weekly read-only upstream monitor explicitly enabled. |
+| Hosted project governance | PRs #1-#3 landed through protected `main`; PR #4 is the active upstream-reconciliation candidate. Its first complete updated-head matrix exposed bounded API-contract and frontend-locator defects; the local remediation is committed and awaiting an exact-head rerun. The active no-bypass ruleset has no bypass actors, requires the GitHub-Actions-sourced `validate-project-governance` check, and keeps the weekly read-only upstream monitor explicitly enabled. |
 
 ## Current verification summary
 
@@ -105,6 +105,37 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   one-shot version checker failed because it still names removed path
   `ciso_assistant/VERSION`; this stale, non-required check also failed on prior
   PR opening heads and is not accepted as candidate evidence.
+- Exact PR #4 head `d80ddfd3e` completed 174 GitHub check runs: 162 succeeded
+  and 12 failed. Required governance run `33146149863` / job `98767531521`
+  passed. The failures were four API jobs across identical SQLite/PostgreSQL
+  failure sets and eight Community/Enterprise functional jobs across TPRM,
+  visibility-effects, mappings, and compliance-assessment scenarios.
+- Remediation commit `ab1f3b5a6` keeps the caller-aware field projector and
+  five-field complete-audit guard fail-closed. It updates stale API expectations
+  without changing production backend/IAM behavior, makes unavailable dashboard
+  progress explicit instead of coercing it to zero, isolates repeated tree score
+  rings from page-level progress locators, and scopes functional locators to a
+  visible/identified owner. The two API files passed 59 and 84 tests; three
+  related IAM/projection suites passed 31 tests. Frontend validation passed 16
+  focused and 293 complete tests, Community and Enterprise builds, scoped
+  Prettier/pre-commit, and the unchanged historical `svelte-check` baseline of
+  2396 errors / 821 warnings / 508 files. Local PostgreSQL was not rerun because
+  production backend behavior did not change; the exact hosted SQLite and
+  PostgreSQL jobs remain the release evidence.
+- A mandatory pre-push fetch then advanced canonical upstream from `9aac30df8`
+  to `b38b72d8f`. Pure merge `76f96a844` has parents `ab1f3b5a6` and
+  `b38b72d8f`; its tree `209a2d2e28dc8cf87af48ba23c9a5b6d123dfd5b`
+  exactly matches the independently computed merge-tree. The upstream change
+  centralises existing safe YAML reads on `CSafeLoader`, with `SafeLoader`
+  fallback. Direct validation parsed all 293 built-in YAML files and rejected
+  an unsafe Python tag; 23 knowledge-graph tests passed. Artifact validation and
+  25 tests plus 12 subtests passed; project governance passed at 263 lines with
+  58 tests plus 55 subtests. A 13-test database-backed loader set
+  was collected but did not leave the repository's migration setup within the
+  three-minute local bound, so no result is claimed for library/document/email
+  imports; the hosted backend matrix remains that gate. No local performance
+  claim was evaluated. This is functional validation, not a model/config/data
+  experiment.
 
 ## Current limitations and risks
 
@@ -131,14 +162,13 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 9. **Only local synthetic PostgreSQL evidence exists.** Representative plans,
    complete upstream-table privileges, production topology, monitoring,
    encryption/key custody, PITR/RPO/RTO, and operations approval remain open.
-10. **The local drift gate is restored; hosted merge authority remains.** A
-    fresh fetch on 2026-08-28 resolved canonical upstream to `9aac30df8` and
-    fork `main` to `d1ff1e461`; code merge `9b8ecfd98` measures 23 ahead / 0
-    behind. The two fork-only governance records for opening and monitoring the
-    protected PR make the updated branch 25 ahead / 0 behind. The task remains
-    active until that exact branch passes the full protected-PR matrix and lands
-    without bypass. The weekly monitor must keep measuring a freshly fetched
-    remote after merge.
+10. **The local drift gate is restored; hosted merge authority remains.** The
+    mandatory pre-push fetch on 2026-08-28 resolved canonical upstream to
+    `b38b72d8f` and fork `main` to `d1ff1e461`. Pure merge `76f96a844` makes the
+    current code tree 27 ahead / 0 behind; this factual ledger commit makes the
+    updated PR candidate 28 ahead / 0 behind. The task remains active until that
+    exact branch passes the full protected-PR matrix and lands without bypass.
+    The weekly monitor must keep measuring a freshly fetched remote after merge.
 11. **Inherited workflow activation still needs an owner policy.** Opening PR #1
     registered inherited validation workflows as well as the three fork jobs.
     The write-scoped CLA and OIDC/security-events Plumber workflows were
@@ -172,15 +202,15 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 ## Current next action
 
 Complete the upstream-reconciliation task without bypassing the protected-main
-gate: push this factual PR-gate update, then monitor every job triggered for the
-exact updated PR #4 head. Investigate and remediate any candidate failure; merge
-only when the required governance check and the complete current-head matrix
-pass under the no-bypass ruleset. Re-fetch and remeasure canonical upstream
-before merge if it advances. Do not mix target-environment work or new product
-features into this reconciliation. After protected merge, add the canonical
-completed record and return the product pointer to
-`CFGRC-P1-TARGET-ACCEPTANCE`; that charter remains blocked on named operations,
-security, privacy, records, legal, and audit owners.
+gate: commit and push this factual validation update, then monitor every job
+triggered for the exact updated PR #4 head. Investigate and remediate any
+candidate failure; merge only when the required governance check and the
+complete current-head matrix pass under the no-bypass ruleset. Re-fetch and
+remeasure canonical upstream before merge if it advances. Do not mix target-
+environment work or new product features into this reconciliation. After
+protected merge, add the canonical completed record and return the product
+pointer to `CFGRC-P1-TARGET-ACCEPTANCE`; that charter remains blocked on named
+operations, security, privacy, records, legal, and audit owners.
 
 ## Active task board
 
