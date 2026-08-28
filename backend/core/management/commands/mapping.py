@@ -116,7 +116,9 @@ class Command(BaseCommand):
             print("\n🌿 Optimized paths (with dynamic pruning):\n")
             all_paths = []
             for source in engine.framework_mappings:
-                for path in engine.all_paths_from(source, max_depth=max_depth):
+                for path in engine.all_paths_from(
+                    source, max_depth=max_depth, authorization=None
+                ):
                     if len(path) > 1:
                         all_paths.append(path)
 
@@ -174,7 +176,11 @@ class Command(BaseCommand):
 
                     start_time = time.time()
                     best_results, best_path = engine.best_mapping_inferences(
-                        audit_from_results, source_urn, dest_urn, max_depth
+                        audit_from_results,
+                        source_urn,
+                        dest_urn,
+                        max_depth,
+                        authorization=None,
                     )
                     elapsed_ms = (time.time() - start_time) * 1000
 

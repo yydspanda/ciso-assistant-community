@@ -30,7 +30,7 @@
 
 	import DonutChart from '$lib/components/Chart/DonutChart.svelte';
 	import RingProgress from '$lib/components/DataViz/RingProgress.svelte';
-	import { URL_MODEL_MAP, getModelInfo, getMarkdownFields } from '$lib/utils/crud';
+	import { URL_MODEL_MAP, getMarkdownFields } from '$lib/utils/crud';
 	import type { Node } from './types';
 
 	import { safeTranslate } from '$lib/utils/i18n';
@@ -86,9 +86,13 @@
 			object: data.compliance_assessment
 		});
 
-	const viewerRole: 'auditor' | 'respondent' = page.data.user.is_third_party
-		? 'respondent'
-		: 'auditor';
+	// The backend classifies the caller from object-level IAM and respondent
+	// assignments. User account type alone cannot distinguish an internal
+	// respondent from an auditor, so missing or unexpected data fails closed.
+	const viewerRole: 'auditor' | 'respondent' = $derived(
+		data.viewerRole === 'auditor' ? 'auditor' : 'respondent'
+	);
+	const isAuditor = $derived(viewerRole === 'auditor');
 	const fieldVis = $derived(getFieldVisibility(compliance_assessment, viewerRole));
 	const showAnswers = $derived(fieldVis.showAnswers);
 	const showResult = $derived(fieldVis.showResult);
@@ -96,7 +100,7 @@
 	const showStatus = $derived(fieldVis.showStatus);
 	const showScore = $derived(fieldVis.showScore);
 
-	const has_threats = data.threats.total_unique_threats > 0;
+	const has_threats = $derived(isAuditor && (data.threats?.total_unique_threats ?? 0) > 0);
 
 	const objectsNotVisibleLabel = (count: number): string => {
 		return m.objectsNotVisible({ count });
@@ -128,7 +132,7 @@
 	function handleKeydown(event: KeyboardEvent) {
 		if (event.metaKey || event.ctrlKey) return;
 		if (document.activeElement?.tagName !== 'BODY') return; // otherwise it will interfere with input fields
-		if (event.key === 'f') {
+		if (event.key === 'f' && isAuditor) {
 			event.preventDefault();
 			goto(`${page.url.pathname}/flash-mode`);
 		}
@@ -188,6 +192,8 @@
 	let selectedStatus = $state([]);
 	let selectedResults = $state([]);
 	let selectedExtendedResults = $state([]);
+	let selectedControlCoverage = $state([]);
+	let selectedEvidenceCoverage = $state([]);
 	let displayOnlyAssessableNodes = $state(false);
 	$effect(
 		() =>
@@ -195,6 +201,8 @@
 				selectedStatus = [],
 				selectedResults = [],
 				selectedExtendedResults = [],
+				selectedControlCoverage = [],
+				selectedEvidenceCoverage = [],
 				displayOnlyAssessableNodes = false
 			} = $currentFilters)
 	);
@@ -222,15 +230,31 @@
 		auditFiltersStore.setExtendedResults(page.params.id, selectedExtendedResults);
 	}
 
+	function toggleControlCoverage(coverage) {
+		selectedControlCoverage = toggleItem(coverage, selectedControlCoverage);
+		auditFiltersStore.setControlCoverage(page.params.id, selectedControlCoverage);
+	}
+
+	function toggleEvidenceCoverage(coverage) {
+		selectedEvidenceCoverage = toggleItem(coverage, selectedEvidenceCoverage);
+		auditFiltersStore.setEvidenceCoverage(page.params.id, selectedEvidenceCoverage);
+	}
+
 	function isNodeHidden(node: Node, displayOnlyAssessableNodes: boolean): boolean {
 		const hasAssessableChildren = Object.keys(node.children || {}).length > 0;
+		const controlCoverage = node.has_applied_controls ? 'with' : 'without';
+		const evidenceCoverage = node.has_evidence ? 'with' : 'without';
 		return (
 			(displayOnlyAssessableNodes && !node.assessable && !hasAssessableChildren) ||
 			(node.assessable &&
 				((selectedStatus.length > 0 && !selectedStatus.includes(node.status)) ||
 					(selectedResults.length > 0 && !selectedResults.includes(node.result)) ||
 					(selectedExtendedResults.length > 0 &&
-						!selectedExtendedResults.includes(node.extended_result))))
+						!selectedExtendedResults.includes(node.extended_result)) ||
+					(selectedControlCoverage.length > 0 &&
+						!selectedControlCoverage.includes(controlCoverage)) ||
+					(selectedEvidenceCoverage.length > 0 &&
+						!selectedEvidenceCoverage.includes(evidenceCoverage))))
 		);
 	}
 	function transformToTreeView(nodes: Node[], hasParentNode: boolean = false) {
@@ -284,14 +308,14 @@
 	}
 	let treeViewNodes: TreeViewNode[] = $state();
 
-	function assessableNodesCount(nodes: TreeViewNode[]): number {
+	function assessableNodesCount(nodes: TreeViewNode[], onlyVisible = false): number {
 		let count = 0;
 		for (const node of nodes) {
-			if (node.contentProps.assessable) {
+			if (node.contentProps.assessable && !(onlyVisible && node.contentProps.hidden)) {
 				count++;
 			}
 			if (node.children) {
-				count += assessableNodesCount(node.children);
+				count += assessableNodesCount(node.children, onlyVisible);
 			}
 		}
 		return count;
@@ -390,7 +414,6 @@
 	function buildExportGroups(): ExportGroup[] {
 		const ca = data.compliance_assessment;
 		const id = ca.id;
-		const isInternal = !page.data.user.is_third_party;
 		const frameworkUrn = ca.framework?.urn ?? '';
 		// CyFun stays exact: backend cyfun_xlsx (views.py) hardcodes the 2025
 		// sheet layout, so other versions would 400. Bump both when a new CyFun
@@ -400,28 +423,28 @@
 		const isIso27001 = frameworkUrn.startsWith(ISO27001_FRAMEWORK_URN_PREFIX);
 
 		const auditOptions = [
-			isInternal && {
+			isAuditor && {
 				titleKey: 'exportRequirementsData',
 				descriptionKey: 'exportRequirementsDataDesc',
 				format: 'CSV' as const,
 				href: `/compliance-assessments/${id}/export/csv`,
 				testId: 'export-option-csv'
 			},
-			isInternal && {
+			isAuditor && {
 				titleKey: 'exportRequirementsWorkbook',
 				descriptionKey: 'exportRequirementsWorkbookDesc',
 				format: 'XLSX' as const,
 				href: `/compliance-assessments/${id}/export/xlsx`,
 				testId: 'export-option-xlsx'
 			},
-			isInternal && {
+			isAuditor && {
 				titleKey: 'exportExecutiveSummary',
 				descriptionKey: 'exportExecutiveSummaryDesc',
 				format: 'DOCX' as const,
 				href: `/compliance-assessments/${id}/export/word`,
 				testId: 'export-option-word'
 			},
-			isInternal &&
+			isAuditor &&
 				isCyFun && {
 					titleKey: 'exportCyFunAssessment',
 					descriptionKey: 'exportCyFunAssessmentDesc',
@@ -429,14 +452,14 @@
 					href: `/compliance-assessments/${id}/export/cyfun-xlsx`,
 					testId: 'export-option-cyfun-xlsx'
 				},
-			{
+			isAuditor && {
 				titleKey: 'exportBundleWithEvidences',
 				descriptionKey: 'exportBundleWithEvidencesDesc',
 				format: 'ZIP' as const,
 				href: `/compliance-assessments/${id}/export`,
 				testId: 'export-option-zip'
 			},
-			isInternal &&
+			isAuditor &&
 				isIso27001 && {
 					titleKey: 'exportSoaBuilder',
 					descriptionKey: 'exportSoaBuilderDesc',
@@ -447,7 +470,7 @@
 				}
 		].filter(Boolean);
 
-		const actionPlanOptions = isInternal
+		const actionPlanOptions = isAuditor
 			? [
 					{
 						titleKey: 'exportControlsList',
@@ -495,11 +518,12 @@
 	}
 
 	function modalRequestValidation(): void {
+		if (!data.validationFlowForm || !data.validationFlowModel) return;
 		const modalComponent: ModalComponent = {
 			ref: CreateModal,
 			props: {
 				form: data.validationFlowForm,
-				model: getModelInfo('validation-flows'),
+				model: data.validationFlowModel,
 				formAction: '/validation-flows?/create',
 				invalidateAll: true,
 				onConfirm: async () => {
@@ -663,6 +687,8 @@
 		(selectedStatus.length > 0 ? 1 : 0) +
 			(selectedResults.length > 0 ? 1 : 0) +
 			(selectedExtendedResults.length > 0 ? 1 : 0) +
+			(selectedControlCoverage.length > 0 ? 1 : 0) +
+			(selectedEvidenceCoverage.length > 0 ? 1 : 0) +
 			(displayOnlyAssessableNodes ? 1 : 0)
 	);
 
@@ -737,7 +763,7 @@
 																	(item) => item.field === key
 																)?.urlModel
 															}/${val.id}`}
-															{#if !page.data.user.is_third_party}
+															{#if isAuditor}
 																<Anchor href={itemHref} class="anchor">{val.str}</Anchor>
 															{:else}
 																{val.str}
@@ -768,7 +794,7 @@
 												(item) => item.field === key
 											)?.urlModel
 										}/${value.id}`}
-										{#if !page.data.user.is_third_party}
+										{#if isAuditor}
 											<Anchor href={itemHref} class="anchor">{value.str}</Anchor>
 										{:else}
 											{value.str}
@@ -906,14 +932,16 @@
 			{/if}
 			<div class="flex flex-col space-y-2 ml-4">
 				<div class="flex flex-row space-x-2">
-					<button
-						type="button"
-						class="btn preset-filled-primary-500 w-full"
-						onclick={modalExport}
-						data-testid="export-button"
-					>
-						<i class="fa-solid fa-download mr-2"></i>{m.exportButton()}
-					</button>
+					{#if isAuditor}
+						<button
+							type="button"
+							class="btn preset-filled-primary-500 w-full"
+							onclick={modalExport}
+							data-testid="export-button"
+						>
+							<i class="fa-solid fa-download mr-2"></i>{m.exportButton()}
+						</button>
+					{/if}
 					{#if canEditObject}
 						<Anchor
 							breadcrumbAction="push"
@@ -924,7 +952,7 @@
 						>
 					{/if}
 				</div>
-				{#if !page.data.user.is_third_party}
+				{#if isAuditor}
 					<Anchor
 						href={`${page.url.pathname}/action-plan`}
 						class="btn preset-filled-primary-500 h-fit"
@@ -938,11 +966,13 @@
 						breadcrumbAction="push"
 						><i class="fa-solid fa-file-lines mr-2"></i>{m.evidences()}</Anchor
 					>
-					<AuditTrailButton
-						model="compliance-assessments"
-						objectId={data.compliance_assessment.id}
-						folderId={data.compliance_assessment.folder?.id ?? user.root_folder_id}
-					/>
+					{#if data.compliance_assessment.folder?.id}
+						<AuditTrailButton
+							model="compliance-assessments"
+							objectId={data.compliance_assessment.id}
+							folderId={data.compliance_assessment.folder.id}
+						/>
+					{/if}
 				{/if}
 				<!-- Power-ups Command Palette Grid -->
 				<div class="pt-3 border-t border-surface-200-800 mt-2 space-y-3">
@@ -959,7 +989,7 @@
 								>{m.modes()}</span
 							>
 							<div class="grid grid-cols-2 gap-2">
-								{#if !page.data.user.is_third_party}
+								{#if isAuditor}
 									<Anchor
 										breadcrumbAction="push"
 										href={`${page.url.pathname}/flash-mode`}
@@ -992,7 +1022,7 @@
 					{/if}
 
 					<!-- Actions -->
-					{#if !page.data.user.is_third_party}
+					{#if isAuditor}
 						<div>
 							<span
 								class="text-[11px] font-medium text-surface-400-600 uppercase tracking-wider mb-1.5 block"
@@ -1023,7 +1053,7 @@
 									<i class="fa-solid fa-code-compare text-rose-500 text-base"></i>
 									<span class="text-sm font-medium">{m.compareToAudit()}</span>
 								</button>
-								{#if page.data?.featureflags?.validation_flows}
+								{#if page.data?.featureflags?.validation_flows && data.validationFlowForm}
 									<button
 										class="flex items-center gap-3 px-3.5 py-2.5 rounded-xl border border-surface-200-800 bg-surface-50-950 text-surface-700-300 hover:bg-surface-100-900 hover:border-surface-300-700 transition-colors shadow-sm cursor-pointer text-left"
 										onclick={() => modalRequestValidation()}
@@ -1098,14 +1128,14 @@
 					{/if}
 
 					<!-- Insights -->
-					{#if (has_threats || page.data?.featureflags?.advanced_analytics) && !page.data.user.is_third_party}
+					{#if (has_threats || page.data?.featureflags?.advanced_analytics) && isAuditor}
 						<div>
 							<span
 								class="text-[11px] font-medium text-surface-400-600 uppercase tracking-wider mb-1.5 block"
 								>{m.insights()}</span
 							>
 							<div class="grid grid-cols-2 gap-2">
-								{#if has_threats && !page.data.user.is_third_party}
+								{#if has_threats && isAuditor}
 									<button
 										class="flex items-center gap-3 px-3.5 py-2.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 hover:bg-amber-100 transition-colors cursor-pointer text-left"
 										onclick={openThreatsDialog}
@@ -1123,7 +1153,7 @@
 										</div>
 									</button>
 								{/if}
-								{#if page.data?.featureflags?.advanced_analytics && !page.data.user.is_third_party}
+								{#if page.data?.featureflags?.advanced_analytics && isAuditor}
 									<Anchor
 										breadcrumbAction="push"
 										href={`${page.url.pathname}/advanced-analytics`}
@@ -1151,7 +1181,11 @@
 				<span class="h4">{m.associatedRequirements()}</span>
 				<span class="badge bg-violet-400 text-white ml-1 rounded-xl">
 					{#if treeViewNodes}
-						{assessableNodesCount(treeViewNodes)}
+						{#if filterCount}
+							{assessableNodesCount(treeViewNodes, true)} / {assessableNodesCount(treeViewNodes)}
+						{:else}
+							{assessableNodesCount(treeViewNodes)}
+						{/if}
 					{/if}
 				</span>
 			</div>
@@ -1252,6 +1286,47 @@
 								</div>
 							{/if}
 							<div>
+								<span class="text-sm font-bold">{m.appliedControls()}</span>
+								<div
+									class="flex flex-wrap w-fit gap-2 text-xs bg-surface-200-800 border-2 p-1 rounded-md"
+								>
+									{#each ['with', 'without'] as coverage}
+										<button
+											type="button"
+											onclick={() => toggleControlCoverage(coverage)}
+											class="px-2 py-1 rounded-md font-bold {selectedControlCoverage.includes(
+												coverage
+											)
+												? 'bg-primary-500 text-white'
+												: 'bg-surface-400 text-black opacity-30'}"
+										>
+											{coverage === 'with' ? m.withAppliedControls() : m.withoutAppliedControls()}
+										</button>
+									{/each}
+								</div>
+							</div>
+							<div>
+								<span class="text-sm font-bold">{m.evidence()}</span>
+								<span class="text-xs text-surface-600-400 ml-1">({m.evidenceCoverageHint()})</span>
+								<div
+									class="flex flex-wrap w-fit gap-2 text-xs bg-surface-200-800 border-2 p-1 rounded-md"
+								>
+									{#each ['with', 'without'] as coverage}
+										<button
+											type="button"
+											onclick={() => toggleEvidenceCoverage(coverage)}
+											class="px-2 py-1 rounded-md font-bold {selectedEvidenceCoverage.includes(
+												coverage
+											)
+												? 'bg-primary-500 text-white'
+												: 'bg-surface-400 text-black opacity-30'}"
+										>
+											{coverage === 'with' ? m.withEvidence() : m.withoutEvidence()}
+										</button>
+									{/each}
+								</div>
+							</div>
+							<div>
 								<span class="text-sm font-bold">{m.ShowOnlyAssessable()}</span>
 								<div id="toggle" class="flex items-center space-x-4 text-xs ml-auto mr-4">
 									<Switch
@@ -1286,7 +1361,7 @@
 			<p>{m.mappingInferenceTip()}</p>
 		</div>
 		{#key data}
-			{#key displayOnlyAssessableNodes || selectedStatus || selectedResults || selectedExtendedResults}
+			{#key [displayOnlyAssessableNodes, selectedStatus, selectedResults, selectedExtendedResults, selectedControlCoverage, selectedEvidenceCoverage].join('|')}
 				<RecursiveTreeView
 					nodes={transformToTreeView(Object.entries(tree))}
 					bind:expandedNodes

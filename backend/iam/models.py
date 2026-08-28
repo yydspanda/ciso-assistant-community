@@ -1020,12 +1020,46 @@ class User(ActorSyncMixin, AbstractBaseUser, AbstractBaseModel, FolderMixin):
         "tprm/third_party_email.html": "questionnaire_assignment",
     }
 
-    def mailing(self, email_template_name, subject, object="", object_id="", pk=False):
+    def mailing(
+        self,
+        email_template_name,
+        subject,
+        object="",
+        object_id="",
+        pk=False,
+        *,
+        allow_rescue=True,
+        redact_logs=False,
+    ):
         """
         Sending a mail to a user for password resetting or creation.
         Tries the YAML-based template system first (supports custom overrides),
-        falls back to the legacy Django HTML templates.
+        falls back to the legacy Django HTML templates. Returns ``True`` only
+        after the backend accepted a message and ``False`` for an intentional
+        disabled-template skip; existing callers may continue ignoring it.
         """
+        template_key = self._TEMPLATE_KEY_MAP.get(email_template_name)
+        if template_key:
+            from core.email_utils import is_email_template_enabled
+
+            # If call to render_email_template (below) fails because the template is disabled (from settings->templates->email templates),
+            # it will still send an email using fallback to legacy Django HTML templates.
+            # This prevents it
+            if not is_email_template_enabled(template_key):
+                if redact_logs:
+                    logger.info(
+                        "Email template is disabled in settings, skipping send",
+                        template_key=template_key,
+                        backend_stage="template_policy",
+                    )
+                else:
+                    logger.info(
+                        "Email template is disabled in settings, skipping send",
+                        template_key=template_key,
+                        recipient=self.email,
+                    )
+                return False
+
         user_lang = self.get_preferences().get("lang", "en")
         uid = urlsafe_base64_encode(force_bytes(self.pk))
         token = default_token_generator.make_token(self)
@@ -1046,7 +1080,6 @@ class User(ActorSyncMixin, AbstractBaseUser, AbstractBaseModel, FolderMixin):
         }
 
         # Try YAML template system (supports custom overrides and Markdown)
-        template_key = self._TEMPLATE_KEY_MAP.get(email_template_name)
         if template_key:
             try:
                 from core.email_utils import render_email_template
@@ -1054,17 +1087,33 @@ class User(ActorSyncMixin, AbstractBaseUser, AbstractBaseModel, FolderMixin):
                 rendered = render_email_template(
                     template_key, context, locale=user_lang
                 )
+            except Exception as e:
+                if redact_logs:
+                    logger.warning(
+                        "YAML template rendering failed, falling back to Django template",
+                        template_key=template_key,
+                        backend_stage="template_render",
+                        error_type=type(e).__name__,
+                    )
+                else:
+                    logger.warning(
+                        "YAML template rendering failed, falling back to Django template",
+                        template_key=template_key,
+                        exc_info=e,
+                    )
+            else:
                 if rendered:
                     subject = rendered["subject"]
                     body = rendered["body"]
                     html_body = rendered.get("html_body")
-                    return self._send_email(subject, body, html_body)
-            except Exception as e:
-                logger.warning(
-                    "YAML template rendering failed, falling back to Django template",
-                    template_key=template_key,
-                    exc_info=e,
-                )
+                    return self._send_email(
+                        subject,
+                        body,
+                        html_body,
+                        allow_rescue=allow_rescue,
+                        redact_logs=redact_logs,
+                        template_key=template_key,
+                    )
 
         # Fallback to legacy Django HTML templates
         header = {
@@ -1083,9 +1132,25 @@ class User(ActorSyncMixin, AbstractBaseUser, AbstractBaseModel, FolderMixin):
             email = render_to_string(email_template_name, header)
             subject = str(subject)
 
-        self._send_email(subject, email, email)
+        return self._send_email(
+            subject,
+            email,
+            email,
+            allow_rescue=allow_rescue,
+            redact_logs=redact_logs,
+            template_key=template_key or email_template_name,
+        )
 
-    def _send_email(self, subject, body, html_body=None):
+    def _send_email(
+        self,
+        subject,
+        body,
+        html_body=None,
+        *,
+        allow_rescue=True,
+        redact_logs=False,
+        template_key=None,
+    ):
         """Send an email with primary/rescue server fallback."""
         try:
             ssl_context = getattr(settings, "EMAIL_SSL_CONTEXT", None)
@@ -1100,22 +1165,41 @@ class User(ActorSyncMixin, AbstractBaseUser, AbstractBaseModel, FolderMixin):
                 if html_body:
                     msg.content_subtype = "html"
                     msg.body = html_body
-                msg.send()
-            logger.info(
-                "Email sent successfully", recipient=self.email, subject=subject
-            )
+                if msg.send() != 1:
+                    raise RuntimeError("Mail backend did not accept the message")
+            if redact_logs:
+                logger.info(
+                    "Email sent successfully",
+                    template_key=template_key,
+                    backend_stage="primary",
+                )
+            else:
+                logger.info(
+                    "Email sent successfully", recipient=self.email, subject=subject
+                )
+            return True
         except Exception as primary_exception:
-            logger.error(
-                "Primary mail server failure, trying rescue",
-                recipient=self.email,
-                subject=subject,
-                error=str(primary_exception),
-                email_host=settings.EMAIL_HOST,
-                email_port=settings.EMAIL_PORT,
-                email_host_user=settings.EMAIL_HOST_USER,
-                email_use_tls=settings.EMAIL_USE_TLS,
-            )
-            if settings.EMAIL_HOST_RESCUE:
+            if redact_logs:
+                logger.error(
+                    "Primary mail server failure",
+                    template_key=template_key,
+                    backend_stage="primary",
+                    error_type=type(primary_exception).__name__,
+                    rescue_attempted=bool(allow_rescue and settings.EMAIL_HOST_RESCUE),
+                )
+            else:
+                logger.error(
+                    "Primary mail server failure",
+                    recipient=self.email,
+                    subject=subject,
+                    error=str(primary_exception),
+                    email_host=settings.EMAIL_HOST,
+                    email_port=settings.EMAIL_PORT,
+                    email_host_user=settings.EMAIL_HOST_USER,
+                    email_use_tls=settings.EMAIL_USE_TLS,
+                    rescue_attempted=bool(allow_rescue and settings.EMAIL_HOST_RESCUE),
+                )
+            if allow_rescue and settings.EMAIL_HOST_RESCUE:
                 try:
                     with get_connection(
                         host=settings.EMAIL_HOST_RESCUE,
@@ -1136,23 +1220,42 @@ class User(ActorSyncMixin, AbstractBaseUser, AbstractBaseModel, FolderMixin):
                         if html_body:
                             msg.content_subtype = "html"
                             msg.body = html_body
-                        msg.send()
-                    logger.info(
-                        "Email sent via rescue server",
-                        recipient=self.email,
-                        subject=subject,
-                    )
+                        if msg.send() != 1:
+                            raise RuntimeError(
+                                "Rescue mail backend did not accept the message"
+                            )
+                    if redact_logs:
+                        logger.info(
+                            "Email sent via rescue server",
+                            template_key=template_key,
+                            backend_stage="rescue",
+                        )
+                    else:
+                        logger.info(
+                            "Email sent via rescue server",
+                            recipient=self.email,
+                            subject=subject,
+                        )
+                    return True
                 except Exception as rescue_exception:
-                    logger.error(
-                        "Rescue mail server failure",
-                        recipient=self.email,
-                        subject=subject,
-                        error=str(rescue_exception),
-                        email_host=settings.EMAIL_HOST_RESCUE,
-                        email_port=settings.EMAIL_PORT_RESCUE,
-                        email_username=settings.EMAIL_HOST_USER_RESCUE,
-                        email_use_tls=settings.EMAIL_USE_TLS_RESCUE,
-                    )
+                    if redact_logs:
+                        logger.error(
+                            "Rescue mail server failure",
+                            template_key=template_key,
+                            backend_stage="rescue",
+                            error_type=type(rescue_exception).__name__,
+                        )
+                    else:
+                        logger.error(
+                            "Rescue mail server failure",
+                            recipient=self.email,
+                            subject=subject,
+                            error=str(rescue_exception),
+                            email_host=settings.EMAIL_HOST_RESCUE,
+                            email_port=settings.EMAIL_PORT_RESCUE,
+                            email_username=settings.EMAIL_HOST_USER_RESCUE,
+                            email_use_tls=settings.EMAIL_USE_TLS_RESCUE,
+                        )
                     raise rescue_exception
             else:
                 raise primary_exception
@@ -1493,20 +1596,6 @@ class RoleAssignment(NameDescriptionMixin, FolderMixin):
         return is_directly_accessible or is_indirectly_accessible
 
     @staticmethod
-    def _is_actor_accessible(
-        user: AbstractBaseUser | AnonymousUser,
-        perm_prefix: PermissionPrefix,
-        actor: Actor,
-    ) -> bool:
-        specific = actor.specific
-        specific_model = type(specific)
-        iam_scope_folder = specific.folder
-
-        return iam_scope_folder.id in RoleAssignment.get_allowed_folder_ids(
-            user, (perm_prefix, specific_model)
-        )
-
-    @staticmethod
     def is_object_accessible(
         user: AbstractBaseUser | AnonymousUser,
         perm_prefix: PermissionPrefix,
@@ -1526,7 +1615,11 @@ class RoleAssignment(NameDescriptionMixin, FolderMixin):
             return False
 
         if model is Actor:
-            return RoleAssignment._is_actor_accessible(user, perm_prefix, obj)
+            if not isinstance(obj, Actor):
+                raise AssertionError("Unreachable.")
+
+            obj = obj.specific
+            model = type(obj)
 
         if perm_prefix == "add" and model is FilteringLabel:
             return RoleAssignment.get_allowed_folder_ids(
@@ -1845,7 +1938,7 @@ class RoleAssignment(NameDescriptionMixin, FolderMixin):
         user_folder_ids = RoleAssignment.get_allowed_folder_ids(
             user, (perm_prefix, User)
         )
-        team__folder_ids = RoleAssignment.get_allowed_folder_ids(
+        team_folder_ids = RoleAssignment.get_allowed_folder_ids(
             user, (perm_prefix, Team)
         )
         entity_folder_ids = RoleAssignment.get_allowed_folder_ids(
@@ -1860,11 +1953,43 @@ class RoleAssignment(NameDescriptionMixin, FolderMixin):
             ),
         ).filter(
             Q(user__isnull=False, iam_folder_id__in=user_folder_ids)
-            | Q(team__isnull=False, iam_folder_id__in=team__folder_ids)
+            | Q(team__isnull=False, iam_folder_id__in=team_folder_ids)
             | Q(entity__isnull=False, iam_folder_id__in=entity_folder_ids)
         )
 
         allowed_actor_ids = allowed_actors.values_list("id", flat=True)
+
+        if perm_prefix == "view":
+            published_actors_query = Q()
+
+            for model, allowed_folder_ids in [
+                (User, user_folder_ids),
+                (Team, team_folder_ids),
+                (Entity, entity_folder_ids),
+            ]:
+                ancestor_folder_ids = Folder.objects.filter(
+                    descendants__in=Folder.objects.filter(
+                        id__in=allowed_folder_ids
+                    ).exclude(content_type=Folder.ContentType.ENCLAVE)
+                ).distinct()
+
+                iam_folder_field = RoleAssignment.get_iam_folder_field(model)
+
+                model_name = model.__name__.lower()
+                published_model_objects_query = Q(
+                    **{
+                        f"{model_name}__{iam_folder_field}__in": ancestor_folder_ids,
+                        f"{model_name}__is_published": True,
+                    }
+                )
+
+                published_actors_query |= published_model_objects_query
+
+            published_actors = Actor.objects.filter(published_actors_query)
+            published_actor_ids = published_actors.values_list("id", flat=True)
+
+            allowed_actor_ids = allowed_actor_ids.union(published_actor_ids)
+
         return allowed_actor_ids
 
     @staticmethod

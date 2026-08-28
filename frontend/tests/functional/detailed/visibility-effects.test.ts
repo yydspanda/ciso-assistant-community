@@ -124,12 +124,15 @@ test('field visibility effects: each flag toggles the corresponding donut', asyn
 	await setVisibility('status', HIDDEN);
 	await page.goto(`${auditDetailUrl}/table-mode`);
 
-	const firstRequirementAssessment = page.locator('.table-mode-form').first();
-	await firstRequirementAssessment
+	const firstRequirementAssessment = page.locator('.table-mode-form:visible').first();
+	await expect(firstRequirementAssessment).toBeVisible();
+	const evidenceTrigger = firstRequirementAssessment
 		.locator('[data-scope="accordion"][data-part="item-trigger"]')
-		.filter({ hasText: m.evidence() })
-		.click();
-	await firstRequirementAssessment.getByTestId('select-evidence-button').click();
+		.filter({ hasText: m.evidence() });
+	await evidenceTrigger.click();
+	const selectEvidenceButton = firstRequirementAssessment.getByTestId('select-evidence-button');
+	await expect(selectEvidenceButton).toBeVisible();
+	await selectEvidenceButton.click();
 
 	await expect(page.getByTestId('modal-title')).toBeVisible();
 	const evidenceField = page.getByTestId('form-input-evidences');

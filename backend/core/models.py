@@ -63,6 +63,7 @@ from .utils import (
     resolve_compute_result,
     sha256,
     update_selected_implementation_groups,
+    yaml_safe_load,
     _is_question_visible,
     _build_answer_context,
 )
@@ -482,7 +483,7 @@ class StoredLibrary(LibraryMixin):
             # We do not store the library if its hash checksum is in the database.
             return None, "libraryAlreadyLoadedError"
         try:
-            library_data = yaml.safe_load(library_content)
+            library_data = yaml_safe_load(library_content)
             if not isinstance(library_data, dict):
                 raise yaml.YAMLError(
                     f"The YAML content must be a dictionary but it's been interpreted as a {type(library_data).__name__} !"
@@ -1423,6 +1424,19 @@ class LibraryUpdater:
 
                     # update answers or score for each ra for the current requirement_node, when relevant
                     for ra in existing_requirement_assessment_objects.get(urn, []):
+                        # Runs regardless of is_scored/score: a pin on a null
+                        # score would otherwise survive the reset and freeze
+                        # the RA against future recomputes.
+                        if (
+                            self.strategy == "reset"
+                            and ra.is_score_overridden
+                            and ra.compliance_assessment in ca_with_scale_change
+                        ):
+                            ra.is_score_overridden = False
+                            if ra.pk not in ra_pks_to_update:
+                                ra_pks_to_update.add(ra.pk)
+                                requirement_assessment_objects_to_update.append(ra)
+
                         if (
                             ra.is_scored
                             and ra.score is not None
@@ -1621,7 +1635,13 @@ class LibraryUpdater:
                 if requirement_assessment_objects_to_update:
                     RequirementAssessment.objects.bulk_update(
                         requirement_assessment_objects_to_update,
-                        ["score", "is_scored", "documentation_score", "result"],
+                        [
+                            "score",
+                            "is_scored",
+                            "is_score_overridden",
+                            "documentation_score",
+                            "result",
+                        ],
                         batch_size=100,
                     )
 
@@ -3078,7 +3098,19 @@ class RequirementNode(ReferentialObjectMixin, I18nObjectMixin):
 
     @property
     def get_questions_translated(self) -> dict | None:
-        questions_qs = self.questions.prefetch_related("choices").all()
+        # Reuse the caller's prefetch when it covers choices too: calling
+        # prefetch_related() on the related manager discards
+        # _prefetched_objects_cache and re-queries once per node.
+        prefetched = (getattr(self, "_prefetched_objects_cache", None) or {}).get(
+            "questions"
+        )
+        if prefetched is not None and all(
+            "choices" in (getattr(q, "_prefetched_objects_cache", None) or {})
+            for q in prefetched
+        ):
+            questions_qs = prefetched
+        else:
+            questions_qs = self.questions.prefetch_related("choices").all()
         if not questions_qs:
             return None
 
@@ -7623,6 +7655,9 @@ class ComplianceAssessment(Assessment):
                         baseline_assessment.documentation_score
                     )
                     assessment.is_scored = baseline_assessment.is_scored
+                    assessment.is_score_overridden = (
+                        baseline_assessment.is_score_overridden
+                    )
                     assessment.observation = baseline_assessment.observation
                     updates.append(assessment)
 
@@ -7645,6 +7680,7 @@ class ComplianceAssessment(Assessment):
                         "score",
                         "documentation_score",
                         "is_scored",
+                        "is_score_overridden",
                         "observation",
                     ],
                     batch_size=1000,
@@ -7657,7 +7693,13 @@ class ComplianceAssessment(Assessment):
 
         return created_assessments
 
-    def sync_to_applied_controls(self, dry_run=True):
+    def sync_to_applied_controls(
+        self,
+        dry_run=True,
+        *,
+        requirement_assessment_ids=None,
+        applied_control_ids=None,
+    ):
         """
         the logic is to get the requirement assessments that have applied controls attached
         then for each:
@@ -7687,9 +7729,27 @@ class ComplianceAssessment(Assessment):
                 compliance_assessment=self, applied_controls__isnull=False
             )
             .select_related("requirement")
-            .prefetch_related("applied_controls")
             .distinct()
         )
+        if requirement_assessment_ids is not None:
+            requirement_assessments_with_ac = requirement_assessments_with_ac.filter(
+                id__in=requirement_assessment_ids
+            )
+        if applied_control_ids is not None:
+            requirement_assessments_with_ac = (
+                requirement_assessments_with_ac.prefetch_related(
+                    Prefetch(
+                        "applied_controls",
+                        queryset=AppliedControl.objects.filter(
+                            id__in=applied_control_ids
+                        ),
+                    )
+                )
+            )
+        else:
+            requirement_assessments_with_ac = (
+                requirement_assessments_with_ac.prefetch_related("applied_controls")
+            )
 
         nonconformity_values: Final[tuple[RequirementAssessment.ExtendedResult]] = [
             RequirementAssessment.ExtendedResult.MAJOR_NONCONFORMITY,
@@ -8805,6 +8865,14 @@ class RequirementAssessment(AbstractBaseModel, FolderMixin, ETADueDateMixin):
         default=False,
         verbose_name=_("Is scored"),
     )
+    is_score_overridden = models.BooleanField(
+        default=False,
+        verbose_name=_("Is score overridden"),
+        help_text=_(
+            "When set, the score is manually pinned and no longer recomputed "
+            "from the questionnaire answers."
+        ),
+    )
     score = models.IntegerField(
         blank=True,
         null=True,
@@ -8969,6 +9037,8 @@ class RequirementAssessment(AbstractBaseModel, FolderMixin, ETADueDateMixin):
         self,
         *,
         selected_reference_control_ids: list | None = None,
+        allowed_reference_control_ids=None,
+        allowed_applied_control_ids=None,
     ) -> list[dict]:
         """Return a list of {'applied_control': AppliedControl, 'status': str}
         where status is one of 'create' (no matching AppliedControl exists yet),
@@ -8980,7 +9050,12 @@ class RequirementAssessment(AbstractBaseModel, FolderMixin, ETADueDateMixin):
             self.requirement
         ):
             return results
-        reference_controls = list(self.requirement.reference_controls.all())
+        reference_controls = self.requirement.reference_controls.all()
+        if allowed_reference_control_ids is not None:
+            reference_controls = reference_controls.filter(
+                id__in=allowed_reference_control_ids
+            )
+        reference_controls = list(reference_controls)
         if selected_reference_control_ids is not None:
             ids_set = {str(v) for v in selected_reference_control_ids}
             reference_controls = [
@@ -8995,6 +9070,8 @@ class RequirementAssessment(AbstractBaseModel, FolderMixin, ETADueDateMixin):
             folder=self.folder,
             reference_control_id__in=ref_ids,
         ).prefetch_related("requirement_assessments")
+        if allowed_applied_control_ids is not None:
+            ac_qs = ac_qs.filter(id__in=allowed_applied_control_ids)
         ac_by_key: dict = {}
         linked_by_key: dict = {}
         for ac in ac_qs:
@@ -9034,6 +9111,8 @@ class RequirementAssessment(AbstractBaseModel, FolderMixin, ETADueDateMixin):
         *,
         dry_run: bool = False,
         selected_reference_control_ids: list | None = None,
+        allowed_reference_control_ids=None,
+        allowed_applied_control_ids=None,
     ) -> list[AppliedControl]:
         applied_controls: list[AppliedControl] = []
         if not self.compliance_assessment.requirement_matches_selected_groups(
@@ -9041,29 +9120,43 @@ class RequirementAssessment(AbstractBaseModel, FolderMixin, ETADueDateMixin):
         ):
             return applied_controls
         reference_controls = self.requirement.reference_controls.all()
+        if allowed_reference_control_ids is not None:
+            reference_controls = reference_controls.filter(
+                id__in=allowed_reference_control_ids
+            )
         if selected_reference_control_ids is not None:
             reference_controls = reference_controls.filter(
                 id__in=selected_reference_control_ids
             )
         for reference_control in reference_controls:
             try:
-                applied_control = AppliedControl.objects.filter(
+                linked_controls = AppliedControl.objects.filter(
                     folder=self.folder,
                     reference_control=reference_control,
                     category=reference_control.category,
                     requirement_assessments=self,
-                ).first()
+                )
+                if allowed_applied_control_ids is not None:
+                    linked_controls = linked_controls.filter(
+                        id__in=allowed_applied_control_ids
+                    )
+                applied_control = linked_controls.first()
 
                 if applied_control:
                     # Already linked to this requirement assessment, skip entirely so
                     # dry-run mirrors the actual creation.
                     continue
 
-                existing_control = AppliedControl.objects.filter(
+                existing_controls = AppliedControl.objects.filter(
                     folder=self.folder,
                     reference_control=reference_control,
                     category=reference_control.category,
-                ).first()
+                )
+                if allowed_applied_control_ids is not None:
+                    existing_controls = existing_controls.filter(
+                        id__in=allowed_applied_control_ids
+                    )
+                existing_control = existing_controls.first()
 
                 if existing_control:
                     applied_control = existing_control
@@ -9279,11 +9372,37 @@ class RequirementAssessment(AbstractBaseModel, FolderMixin, ETADueDateMixin):
             questionnaire_fully_answered=questionnaire_fully_answered,
         )
 
-    def get_visible_questions_counts(self) -> tuple[int, int]:
-        """Return (visible_questions_count, answered_visible_questions_count) for this assessment."""
+    def get_visible_questions_counts(self, *, user=None) -> tuple[int, int]:
+        """Return visible/answered question counts within the caller's IAM slice."""
         # Use prefetched objects if available
         questions_qs = self.requirement.questions.all()
         answers_qs = self.answers.all()
+        if user is not None:
+            from iam.models import RoleAssignment
+
+            visible_question_ids = RoleAssignment.get_viewable_object_ids(
+                user, Question
+            )
+            visible_answer_ids = RoleAssignment.get_viewable_object_ids(user, Answer)
+            visible_choice_ids = RoleAssignment.get_viewable_object_ids(
+                user, QuestionChoice
+            )
+            questions_qs = questions_qs.filter(id__in=visible_question_ids)
+            answers_qs = (
+                answers_qs.filter(
+                    id__in=visible_answer_ids,
+                    question_id__in=visible_question_ids,
+                )
+                .select_related("question")
+                .prefetch_related(
+                    Prefetch(
+                        "selected_choices",
+                        queryset=QuestionChoice.objects.filter(
+                            id__in=visible_choice_ids
+                        ),
+                    )
+                )
+            )
 
         # Build lookup for answered questions and their values
         _, answers_by_urn, questions_by_urn, has_answer_by_qid = _build_answer_context(
@@ -9370,6 +9489,12 @@ class RequirementAssessment(AbstractBaseModel, FolderMixin, ETADueDateMixin):
             if not _is_question_visible(question, answers_by_urn, questions_by_urn):
                 continue
 
+            # Free-text questions are informational: they have no choices and can be anything,
+            # so it does not make very much sense to take them into account. Skip them out.
+            # (They still count as unanswered in progress see get_visible_questions_counts.)
+            if question.type == Question.Type.TEXT:
+                continue
+
             visible_questions += 1
             if not has_answer_by_qid.get(question.id):
                 continue
@@ -9428,10 +9553,11 @@ class RequirementAssessment(AbstractBaseModel, FolderMixin, ETADueDateMixin):
                 }
                 new_result = result_map.get(aggregated, self.Result.NOT_ASSESSED)
 
-        # Update attributes
-        self.score = new_score
+        # Override pins score and is_scored; result still follows answers.
+        if not self.is_score_overridden:
+            self.score = new_score
+            self.is_scored = new_is_scored
         self.result = new_result
-        self.is_scored = new_is_scored
 
     def compute_score_and_result(self):
         self.recompute_assessment()
@@ -9567,6 +9693,83 @@ class RequirementAssignmentEvent(AbstractBaseModel, FolderMixin):
 
     def __str__(self) -> str:
         return f"{self.assignment} - {self.event_type} - {self.created_at.strftime('%Y-%m-%d %H:%M')}"
+
+
+class RequirementAssignmentMailOutbox(AbstractBaseModel, FolderMixin):
+    """Durable delivery intent for an assignment-activation email.
+
+    The requirement-assignment status and its workflow event remain the
+    authoritative business records.  This row only bridges their database
+    transaction to the asynchronous mail worker without sending SMTP inside
+    the request transaction.
+    """
+
+    class Status(models.TextChoices):
+        QUEUED = "queued", _("Queued")
+        SENDING = "sending", _("Sending")
+        DELIVERED = "delivered", _("Delivered")
+        FAILED = "failed", _("Failed")
+
+    assignment = models.ForeignKey(
+        RequirementAssignment,
+        on_delete=models.CASCADE,
+        related_name="mail_outbox_entries",
+    )
+    recipient_actor = models.ForeignKey(
+        "Actor",
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="requirement_assignment_mail_outbox_entries",
+    )
+    requested_by = models.ForeignKey(
+        User,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="requested_requirement_assignment_mails",
+    )
+    payload_digest = models.CharField(max_length=64, unique=True)
+    recipient_address_hash = models.CharField(max_length=64)
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.QUEUED,
+    )
+    attempts = models.PositiveIntegerField(default=0)
+    available_at = models.DateTimeField(default=timezone.now)
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    failed_at = models.DateTimeField(null=True, blank=True)
+    failure_code = models.CharField(max_length=64, blank=True)
+
+    class Meta:
+        ordering = ["created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["assignment", "recipient_actor"],
+                name="uniq_ra_mail_assignment_actor",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(
+                    status__in=("queued", "sending", "delivered", "failed")
+                ),
+                name="core_ra_mail_status_valid",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["status", "available_at"],
+                name="core_ra_mail_status_due_idx",
+            ),
+            models.Index(
+                fields=["assignment", "status"],
+                name="core_ra_mail_assignment_idx",
+            ),
+        ]
+        verbose_name = _("Requirement assignment mail outbox entry")
+        verbose_name_plural = _("Requirement assignment mail outbox entries")
+
+    def __str__(self) -> str:
+        return f"{self.assignment_id} - {self.status}"
 
 
 class Answer(AbstractBaseModel, FolderMixin):
@@ -10459,7 +10662,9 @@ class ValidationFlow(AbstractBaseModel, FolderMixin, FilteringLabelMixin):
         return event.event_notes if event else None
 
     def __str__(self) -> str:
-        return self.ref_id
+        # ref_id is nullable and only auto-assigned in save(); bulk-created
+        # rows may not have one.
+        return self.ref_id or ""
 
 
 class FlowEvent(AbstractBaseModel, FolderMixin):

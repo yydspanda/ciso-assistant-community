@@ -30,16 +30,18 @@
 			progressEntries.forEach(([key, value], index) => {
 				const centerPosition = -30 + index * spacingFactor;
 				const titlePosition = centerPosition - 10;
+				const isAvailable = typeof value === 'number' && Number.isFinite(value);
 
 				gaugeData.push({
-					value: value,
+					value: isAvailable ? value : null,
 					name: safeTranslate(key),
 					title: {
 						offsetCenter: ['0%', `${titlePosition}%`]
 					},
 					detail: {
 						valueAnimation: true,
-						offsetCenter: ['0%', `${centerPosition}%`]
+						offsetCenter: ['0%', `${centerPosition}%`],
+						formatter: isAvailable ? '{value}%' : m.informationNotAvailable()
 					}
 				});
 			});

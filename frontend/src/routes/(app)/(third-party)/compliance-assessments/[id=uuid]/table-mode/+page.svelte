@@ -91,7 +91,7 @@
 
 	// Field visibility based on viewer role (server-computed from actor membership)
 	const viewerRole: 'respondent' | 'auditor' = $derived(
-		(data.viewerRole ?? 'auditor') as 'respondent' | 'auditor'
+		data.viewerRole === 'auditor' ? 'auditor' : 'respondent'
 	);
 	const fieldVis = $derived(getFieldVisibility(complianceAssessment, viewerRole));
 	const showAnswers = $derived(fieldVis.showAnswers);
@@ -163,7 +163,7 @@
 	}
 
 	let questionnaireMode = $state(
-		questionnaireOnly ? true : !hasQuestions ? false : page.data.user.is_third_party ? true : false
+		questionnaireOnly ? true : !hasQuestions ? false : viewerRole === 'respondent'
 	);
 
 	const modalStore: ModalStore = getModalStore();
@@ -960,16 +960,18 @@
 															<Accordion.ItemContent>
 																<div class="flex flex-row space-x-2 items-center">
 																	{#if !shallow && !isReadOnly}
-																		<button
-																			class="btn preset-filled-primary-500 self-start"
-																			onclick={() =>
-																				modalMeasureCreateForm(
-																					requirementAssessment.measureCreateForm
-																				)}
-																			type="button"
-																			><i class="fa-solid fa-plus mr-2"
-																			></i>{m.addAppliedControl()}</button
-																		>
+																		{#if requirementAssessment.measureCreateForm}
+																			<button
+																				class="btn preset-filled-primary-500 self-start"
+																				onclick={() =>
+																					modalMeasureCreateForm(
+																						requirementAssessment.measureCreateForm
+																					)}
+																				type="button"
+																				><i class="fa-solid fa-plus mr-2"
+																				></i>{m.addAppliedControl()}</button
+																			>
+																		{/if}
 																		<button
 																			class="btn preset-filled-secondary-500 self-start"
 																			type="button"
@@ -1042,17 +1044,19 @@
 															<Accordion.ItemContent>
 																<div class="flex flex-row space-x-2 items-center">
 																	{#if !shallow && !isReadOnly}
-																		<button
-																			class="btn preset-filled-primary-500 self-start"
-																			onclick={() =>
-																				modalEvidenceCreateForm(
-																					requirementAssessment.evidenceCreateForm
-																				)}
-																			type="button"
-																			data-testid="create-evidence-button"
-																			><i class="fa-solid fa-plus mr-2"
-																			></i>{m.addEvidence()}</button
-																		>
+																		{#if requirementAssessment.evidenceCreateForm}
+																			<button
+																				class="btn preset-filled-primary-500 self-start"
+																				onclick={() =>
+																					modalEvidenceCreateForm(
+																						requirementAssessment.evidenceCreateForm
+																					)}
+																				type="button"
+																				data-testid="create-evidence-button"
+																				><i class="fa-solid fa-plus mr-2"
+																				></i>{m.addEvidence()}</button
+																			>
+																		{/if}
 																		<button
 																			class="btn preset-filled-secondary-500 self-start"
 																			type="button"
