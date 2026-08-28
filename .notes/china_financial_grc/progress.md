@@ -82,12 +82,24 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   backup/restore fingerprint equality, and a restored successor write. Final
   candidate `fced7716` then passed all 168 checks and all nine workflow runs;
   PR #3 merged without bypass as `d1ff1e461d58f6bb2dff77d312b160d475d2ff3e`.
-- The reconciliation branch preserved pure merge `11e9e9455` against canonical
-  upstream `ec3cf7d03`; the separately reviewed IAM, mapping, formal-export,
-  respondent-tree, and durable assignment-mail hardening is committed as
-  `f69cec3a2`. Canonical upstream subsequently advanced by one commit to
-  `9aac30df8`, leaving the local candidate 21 ahead / 1 behind before the final
-  clean merge.
+- The dedicated reconciliation candidate preserves pure merge `11e9e9455`
+  against canonical upstream `ec3cf7d03`, separate reviewed security commit
+  `f69cec3a2`, and final pure merge `9b8ecfd98` against `9aac30df8`. An isolated
+  Git merge-tree replay produced `bc784debdd064922ad04d5b1c8bb0056050e1bdc`,
+  exactly matching the final merge tree without a manual conflict resolution.
+- On the final merged tree, the 17-file security regression recorded 270/270
+  backend tests, zero Django system-check or migration-drift issues, and clean
+  scoped Ruff formatting. Frontend validation recorded 92/92 focused tests,
+  277/277 complete tests, successful Community and Enterprise builds, and the
+  unchanged historical `svelte-check` baseline of 2396 errors / 821 warnings /
+  508 files. The latest frontend-only upstream commit introduced no diagnostic
+  delta. Playwright against a live stack was not run locally.
+- The same final backend tree passed the local synthetic PostgreSQL 16.11
+  acceptance harness before the frontend-only final merge: 80 regulatory tests,
+  real locking/index probes, migration and backup/restore checks, and evidence-
+  index SHA-256 `8255608d8d56a481eb693c086c38a102aeffbb7a5f449e8c30cef80b000c3dd5`.
+  Post-merge artifact and governance gates then passed 25 tests plus 12 subtests
+  and 58 tests plus 55 subtests respectively.
 
 ## Current limitations and risks
 
@@ -114,12 +126,13 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 9. **Only local synthetic PostgreSQL evidence exists.** Representative plans,
    complete upstream-table privileges, production topology, monitoring,
    encryption/key custody, PITR/RPO/RTO, and operations approval remain open.
-10. **The reconciliation candidate needs one final canonical merge.** The branch
-    has preserved pure merge `11e9e9455` for the original 22-behind boundary,
-    but canonical upstream advanced to `9aac30df8` after that merge. The current
-    measurement is 21 ahead / 1 behind. The final fetch and merge must remain a
-    dedicated clean commit with proportional regression and must not be hidden
-    in another extension slice.
+10. **The local drift gate is restored; hosted merge authority remains.** A
+    fresh fetch on 2026-08-28 resolved canonical upstream to `9aac30df8` and
+    fork `main` to `d1ff1e461`; code merge `9b8ecfd98` measures 23 ahead / 0
+    behind, and this final fork-only governance record makes the pushed branch
+    24 ahead / 0 behind. The task remains active until that branch passes the
+    full protected-PR matrix and lands without bypass. The weekly monitor must
+    keep measuring a freshly fetched remote after merge.
 11. **Inherited workflow activation still needs an owner policy.** Opening PR #1
     registered inherited validation workflows as well as the three fork jobs.
     The write-scoped CLA and OIDC/security-events Plumber workflows were
@@ -138,17 +151,23 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
     but existing custom roles are not auto-expanded. An administrator must
     grant that extension-owned permission only where registered applicability
     access is intended; generic `tprm.view_entity` is not a substitute.
+14. **Live delivery gates remain for the new assignment-mail boundary.** Mocked
+    and injected concurrency tests passed, but real Huey workers, SMTP delivery,
+    and PostgreSQL outbox claim competition were not exercised locally. Those
+    integrations require environment-scoped credentials, monitoring, and named
+    operations/security acceptance; no local result is a production guarantee.
 
 ## Current next action
 
 Complete the upstream-reconciliation task without bypassing the protected-main
-gate: fetch canonical upstream again, review and merge the one new
-`9aac30df8` library-builder commit as a pure upstream change, and remeasure to
-zero behind. Then rerun the affected frontend, focused backend, artifact, and
-project-governance gates and push only this dedicated reconciliation candidate.
-Merge only through a PR whose complete hosted matrix passes; do not mix target-
-environment work or new product features into the reconciliation. After the
-drift gate is restored, return the product pointer to
+gate: push the clean branch containing code merge `9b8ecfd98` and this final
+governance record, open a dedicated PR, confirm the required GitHub-Actions
+governance check and complete hosted matrix, and merge only when every required
+job passes under the no-bypass ruleset. Re-fetch and remeasure canonical
+upstream before merge if the PR remains open long enough for upstream to
+advance. Do not mix target-environment work or new product features into this
+reconciliation. After protected merge, add the canonical completed record and
+return the product pointer to
 `CFGRC-P1-TARGET-ACCEPTANCE`; that charter remains blocked on named operations,
 security, privacy, records, legal, and audit owners.
 
