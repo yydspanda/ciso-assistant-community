@@ -1,7 +1,12 @@
 from dateutil.relativedelta import relativedelta
+from django.db import transaction
 from rest_framework import serializers
 
 from core.models import Terminology
+from core.relation_locking import (
+    lock_assessment_relation_targets,
+    lock_owner_folder_write_scope,
+)
 from core.serializers import BaseModelSerializer
 from core.serializer_fields import FieldsRelatedField, PathField
 from custom_fields.serializers import CustomFieldsSerializerMixin
@@ -39,6 +44,47 @@ class GenericCollectionReadSerializer(BaseModelSerializer):
 
 
 class GenericCollectionWriteSerializer(BaseModelSerializer):
+    def _write_with_locked_assessment_links(self, instance, validated_data):
+        from iam.models import Folder
+
+        request = self.context.get("request")
+        with transaction.atomic():
+            Folder._lock_folder_tree()
+            locked_instance, current_folder, destination_folder = (
+                lock_owner_folder_write_scope(
+                    model=GenericCollection,
+                    instance=instance,
+                    validated_data=validated_data,
+                )
+            )
+            if locked_instance is None:
+                self._check_object_perm(
+                    validated_data,
+                    "add",
+                    folder=destination_folder,
+                )
+            else:
+                self._check_object_perm(locked_instance, "change")
+                if destination_folder.pk != current_folder.pk:
+                    self._check_object_perm(
+                        locked_instance,
+                        "add",
+                        folder=destination_folder,
+                    )
+            lock_assessment_relation_targets(
+                validated_data,
+                user=getattr(request, "user", None),
+            )
+            if locked_instance is None:
+                return super().create(validated_data)
+            return super().update(locked_instance, validated_data)
+
+    def create(self, validated_data):
+        return self._write_with_locked_assessment_links(None, validated_data)
+
+    def update(self, instance, validated_data):
+        return self._write_with_locked_assessment_links(instance, validated_data)
+
     class Meta:
         model = GenericCollection
         fields = "__all__"

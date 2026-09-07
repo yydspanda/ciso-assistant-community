@@ -1,6 +1,8 @@
 import io
 import re
 
+from django.contrib.auth import get_user_model
+from django.db import transaction
 from django.db.models import ProtectedError
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
@@ -9,13 +11,13 @@ from rest_framework.status import (
     HTTP_403_FORBIDDEN,
     HTTP_409_CONFLICT,
 )
-from iam.models import Folder, Permission, RoleAssignment
+from iam.models import Folder, Permission, RoleAssignment, UserGroup
 from core.views import (
     BaseModelViewSet as AbstractBaseModelViewSet,
     ExportMixin,
     escape_excel_formula,
 )
-from core.models import Asset
+from core.models import Actor, Asset, ComplianceAssessment, Framework, Team
 from tprm.models import Entity, Representative, Solution, EntityAssessment, Contract
 from rest_framework.decorators import action
 import structlog
@@ -26,10 +28,25 @@ from rest_framework.response import Response
 from django.utils.formats import date_format
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
-from django.db.models import Prefetch, Sum, F, FloatField, TextField, Case, When, Value
+from django.db.models import (
+    Case,
+    F,
+    FloatField,
+    Prefetch,
+    Q,
+    Sum,
+    TextField,
+    Value,
+    When,
+)
 from django.db.models.functions import Cast, Greatest, Coalesce, Round
 
 from core.constants import COUNTRY_CHOICES, CURRENCY_CHOICES
+from core.reserved_iam import (
+    MANAGED_TPRM_RESPONDENT_IAM_ERROR,
+    ManagedTprmRespondentIamError,
+    lock_and_assert_no_tprm_idp_group_inheritance,
+)
 from core.dora import (
     DORA_ENTITY_TYPE_CHOICES,
     DORA_ENTITY_HIERARCHY_CHOICES,
@@ -54,6 +71,7 @@ import zipfile
 from datetime import datetime
 
 logger = structlog.get_logger(__name__)
+User = get_user_model()
 
 # Core models the DORA ROI is built from. Reading the register as a whole
 # requires holding these on the root folder, i.e. instance-wide.
@@ -156,6 +174,41 @@ class EntityViewSet(ExportMixin, BaseModelViewSet):
         "default_trust",
     ]
     search_fields = ["name", "description", "legal_identifiers_text"]
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        """Keep Entity CASCADE from bypassing owned EA cleanup authority."""
+
+        from core.views import _assert_object_action_permission
+
+        Folder._lock_folder_tree()
+        expected_folder_id = instance.folder_id
+        locked_folder = get_object_or_404(
+            Folder.objects.select_for_update(of=("self",)),
+            id=expected_folder_id,
+        )
+        locked_instance = get_object_or_404(
+            Entity.objects.select_for_update(of=("self",)),
+            id=instance.id,
+        )
+        if locked_instance.folder_id != expected_folder_id:
+            raise PermissionDenied("The entity owner changed; retry.")
+        locked_instance.folder = locked_folder
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=locked_instance,
+            action="delete",
+        )
+        dependent_assessments = list(
+            EntityAssessment.objects.select_for_update(of=("self",))
+            .filter(entity_id=locked_instance.id)
+            .order_by("id")
+        )
+        if dependent_assessments:
+            raise PermissionDenied(
+                "Delete dependent entity assessments through their owned endpoint first."
+            )
+        return super().perform_destroy(locked_instance)
 
     def destroy(self, request, *args, **kwargs):
         """
@@ -1100,24 +1153,517 @@ class EntityAssessmentViewSet(BaseModelViewSet):
         "genericcollection",
     ]
 
-    def destroy(self, request, *args, **kwargs):
-        instance = self.get_object()
-        if instance.compliance_assessment:
-            folder = instance.compliance_assessment.folder
-            if folder.content_type == Folder.ContentType.ENCLAVE:
-                logger.info(
-                    "deleting_compliance_assessment_folder",
-                    folder_id=str(folder.id),
-                    content_type=str(folder.content_type),
-                )
-                folder.delete()
-            else:
-                logger.warning(
-                    "Compliance assessment folder is not an Enclave, skipping deletion",
-                    folder=folder,
+    @staticmethod
+    def _assert_enclave_contains_only_iam_scaffolding(
+        folder, *, expected_respondent_user_ids, user
+    ):
+        """Fail closed before cascading an otherwise empty owned enclave."""
+
+        from core.utils import RoleCodename, UserGroupCodename
+
+        try:
+            lock_and_assert_no_tprm_idp_group_inheritance(
+                enclave_folder_ids=(folder.id,)
+            )
+        except ManagedTprmRespondentIamError as exc:
+            raise PermissionDenied(MANAGED_TPRM_RESPONDENT_IAM_ERROR) from exc
+
+        groups = list(
+            UserGroup.objects.select_for_update(of=("self",))
+            .filter(folder_id=folder.id)
+            .order_by("id")
+        )
+        group_ids = {group.id for group in groups}
+        assignments = list(
+            RoleAssignment.objects.select_for_update(of=("self",))
+            .filter(Q(folder_id=folder.id) | Q(user_group_id__in=group_ids))
+            .select_related("role", "user_group")
+            .order_by("id")
+        )
+        if len(groups) > 1 or len(assignments) != len(groups):
+            raise PermissionDenied("The audit enclave contains unrelated IAM objects.")
+        if groups:
+            group = groups[0]
+            assignment = assignments[0]
+            if (
+                not group.builtin
+                or group.name != UserGroupCodename.THIRD_PARTY_RESPONDENT.value
+                or not assignment.builtin
+                or assignment.user_id is not None
+                or assignment.user_group_id != group.id
+                or assignment.folder_id != folder.id
+                or assignment.role.name != RoleCodename.THIRD_PARTY_RESPONDENT.value
+                or not assignment.is_recursive
+                or set(assignment.perimeter_folders.values_list("id", flat=True))
+                != {folder.id}
+            ):
+                raise PermissionDenied(
+                    "The audit enclave contains unrelated IAM objects."
                 )
 
-        return super().destroy(request, *args, **kwargs)
+            membership_field = User._meta.get_field("user_groups")
+            membership_through = membership_field.remote_field.through
+            membership_source = membership_field.m2m_field_name()
+            membership_target = membership_field.m2m_reverse_field_name()
+            membership_filter = {f"{membership_target}_id": group.id}
+            membership_rows = list(
+                membership_through.objects.select_for_update()
+                .filter(**membership_filter)
+                .order_by("pk")
+            )
+            member_ids = {
+                getattr(row, f"{membership_source}_id") for row in membership_rows
+            }
+            if member_ids != set(expected_respondent_user_ids):
+                raise PermissionDenied(
+                    "The audit respondent membership is inconsistent."
+                )
+            locked_user_ids = set(
+                User.objects.select_for_update(of=("self",))
+                .filter(id__in=member_ids)
+                .values_list("id", flat=True)
+            )
+            try:
+                visible_user_ids = set(
+                    RoleAssignment.get_viewable_object_ids(user, User)
+                )
+            except (NotImplementedError, Permission.DoesNotExist):
+                visible_user_ids = set()
+            if locked_user_ids != member_ids or not member_ids.issubset(
+                visible_user_ids
+            ):
+                raise PermissionDenied(
+                    "The audit respondent membership is unavailable."
+                )
+        elif expected_respondent_user_ids:
+            raise PermissionDenied("The audit respondent membership is missing.")
+
+        perimeter_field = RoleAssignment._meta.get_field("perimeter_folders")
+        perimeter_through = perimeter_field.remote_field.through
+        perimeter_source = perimeter_field.m2m_field_name()
+        perimeter_target = perimeter_field.m2m_reverse_field_name()
+        perimeter_filter = {f"{perimeter_target}_id": folder.id}
+        perimeter_rows = list(
+            perimeter_through.objects.select_for_update()
+            .filter(**perimeter_filter)
+            .order_by("pk")
+        )
+        perimeter_assignment_ids = {
+            getattr(row, f"{perimeter_source}_id") for row in perimeter_rows
+        }
+        if perimeter_assignment_ids != {assignment.id for assignment in assignments}:
+            # In particular, never cascade a Folder merely because an external
+            # RoleAssignment happens to point at it through perimeter_folders.
+            raise PermissionDenied(
+                "The audit enclave has external IAM perimeter links."
+            )
+
+        allowed_labels = {"iam.usergroup", "iam.roleassignment"}
+        for relation in Folder._meta.related_objects:
+            related_model = relation.related_model
+            if relation.many_to_many:
+                field = relation.field
+                relation_key = (related_model._meta.label_lower, field.name)
+                if relation_key in {
+                    ("iam.folder", "descendants"),
+                    ("iam.roleassignment", "perimeter_folders"),
+                }:
+                    continue
+                through = field.remote_field.through
+                target_name = field.m2m_reverse_field_name()
+                rows = list(
+                    through.objects.select_for_update()
+                    .filter(**{f"{target_name}_id": folder.id})
+                    .order_by("pk")
+                )
+                if rows:
+                    raise PermissionDenied(
+                        "The audit enclave has unrelated many-to-many links."
+                    )
+                continue
+            if (
+                related_model._meta.auto_created
+                or related_model._meta.label_lower in allowed_labels
+            ):
+                continue
+            accessor = relation.get_accessor_name()
+            if not accessor:
+                continue
+            try:
+                related = getattr(folder, accessor, None)
+            except related_model.DoesNotExist:
+                continue
+            if related is None:
+                continue
+            if hasattr(related, "exists"):
+                has_rows = related.exists()
+            else:
+                has_rows = True
+            if has_rows:
+                raise PermissionDenied(
+                    "The audit enclave contains unrelated governed objects."
+                )
+
+    @staticmethod
+    def _assert_complete_linked_audit_read_access(user, audit):
+        """Prove the complete linked-audit projection, not a redacted subset."""
+
+        from core.compliance_deletion import (
+            assert_complete_compliance_assessment_deletion_access,
+        )
+
+        return assert_complete_compliance_assessment_deletion_access(user, audit)
+
+    @staticmethod
+    def _lock_linked_audit_deletion_graph(
+        *,
+        user,
+        audit,
+        entity_assessment,
+        allowed_reverse_owner_ids_by_relation=None,
+    ):
+        """Delegate the exact-EA path to the core-owned deletion closure."""
+
+        from core.compliance_deletion import (
+            lock_compliance_assessment_deletion_graph,
+        )
+
+        return lock_compliance_assessment_deletion_graph(
+            user=user,
+            audit=audit,
+            entity_assessment=entity_assessment,
+            allowed_reverse_owner_ids_by_relation=(
+                allowed_reverse_owner_ids_by_relation
+            ),
+            complete_access_check=(
+                EntityAssessmentViewSet._assert_complete_linked_audit_read_access
+            ),
+        )
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        """Delete an EA and its owned enclave through one governed path.
+
+        ``perform_destroy`` is shared by the normal detail endpoint and the
+        generic batch endpoint.  Authorization must precede deleting the
+        enclave because that folder cascades the linked audit and its children.
+        """
+
+        from core.utils import has_full_view_compliance_assessment
+        from core.models import ValidationFlow
+        from core.views import (
+            _assert_assessment_mutation_state,
+            _assert_object_action_permission,
+            dispatch_webhook_event,
+        )
+        from pmbok.models import GenericCollection
+
+        Folder._lock_folder_tree()
+        expected_folder_id = instance.folder_id
+        expected_audit_id = instance.compliance_assessment_id
+
+        expected_audit_folder_id = None
+        if expected_audit_id is not None:
+            expected_audit_folder_id = (
+                ComplianceAssessment.objects.filter(id=expected_audit_id)
+                .values_list("folder_id", flat=True)
+                .first()
+            )
+            if expected_audit_folder_id is None:
+                raise PermissionDenied("The linked audit is unavailable.")
+
+        def reverse_owner_snapshot(owner_model, field_name, target_id):
+            field = owner_model._meta.get_field(field_name)
+            through = field.remote_field.through
+            source_name = field.m2m_field_name()
+            target_name = field.m2m_reverse_field_name()
+            row_filter = {f"{target_name}_id": target_id}
+            owner_ids = set(
+                through.objects.filter(**row_filter).values_list(
+                    f"{source_name}_id", flat=True
+                )
+            )
+            return through, row_filter, source_name, owner_ids
+
+        owner_snapshots = [
+            (
+                GenericCollection,
+                reverse_owner_snapshot(
+                    GenericCollection, "entity_assessments", instance.id
+                ),
+            ),
+            (
+                ValidationFlow,
+                reverse_owner_snapshot(
+                    ValidationFlow, "entity_assessments", instance.id
+                ),
+            ),
+        ]
+        if expected_audit_id is not None:
+            owner_snapshots.extend(
+                [
+                    (
+                        GenericCollection,
+                        reverse_owner_snapshot(
+                            GenericCollection,
+                            "compliance_assessments",
+                            expected_audit_id,
+                        ),
+                    ),
+                    (
+                        ValidationFlow,
+                        reverse_owner_snapshot(
+                            ValidationFlow,
+                            "compliance_assessments",
+                            expected_audit_id,
+                        ),
+                    ),
+                ]
+            )
+
+        owner_ids_by_model = {GenericCollection: set(), ValidationFlow: set()}
+        for owner_model, (_through, _filter, _source, owner_ids) in owner_snapshots:
+            owner_ids_by_model[owner_model].update(owner_ids)
+
+        owner_folder_snapshots = {}
+        for owner_model, owner_ids in owner_ids_by_model.items():
+            folder_by_id = dict(
+                owner_model.objects.filter(id__in=owner_ids).values_list(
+                    "id", "folder_id"
+                )
+            )
+            if set(folder_by_id) != owner_ids or any(
+                folder_id is None for folder_id in folder_by_id.values()
+            ):
+                raise PermissionDenied(
+                    "An assessment relationship owner is unavailable."
+                )
+            owner_folder_snapshots[owner_model] = folder_by_id
+
+        folder_ids = {expected_folder_id, expected_audit_folder_id}
+        for folder_by_id in owner_folder_snapshots.values():
+            folder_ids.update(folder_by_id.values())
+        folder_ids.discard(None)
+        locked_folders = {
+            folder.id: folder
+            for folder in Folder.objects.select_for_update(of=("self",))
+            .filter(id__in=folder_ids)
+            .order_by("id")
+        }
+        if set(locked_folders) != folder_ids:
+            raise PermissionDenied("An assessment owner is unavailable.")
+
+        locked_owners = {}
+        for owner_model in sorted(
+            owner_ids_by_model, key=lambda model: model._meta.label_lower
+        ):
+            owner_ids = owner_ids_by_model[owner_model]
+            rows = {
+                row.id: row
+                for row in owner_model.objects.select_for_update(of=("self",))
+                .filter(id__in=owner_ids)
+                .order_by("id")
+            }
+            if set(rows) != owner_ids or any(
+                row.folder_id != owner_folder_snapshots[owner_model][row.id]
+                for row in rows.values()
+            ):
+                raise PermissionDenied(
+                    "An assessment relationship owner changed; retry."
+                )
+            locked_owners[owner_model] = rows
+
+        locked_audit = None
+        if expected_audit_id is not None:
+            locked_audit = get_object_or_404(
+                ComplianceAssessment.objects.select_for_update(of=("self",)),
+                id=expected_audit_id,
+            )
+            if locked_audit.folder_id != expected_audit_folder_id:
+                raise PermissionDenied("The linked audit owner changed; retry.")
+        locked_instance = get_object_or_404(
+            EntityAssessment.objects.select_for_update(of=("self",)),
+            id=instance.id,
+        )
+        if (
+            locked_instance.folder_id != expected_folder_id
+            or locked_instance.compliance_assessment_id != expected_audit_id
+        ):
+            raise PermissionDenied("The assessment owner changed; retry.")
+
+        for _owner_model, snapshot in sorted(
+            owner_snapshots, key=lambda item: item[1][0]._meta.db_table
+        ):
+            through, row_filter, source_name, expected_owner_ids = snapshot
+            list(
+                through.objects.select_for_update().filter(**row_filter).order_by("pk")
+            )
+            current_owner_ids = set(
+                through.objects.filter(**row_filter).values_list(
+                    f"{source_name}_id", flat=True
+                )
+            )
+            if current_owner_ids != expected_owner_ids:
+                raise PermissionDenied(
+                    "Assessment relationship ownership changed; retry."
+                )
+
+        generic_collection_ids = owner_ids_by_model[GenericCollection]
+        if generic_collection_ids:
+            visible_collection_ids = set(
+                RoleAssignment.get_viewable_object_ids(
+                    self.request.user, GenericCollection
+                )
+            )
+            if not generic_collection_ids.issubset(visible_collection_ids):
+                raise PermissionDenied(
+                    "One or more assessment collections are unavailable."
+                )
+            for collection in locked_owners[GenericCollection].values():
+                collection.folder = locked_folders[collection.folder_id]
+                _assert_object_action_permission(
+                    user=self.request.user,
+                    instance=collection,
+                    action="change",
+                )
+
+        if owner_ids_by_model[ValidationFlow]:
+            # ValidationFlow owns its status transition and approver history.
+            # Deleting an assessment must never silently rewrite that workflow,
+            # including terminal/accepted records; unlink it through the
+            # governed validation-flow API first.
+            raise PermissionDenied(
+                "The assessment is linked to a validation flow; unlink it "
+                "through the validation workflow before deletion."
+            )
+
+        if locked_instance.folder_id not in locked_folders:
+            raise PermissionDenied("The assessment owner is unavailable.")
+        locked_instance.folder = locked_folders[locked_instance.folder_id]
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=locked_instance,
+            action="delete",
+        )
+        # EntityAssessment inherits the same authoritative lifecycle fields as
+        # ComplianceAssessment.  Reprove its state after acquiring the row
+        # lock so both standalone and linked deletion paths fail closed.
+        _assert_assessment_mutation_state(locked_instance)
+
+        from tprm.deletion_authority import lock_entity_assessment_deletion_graph
+
+        lock_entity_assessment_deletion_graph(
+            user=self.request.user,
+            entity_assessment=locked_instance,
+            allowed_reverse_owner_ids_by_relation={
+                (
+                    "pmbok.genericcollection",
+                    "entity_assessments",
+                ): owner_ids_by_model[GenericCollection],
+            },
+        )
+        expected_respondent_user_ids = set(
+            locked_instance.representatives.values_list("id", flat=True)
+        )
+
+        if locked_audit is not None:
+            if locked_audit.folder_id not in locked_folders:
+                raise PermissionDenied("The audit owner is unavailable.")
+            locked_audit.folder = locked_folders[locked_audit.folder_id]
+            if locked_audit.folder.content_type == Folder.ContentType.ENCLAVE:
+                if locked_audit.folder.parent_folder_id != locked_instance.folder_id:
+                    raise PermissionDenied("The linked audit owner is inconsistent.")
+                enclave_audit_ids = set(
+                    ComplianceAssessment.objects.select_for_update(of=("self",))
+                    .filter(folder_id=locked_audit.folder_id)
+                    .order_by("id")
+                    .values_list("id", flat=True)
+                )
+                if enclave_audit_ids != {locked_audit.id}:
+                    raise PermissionDenied("The audit enclave is not exclusive.")
+                if (
+                    EntityAssessment.objects.filter(
+                        compliance_assessment_id=locked_audit.id
+                    )
+                    .exclude(id=locked_instance.id)
+                    .exists()
+                ):
+                    raise PermissionDenied(
+                        "The audit is linked to another entity assessment."
+                    )
+                if not has_full_view_compliance_assessment(
+                    self.request.user, locked_audit
+                ):
+                    raise PermissionDenied(
+                        "Complete audit data is unavailable for this caller."
+                    )
+                _assert_assessment_mutation_state(locked_audit)
+                _assert_object_action_permission(
+                    user=self.request.user,
+                    instance=locked_audit,
+                    action="delete",
+                )
+                _assert_object_action_permission(
+                    user=self.request.user,
+                    instance=locked_audit.folder,
+                    action="delete",
+                )
+                self._lock_linked_audit_deletion_graph(
+                    user=self.request.user,
+                    audit=locked_audit,
+                    entity_assessment=locked_instance,
+                    allowed_reverse_owner_ids_by_relation={
+                        (
+                            "tprm.entityassessment",
+                            "compliance_assessment",
+                        ): {locked_instance.id},
+                        (
+                            "pmbok.genericcollection",
+                            "compliance_assessments",
+                        ): owner_ids_by_model[GenericCollection],
+                    },
+                )
+                logger.info(
+                    "deleting_compliance_assessment_folder",
+                    folder_id=str(locked_audit.folder_id),
+                    content_type=str(locked_audit.folder.content_type),
+                )
+                enclave = locked_audit.folder
+                locked_audit.delete()
+                serializer_class = self.get_serializer_class(action="destroy")
+                serializer = serializer_class(
+                    locked_instance,
+                    context=self.get_serializer_context(),
+                )
+                serializer.delete(locked_instance)
+                self._assert_enclave_contains_only_iam_scaffolding(
+                    enclave,
+                    expected_respondent_user_ids=expected_respondent_user_ids,
+                    user=self.request.user,
+                )
+                enclave.delete()
+                try:
+                    dispatch_webhook_event(locked_instance, "deleted")
+                except Exception:
+                    logger.error("Webhook dispatch failed on delete", exc_info=True)
+                return None
+            else:
+                raise PermissionDenied("The linked audit owner is inconsistent.")
+
+        return super().perform_destroy(locked_instance)
+
+    def batch_action(self, request):
+        if request.data.get("action") in {"add_m2m", "remove_m2m"}:
+            return Response(
+                {
+                    "error": (
+                        "Entity assessment relationships require exact "
+                        "change_m2m replacement semantics."
+                    )
+                },
+                status=HTTP_400_BAD_REQUEST,
+            )
+        return super().batch_action(request)
 
     @action(detail=False, name="Get status choices")
     def status(self, request):
@@ -1129,57 +1675,121 @@ class EntityAssessmentViewSet(BaseModelViewSet):
 
     @action(detail=False, name="Get TPRM metrics")
     def metrics(self, request):
-        assessments_data = []
+        def visible_ids(model):
+            try:
+                return set(RoleAssignment.get_viewable_object_ids(request.user, model))
+            except (NotImplementedError, Permission.DoesNotExist):
+                return set()
 
-        viewable_items = RoleAssignment.get_viewable_object_ids(
-            request.user, EntityAssessment
+        viewable_items = visible_ids(EntityAssessment)
+        visible_entities = visible_ids(Entity)
+        visible_folders = visible_ids(Folder)
+        visible_solutions = visible_ids(Solution)
+        visible_assessments = visible_ids(ComplianceAssessment)
+        visible_frameworks = visible_ids(Framework)
+        visible_actors = visible_ids(Actor)
+        visible_users = visible_ids(User)
+        visible_teams = visible_ids(Team)
+
+        queryset = (
+            EntityAssessment.objects.filter(id__in=viewable_items)
+            .select_related("folder", "entity", "compliance_assessment__framework")
+            .prefetch_related(
+                "solutions",
+                Prefetch(
+                    "reviewers",
+                    queryset=Actor.objects.select_related("user", "team", "entity"),
+                ),
+            )
+            .order_by("id")
         )
-
-        for ea in EntityAssessment.objects.filter(id__in=viewable_items).select_related(
-            "folder", "entity"
-        ):
-            # Use entity assessment's folder for grouping
+        assessments_data = []
+        for ea in queryset:
             folder = ea.folder
-            entry = {
-                "entity_assessment_id": ea.id,
-                "provider": ea.entity.name,
-                "folder_id": str(folder.id) if folder else None,
-                "folder_name": folder.name if folder else None,
-                "solutions": ",".join([sol.name for sol in ea.solutions.all()])
-                if len(ea.solutions.all()) > 0
-                else "-",
-                "baseline": ea.compliance_assessment.framework.name
-                if ea.compliance_assessment
-                else "-",
-                "due_date": ea.due_date.strftime("%Y-%m-%d") if ea.due_date else "-",
-                "last_update": ea.updated_at.strftime("%Y-%m-%d")
-                if ea.updated_at
-                else "-",
-                "conclusion": ea.conclusion if ea.conclusion else "ongoing",
-                "compliance_assessment_id": ea.compliance_assessment.id
-                if ea.compliance_assessment
-                else "#",
-                "reviewers": ",".join([str(re.specific) for re in ea.reviewers.all()])
-                if len(ea.reviewers.all())
-                else "-",
-                "observation": ea.observation if ea.observation else "-",
-                "has_questions": ea.compliance_assessment.has_questions
-                if ea.compliance_assessment
-                else False,
-            }
+            solutions = list(ea.solutions.all())
+            solution_ids = {solution.id for solution in solutions}
+            reviewers = list(ea.reviewers.all())
+            reviewer_ids = {reviewer.id for reviewer in reviewers}
 
-            completion = (
-                ea.compliance_assessment.answers_progress
-                if ea.compliance_assessment
-                else 0
-            )
-            entry.update({"completion": completion})
+            # This endpoint returns an aggregate row, not a sparse object
+            # serializer.  Returning placeholders for hidden relations still
+            # reveals that an assessment/audit exists and lets callers compare
+            # hidden progress over time.  Admit the row only when every carrier
+            # used by the projection is independently visible.
+            if (
+                folder is None
+                or folder.id not in visible_folders
+                or ea.entity_id not in visible_entities
+                or not solution_ids.issubset(visible_solutions)
+            ):
+                continue
 
-            review_progress = (
-                ea.compliance_assessment.progress if ea.compliance_assessment else 0
+            audit = ea.compliance_assessment
+            complete_audit_visible = False
+            if audit is not None:
+                if audit.id not in visible_assessments:
+                    continue
+                try:
+                    self._assert_complete_linked_audit_read_access(request.user, audit)
+                except (PermissionDenied, NotImplementedError, Permission.DoesNotExist):
+                    continue
+                else:
+                    complete_audit_visible = True
+
+            provider = ea.entity.name
+            solution_names = ",".join(solution.name for solution in solutions)
+            reviewer_carriers_visible = all(
+                (reviewer.user_id is not None and reviewer.user_id in visible_users)
+                or (reviewer.team_id is not None and reviewer.team_id in visible_teams)
+                or (
+                    reviewer.entity_id is not None
+                    and reviewer.entity_id in visible_entities
+                )
+                for reviewer in reviewers
             )
-            entry.update({"review_progress": review_progress})
-            assessments_data.append(entry)
+            if (
+                not reviewer_ids.issubset(visible_actors)
+                or not reviewer_carriers_visible
+            ):
+                continue
+            reviewer_names = ",".join(str(reviewer.specific) for reviewer in reviewers)
+
+            baseline = "-"
+            if complete_audit_visible:
+                if audit.framework_id not in visible_frameworks:
+                    continue
+                baseline = audit.framework.name
+            assessments_data.append(
+                {
+                    "entity_assessment_id": ea.id,
+                    "provider": provider,
+                    "folder_id": (str(folder.id)),
+                    "folder_name": (folder.name),
+                    "solutions": solution_names,
+                    "baseline": baseline,
+                    "due_date": (
+                        ea.due_date.strftime("%Y-%m-%d") if ea.due_date else "-"
+                    ),
+                    "last_update": (
+                        ea.updated_at.strftime("%Y-%m-%d") if ea.updated_at else "-"
+                    ),
+                    "conclusion": ea.conclusion or "ongoing",
+                    "compliance_assessment_id": (
+                        audit.id if complete_audit_visible else "#"
+                    ),
+                    "reviewers": reviewer_names,
+                    "observation": ea.observation or "-",
+                    "has_questions": (
+                        audit.has_questions if complete_audit_visible else False
+                    ),
+                    "completion": (
+                        audit.answers_progress if complete_audit_visible else 0
+                    ),
+                    "review_progress": (
+                        audit.progress if complete_audit_visible else 0
+                    ),
+                }
+            )
 
         return Response(assessments_data)
 

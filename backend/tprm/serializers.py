@@ -1,20 +1,40 @@
 import structlog
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Permission
 from django.db import IntegrityError, transaction
 from django.utils.translation import gettext_lazy as _
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
 
+from core.assignment_access import (
+    ComplianceAssessmentRelocationError,
+    relocate_compliance_assessment_tree,
+)
 from core.models import (
-    Answer,
+    Actor,
     ComplianceAssessment,
+    Evidence,
     Framework,
+    Perimeter,
     RequirementAssessment,
     RequirementAssignment,
+    ValidationFlow,
+)
+from core.relation_locking import lock_rows_in_global_model_order
+from core.reserved_iam import (
+    MANAGED_TPRM_RESPONDENT_IAM_ERROR,
+    ManagedTprmRespondentIamError,
+    lock_and_assert_no_tprm_idp_group_inheritance,
 )
 from core.serializer_fields import FieldsRelatedField, HashSlugRelatedField
 from core.serializers import BaseModelSerializer
-from core.utils import RoleCodename, UserGroupCodename
+from core.utils import (
+    RoleCodename,
+    UserGroupCodename,
+    has_full_view_compliance_assessment,
+    is_field_editable_by,
+)
 from iam.models import Folder, Role, RoleAssignment, UserGroup
 from pmbok.models import GenericCollection
 from tprm.models import (
@@ -329,7 +349,31 @@ class ContractImportExportSerializer(BaseModelSerializer):
         ]
 
 
-class EntityAssessmentReadSerializer(BaseModelSerializer):
+class EntityAssessmentCollectionProjectionMixin:
+    """Read-only, IAM-filtered reverse GenericCollection projection."""
+
+    def get_genericcollection(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if user is None or not getattr(user, "is_authenticated", False):
+            return []
+        try:
+            visible_ids = set(
+                RoleAssignment.get_viewable_object_ids(user, GenericCollection)
+            )
+        except (NotImplementedError, Permission.DoesNotExist):
+            return []
+        return list(
+            obj.genericcollection_set.filter(id__in=visible_ids)
+            .order_by("id")
+            .values_list("id", flat=True)
+        )
+
+
+class EntityAssessmentReadSerializer(
+    EntityAssessmentCollectionProjectionMixin, BaseModelSerializer
+):
+    genericcollection = serializers.SerializerMethodField()
     compliance_assessment = FieldsRelatedField(fields=["id", "name"])
     evidence = FieldsRelatedField()
     perimeter = FieldsRelatedField()
@@ -339,29 +383,58 @@ class EntityAssessmentReadSerializer(BaseModelSerializer):
     representatives = FieldsRelatedField(many=True)
     authors = FieldsRelatedField(many=True)
     reviewers = FieldsRelatedField(many=True)
-    validation_flows = FieldsRelatedField(
-        many=True,
-        fields=[
-            "id",
-            "ref_id",
-            "status",
-            {"approver": ["id", "email", "first_name", "last_name"]},
-        ],
-        source="validationflow_set",
-    )
+    validation_flows = serializers.SerializerMethodField()
+
+    def get_validation_flows(self, obj):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if user is None or not getattr(user, "is_authenticated", False):
+            return []
+        try:
+            visible_flow_ids = set(
+                RoleAssignment.get_viewable_object_ids(user, ValidationFlow)
+            )
+            visible_user_ids = set(RoleAssignment.get_viewable_object_ids(user, User))
+        except (NotImplementedError, Permission.DoesNotExist):
+            return []
+        rows = []
+        for flow in (
+            obj.validationflow_set.filter(id__in=visible_flow_ids)
+            .select_related("approver")
+            .order_by("id")
+        ):
+            row = {
+                "id": flow.id,
+                "ref_id": flow.ref_id,
+                "status": flow.status,
+            }
+            # Hidden and absent approvers deliberately have the same wire
+            # representation.  Omitting the key only for a hidden identity
+            # exposes one bit of otherwise protected relationship state.
+            row["approver"] = None
+            if flow.approver_id in visible_user_ids:
+                row["approver"] = {
+                    "id": flow.approver.id,
+                    "email": flow.approver.email,
+                    "first_name": flow.approver.first_name,
+                    "last_name": flow.approver.last_name,
+                }
+            rows.append(row)
+        return rows
 
     class Meta:
         model = EntityAssessment
         exclude = ["penetration", "dependency", "maturity", "trust"]
 
 
-class EntityAssessmentWriteSerializer(BaseModelSerializer):
-    genericcollection = serializers.PrimaryKeyRelatedField(
-        source="genericcollection_set",
-        many=True,
-        required=False,
-        queryset=GenericCollection.objects.all(),
-    )
+class EntityAssessmentWriteSerializer(
+    EntityAssessmentCollectionProjectionMixin, BaseModelSerializer
+):
+    genericcollection = serializers.SerializerMethodField()
+    # The model FK is deliberately not a general write surface. Creating or
+    # relocating an audit must pass through the governed create_audit/link_audit
+    # flows below so their locks, full-view checks, and target-folder IAM run.
+    compliance_assessment = serializers.PrimaryKeyRelatedField(read_only=True)
     create_audit = serializers.BooleanField(default=False)
     framework = serializers.PrimaryKeyRelatedField(
         queryset=Framework.objects.all(), required=False
@@ -392,6 +465,708 @@ class EntityAssessmentWriteSerializer(BaseModelSerializer):
             )
         return locked
 
+    @staticmethod
+    def _assert_audit_owner_coherence(
+        entity_assessment,
+        audit,
+        *,
+        require_link=True,
+    ):
+        """Reject legacy or concurrent audit ownership outside one enclave."""
+
+        folder = getattr(audit, "folder", None)
+        if (
+            folder is None
+            or folder.content_type != Folder.ContentType.ENCLAVE
+            or folder.parent_folder_id != entity_assessment.folder_id
+        ):
+            raise PermissionDenied("The linked audit owner is inconsistent.")
+        audit_rows = ComplianceAssessment.objects.filter(folder_id=folder.id).order_by(
+            "id"
+        )
+        linked_rows = EntityAssessment.objects.filter(
+            compliance_assessment_id=audit.id
+        ).order_by("id")
+        if transaction.get_connection().in_atomic_block:
+            audit_rows = audit_rows.select_for_update(of=("self",))
+            linked_rows = linked_rows.select_for_update(of=("self",))
+        if set(audit_rows.values_list("id", flat=True)) != {audit.id}:
+            raise PermissionDenied("The audit enclave is not exclusive.")
+        linked_ids = set(linked_rows.values_list("id", flat=True))
+        expected_linked_ids = {entity_assessment.id} if require_link else set()
+        if require_link and linked_ids != expected_linked_ids:
+            raise PermissionDenied("The audit is linked to another entity assessment.")
+        if not require_link and linked_ids - {entity_assessment.id}:
+            raise PermissionDenied("The audit is linked to another entity assessment.")
+        if require_link and entity_assessment.compliance_assessment_id != audit.id:
+            raise PermissionDenied("The linked audit owner is inconsistent.")
+
+    def _lock_existing_audit_tree_authority(
+        self,
+        audit,
+        *,
+        fields,
+        assignment_sync_required=False,
+        assignment_create_required=False,
+    ):
+        """Lock and authorize an existing audit before identity/owner changes."""
+
+        request = self.context.get("request")
+        if request is None:
+            raise PermissionDenied("Complete audit data is unavailable.")
+        if audit.folder_id is None:
+            raise PermissionDenied("The audit owner is unavailable.")
+        audit.folder = Folder.objects.select_for_update().get(id=audit.folder_id)
+        if not has_full_view_compliance_assessment(request.user, audit):
+            raise PermissionDenied("Complete audit data is unavailable.")
+        if audit.is_locked or audit.status == ComplianceAssessment.Status.IN_REVIEW:
+            raise PermissionDenied("The audit is not editable.")
+        if not all(
+            is_field_editable_by(audit, field_name, "auditor") for field_name in fields
+        ):
+            raise PermissionDenied("The audit is not editable.")
+        self._check_object_perm(audit, "change", model=ComplianceAssessment)
+
+        assignments = list(
+            RequirementAssignment.objects.select_for_update(of=("self",))
+            .filter(compliance_assessment_id=audit.id)
+            .order_by("id")
+        )
+        if len(assignments) > 1 or any(
+            assignment.folder_id != audit.folder_id for assignment in assignments
+        ):
+            raise PermissionDenied("The audit assignment owner is inconsistent.")
+        if assignment_sync_required and assignments:
+            assignment = assignments[0]
+            if assignment.status not in {
+                RequirementAssignment.Status.DRAFT,
+                RequirementAssignment.Status.IN_PROGRESS,
+            }:
+                raise PermissionDenied("The audit assignment is not editable.")
+            if assignment.id not in set(
+                RoleAssignment.get_viewable_object_ids(
+                    request.user, RequirementAssignment
+                )
+            ):
+                raise PermissionDenied("The audit assignment is unavailable.")
+            self._check_object_perm(assignment, "change", model=RequirementAssignment)
+        elif assignment_create_required:
+            self._check_object_perm(
+                {},
+                "add",
+                folder=audit.folder,
+                model=RequirementAssignment,
+            )
+
+        requirement_assessments = list(
+            RequirementAssessment.objects.select_for_update(of=("self",))
+            .filter(compliance_assessment_id=audit.id)
+            .order_by("id")
+        )
+        if any(
+            requirement_assessment.folder_id != audit.folder_id
+            for requirement_assessment in requirement_assessments
+        ):
+            raise PermissionDenied(
+                "A requirement assessment has an inconsistent audit folder."
+            )
+        audit_requirement_assessment_ids = {
+            requirement_assessment.id
+            for requirement_assessment in requirement_assessments
+        }
+        for assignment in assignments:
+            assigned_ids = set(
+                assignment.requirement_assessments.values_list("id", flat=True)
+            )
+            if not assigned_ids.issubset(audit_requirement_assessment_ids):
+                raise PermissionDenied("The audit assignment scope is inconsistent.")
+
+        from core.views import ComplianceAssessmentViewSet
+
+        ComplianceAssessmentViewSet._assert_complete_assessment_read_access(
+            request.user, audit
+        )
+        return assignments, requirement_assessments
+
+    @staticmethod
+    def _m2m_snapshot(instance, field_name):
+        field = instance._meta.get_field(field_name)
+        source_name = field.m2m_field_name()
+        target_name = field.m2m_reverse_field_name()
+        through = field.remote_field.through
+        row_filter = {f"{source_name}_id": instance.id}
+        ids = set(
+            through.objects.filter(**row_filter).values_list(
+                f"{target_name}_id", flat=True
+            )
+        )
+        return through, row_filter, target_name, ids
+
+    def _lock_existing_audit_identity_rows(
+        self,
+        *,
+        audit,
+        entity_assessment,
+        assignments,
+        validated_data,
+        identity_fields,
+    ):
+        """Lock every identity carrier and reject partial hidden rewrites."""
+
+        request = self.context.get("request")
+        identity_fields = set(identity_fields)
+        requested_reviewers = (
+            list(validated_data.get("reviewers", entity_assessment.reviewers.all()))
+            if "reviewers" in identity_fields
+            else []
+        )
+        requested_representatives = (
+            list(
+                validated_data.get(
+                    "representatives", entity_assessment.representatives.all()
+                )
+            )
+            if "representatives" in identity_fields
+            else []
+        )
+        snapshots = []
+        if "reviewers" in identity_fields:
+            owners = [entity_assessment]
+            if audit is not None:
+                owners.append(audit)
+            for owner in owners:
+                snapshots.append(
+                    (owner, "reviewers", self._m2m_snapshot(owner, "reviewers"))
+                )
+        if "representatives" in identity_fields:
+            snapshots.append(
+                (
+                    entity_assessment,
+                    "representatives",
+                    self._m2m_snapshot(entity_assessment, "representatives"),
+                )
+            )
+            if audit is not None:
+                snapshots.append(
+                    (audit, "authors", self._m2m_snapshot(audit, "authors"))
+                )
+                for assignment in assignments:
+                    snapshots.append(
+                        (
+                            assignment,
+                            "actor",
+                            self._m2m_snapshot(assignment, "actor"),
+                        )
+                    )
+                    snapshots.append(
+                        (
+                            assignment,
+                            "requirement_assessments",
+                            self._m2m_snapshot(assignment, "requirement_assessments"),
+                        )
+                    )
+
+        user_ids = {user.id for user in requested_representatives}
+        actor_ids = {actor.id for actor in requested_reviewers}
+        for _owner, field_name, (_through, _row_filter, _target_name, ids) in snapshots:
+            if field_name == "representatives":
+                user_ids.update(ids)
+            elif field_name != "requirement_assessments":
+                actor_ids.update(ids)
+        representative_actor_ids = set(
+            Actor.objects.filter(user_id__in=user_ids).values_list("id", flat=True)
+        )
+        actor_ids.update(representative_actor_ids)
+        lock_rows_in_global_model_order({User: user_ids, Actor: actor_ids})
+
+        for _owner, _field_name, (
+            through,
+            row_filter,
+            target_name,
+            expected,
+        ) in snapshots:
+            list(
+                through.objects.select_for_update().filter(**row_filter).order_by("pk")
+            )
+            current = set(
+                through.objects.filter(**row_filter).values_list(
+                    f"{target_name}_id", flat=True
+                )
+            )
+            if current != expected:
+                raise PermissionDenied(
+                    "Audit identity links changed concurrently; retry."
+                )
+
+        if request is None:
+            raise PermissionDenied("Audit identity authority is unavailable.")
+        visible_user_ids = set(
+            RoleAssignment.get_viewable_object_ids(request.user, User)
+        )
+        visible_actor_ids = set(
+            RoleAssignment.get_viewable_object_ids(request.user, Actor)
+        )
+        if user_ids - visible_user_ids or actor_ids - visible_actor_ids:
+            raise PermissionDenied("One or more audit identities are unavailable.")
+
+    def _lock_existing_audit_relation_owners(self, audit):
+        """Freeze reverse owners before relocating an existing audit.
+
+        Moving a ComplianceAssessment changes the governing folder observed by
+        every collection/workflow that links it, even though Django only writes
+        the assessment row.  Treat those reverse links as authority-bearing:
+        GenericCollection may consent through independent view + change IAM;
+        ValidationFlow must be explicitly unlinked by its governed workflow.
+        """
+
+        request = self.context.get("request")
+        if request is None or not getattr(request.user, "is_authenticated", False):
+            raise PermissionDenied("Audit relationship authority is unavailable.")
+
+        snapshots = []
+        owner_ids_by_model = {}
+        for owner_model, field_name in (
+            (GenericCollection, "compliance_assessments"),
+            (ValidationFlow, "compliance_assessments"),
+        ):
+            field = owner_model._meta.get_field(field_name)
+            through = field.remote_field.through
+            source_name = field.m2m_field_name()
+            target_name = field.m2m_reverse_field_name()
+            row_filter = {f"{target_name}_id": audit.id}
+            owner_ids = set(
+                through.objects.filter(**row_filter).values_list(
+                    f"{source_name}_id", flat=True
+                )
+            )
+            snapshots.append((through, row_filter, source_name, owner_model, owner_ids))
+            owner_ids_by_model[owner_model] = owner_ids
+
+        folder_snapshots = {}
+        folder_ids = set()
+        for owner_model, owner_ids in owner_ids_by_model.items():
+            folder_by_owner = dict(
+                owner_model.objects.filter(id__in=owner_ids).values_list(
+                    "id", "folder_id"
+                )
+            )
+            if set(folder_by_owner) != owner_ids or any(
+                folder_id is None for folder_id in folder_by_owner.values()
+            ):
+                raise PermissionDenied("An audit relationship owner is unavailable.")
+            folder_snapshots[owner_model] = folder_by_owner
+            folder_ids.update(folder_by_owner.values())
+
+        locked_folders = {
+            folder.id: folder
+            for folder in Folder.objects.select_for_update(of=("self",))
+            .filter(id__in=folder_ids)
+            .order_by("id")
+        }
+        if set(locked_folders) != folder_ids:
+            raise PermissionDenied("An audit relationship owner is unavailable.")
+
+        locked_owners = {}
+        for owner_model in sorted(
+            owner_ids_by_model, key=lambda model: model._meta.label_lower
+        ):
+            owner_ids = owner_ids_by_model[owner_model]
+            owners = {
+                owner.id: owner
+                for owner in owner_model.objects.select_for_update(of=("self",))
+                .filter(id__in=owner_ids)
+                .order_by("id")
+            }
+            if set(owners) != owner_ids or any(
+                owner.folder_id != folder_snapshots[owner_model][owner.id]
+                for owner in owners.values()
+            ):
+                raise PermissionDenied("An audit relationship owner changed; retry.")
+            locked_owners[owner_model] = owners
+
+        for through, row_filter, source_name, _owner_model, expected in sorted(
+            snapshots, key=lambda item: item[0]._meta.db_table
+        ):
+            list(
+                through.objects.select_for_update(of=("self",))
+                .filter(**row_filter)
+                .order_by("pk")
+            )
+            current = set(
+                through.objects.filter(**row_filter).values_list(
+                    f"{source_name}_id", flat=True
+                )
+            )
+            if current != expected:
+                raise PermissionDenied("Audit relationships changed; retry.")
+
+        flow_ids = owner_ids_by_model[ValidationFlow]
+        if flow_ids:
+            raise PermissionDenied(
+                "The audit is linked to a validation flow; unlink it through "
+                "the validation workflow before relocation."
+            )
+
+        collection_ids = owner_ids_by_model[GenericCollection]
+        if collection_ids:
+            visible_collection_ids = set(
+                RoleAssignment.get_viewable_object_ids(request.user, GenericCollection)
+            )
+            if not collection_ids.issubset(visible_collection_ids):
+                raise PermissionDenied("One or more audit collections are unavailable.")
+            for collection in locked_owners[GenericCollection].values():
+                collection.folder = locked_folders[collection.folder_id]
+                self._check_object_perm(
+                    collection,
+                    "change",
+                    model=GenericCollection,
+                )
+
+    def _lock_entity_assessment_relation_owners(self, assessment):
+        """Authorize owners affected by an EA perimeter/folder relocation.
+
+        A reverse collection or validation-flow link does not change rows when
+        the assessment moves, but its governed target does.  Freeze the exact
+        owner/link set and require independent collection authority.  A
+        ValidationFlow must be explicitly unlinked through its workflow.
+        """
+
+        request = self.context.get("request")
+        if request is None or not getattr(request.user, "is_authenticated", False):
+            raise PermissionDenied("Assessment relationship authority is unavailable.")
+
+        snapshots = []
+        owner_ids_by_model = {}
+        for owner_model, field_name in (
+            (GenericCollection, "entity_assessments"),
+            (ValidationFlow, "entity_assessments"),
+        ):
+            field = owner_model._meta.get_field(field_name)
+            through = field.remote_field.through
+            source_name = field.m2m_field_name()
+            target_name = field.m2m_reverse_field_name()
+            row_filter = {f"{target_name}_id": assessment.id}
+            owner_ids = set(
+                through.objects.filter(**row_filter).values_list(
+                    f"{source_name}_id", flat=True
+                )
+            )
+            snapshots.append((through, row_filter, source_name, owner_model, owner_ids))
+            owner_ids_by_model[owner_model] = owner_ids
+
+        owner_folder_ids = {}
+        folder_ids = set()
+        for owner_model, owner_ids in owner_ids_by_model.items():
+            folder_by_owner = dict(
+                owner_model.objects.filter(id__in=owner_ids).values_list(
+                    "id", "folder_id"
+                )
+            )
+            if set(folder_by_owner) != owner_ids or any(
+                folder_id is None for folder_id in folder_by_owner.values()
+            ):
+                raise PermissionDenied(
+                    "An assessment relationship owner is unavailable."
+                )
+            owner_folder_ids[owner_model] = folder_by_owner
+            folder_ids.update(folder_by_owner.values())
+
+        locked_folders = {
+            folder.id: folder
+            for folder in Folder.objects.select_for_update(of=("self",))
+            .filter(id__in=folder_ids)
+            .order_by("id")
+        }
+        if set(locked_folders) != folder_ids:
+            raise PermissionDenied("An assessment relationship owner is unavailable.")
+
+        locked_owners = {}
+        for owner_model in sorted(
+            owner_ids_by_model, key=lambda model: model._meta.label_lower
+        ):
+            owner_ids = owner_ids_by_model[owner_model]
+            owners = {
+                owner.id: owner
+                for owner in owner_model.objects.select_for_update(of=("self",))
+                .filter(id__in=owner_ids)
+                .order_by("id")
+            }
+            if set(owners) != owner_ids or any(
+                owner.folder_id != owner_folder_ids[owner_model][owner.id]
+                for owner in owners.values()
+            ):
+                raise PermissionDenied(
+                    "An assessment relationship owner changed; retry."
+                )
+            locked_owners[owner_model] = owners
+
+        for through, row_filter, source_name, _owner_model, expected in sorted(
+            snapshots, key=lambda item: item[0]._meta.db_table
+        ):
+            list(
+                through.objects.select_for_update().filter(**row_filter).order_by("pk")
+            )
+            current = set(
+                through.objects.filter(**row_filter).values_list(
+                    f"{source_name}_id", flat=True
+                )
+            )
+            if current != expected:
+                raise PermissionDenied(
+                    "Assessment relationships changed concurrently; retry."
+                )
+
+        if owner_ids_by_model[ValidationFlow]:
+            raise PermissionDenied(
+                "The assessment is linked to a validation flow; unlink it "
+                "through the validation workflow before relocation."
+            )
+
+        collection_ids = owner_ids_by_model[GenericCollection]
+        if collection_ids:
+            try:
+                visible_collection_ids = set(
+                    RoleAssignment.get_viewable_object_ids(
+                        request.user, GenericCollection
+                    )
+                )
+            except (NotImplementedError, Permission.DoesNotExist) as exc:
+                raise PermissionDenied(
+                    "One or more assessment collections are unavailable."
+                ) from exc
+            if not collection_ids.issubset(visible_collection_ids):
+                raise PermissionDenied(
+                    "One or more assessment collections are unavailable."
+                )
+            for collection in locked_owners[GenericCollection].values():
+                collection.folder = locked_folders[collection.folder_id]
+                self._check_object_perm(
+                    collection,
+                    "change",
+                    model=GenericCollection,
+                )
+
+    def _lock_and_validate_entity_relations(
+        self,
+        *,
+        instance,
+        validated_data,
+        validate_representatives=False,
+        validate_reviewers=False,
+        validate_solutions=False,
+    ):
+        """Lock, re-read and authorize every relation used by an EA write.
+
+        Base serializer validation happens before the write transaction and only
+        checks non-empty submitted M2M values.  This transaction-time proof also
+        covers empty replacements, hidden existing members, reverse generic
+        collections, FK targets, and the entity-specific respondent binding.
+        """
+
+        request = self.context.get("request")
+        if request is None or not getattr(request.user, "is_authenticated", False):
+            raise PermissionDenied("Entity assessment authority is unavailable.")
+
+        relation_specs = {
+            "reviewers": (Actor, "reviewers"),
+            "authors": (Actor, "authors"),
+            "representatives": (User, "representatives"),
+            "solutions": (Solution, "solutions"),
+        }
+        target_ids_by_model = {}
+        requested_ids_by_field = {}
+        snapshots = []
+
+        def add_ids(model, values):
+            target_ids_by_model.setdefault(model, set()).update(values)
+
+        for data_key, (model, model_field_name) in relation_specs.items():
+            force_existing = (
+                data_key == "representatives" and validate_representatives
+            ) or (data_key == "reviewers" and validate_reviewers)
+            if data_key not in validated_data and not force_existing:
+                continue
+            requested = list(
+                validated_data.get(
+                    data_key,
+                    getattr(instance, model_field_name).all()
+                    if instance is not None and model_field_name is not None
+                    else (),
+                )
+            )
+            requested_ids = [item.id for item in requested]
+            requested_ids_by_field[data_key] = requested_ids
+            add_ids(model, requested_ids)
+            if instance is not None:
+                snapshot = self._m2m_snapshot(instance, model_field_name)
+                snapshots.append(snapshot)
+                add_ids(model, snapshot[3])
+
+        entity = validated_data.get("entity")
+        if entity is None and instance is not None:
+            entity = instance.entity
+        if entity is None:
+            raise PermissionDenied("The assessed entity is unavailable.")
+        if (
+            instance is not None
+            and "entity" in validated_data
+            and entity.id != instance.entity_id
+        ):
+            raise PermissionDenied({"entity": "This field is immutable"})
+        entity_id = entity.id
+        add_ids(Entity, {entity_id})
+
+        for data_key, model in (("perimeter", Perimeter), ("evidence", Evidence)):
+            include_current_for_folder = (
+                data_key == "perimeter"
+                and instance is not None
+                and "folder" in validated_data
+            )
+            if data_key not in validated_data and not include_current_for_folder:
+                continue
+            requested = validated_data.get(data_key)
+            ids = {requested.id} if requested is not None else set()
+            if instance is not None:
+                current_id = getattr(instance, f"{data_key}_id")
+                if current_id is not None:
+                    ids.add(current_id)
+            add_ids(model, ids)
+
+        if "folder" in validated_data:
+            requested_folder = validated_data["folder"]
+            folder_ids = (
+                {requested_folder.id} if requested_folder is not None else set()
+            )
+            if instance is not None and instance.folder_id is not None:
+                folder_ids.add(instance.folder_id)
+            add_ids(Folder, folder_ids)
+
+        final_representatives = list(
+            validated_data.get(
+                "representatives",
+                instance.representatives.all() if instance is not None else (),
+            )
+        )
+        final_solutions = list(
+            validated_data.get(
+                "solutions", instance.solutions.all() if instance is not None else ()
+            )
+        )
+        representative_ids = (
+            {user.id for user in final_representatives}
+            if validate_representatives
+            else set()
+        )
+        solution_ids = (
+            {solution.id for solution in final_solutions}
+            if validate_solutions
+            else set()
+        )
+        add_ids(User, representative_ids)
+        add_ids(Solution, solution_ids)
+
+        representative_actor_ids = set(
+            Actor.objects.filter(user_id__in=representative_ids).values_list(
+                "id", flat=True
+            )
+        )
+        representative_row_ids = set(
+            Representative.objects.filter(
+                entity_id=entity_id,
+                user_id__in=representative_ids,
+            ).values_list("id", flat=True)
+        )
+        add_ids(Actor, representative_actor_ids)
+        add_ids(Representative, representative_row_ids)
+
+        locked = lock_rows_in_global_model_order(target_ids_by_model)
+
+        for through, row_filter, target_name, expected in snapshots:
+            list(
+                through.objects.select_for_update().filter(**row_filter).order_by("pk")
+            )
+            current = set(
+                through.objects.filter(**row_filter).values_list(
+                    f"{target_name}_id", flat=True
+                )
+            )
+            if current != expected:
+                raise PermissionDenied(
+                    "Entity assessment relations changed concurrently; retry."
+                )
+
+        for model, row_ids in target_ids_by_model.items():
+            if row_ids and not row_ids.issubset(
+                set(RoleAssignment.get_viewable_object_ids(request.user, model))
+            ):
+                raise PermissionDenied(
+                    "One or more entity assessment relations are unavailable."
+                )
+
+        locked_entity = locked[Entity][entity_id]
+        locked_users = locked.get(User, {})
+        locked_solutions = locked.get(Solution, {})
+        if validate_solutions and any(
+            solution.provider_entity_id != entity_id
+            for solution in (locked_solutions[item_id] for item_id in solution_ids)
+        ):
+            raise PermissionDenied("Every solution must belong to the assessed entity.")
+
+        locked_actors = locked.get(Actor, {})
+        locked_representative_rows = locked.get(Representative, {})
+        actor_user_ids = {
+            actor.user_id
+            for actor_id, actor in locked_actors.items()
+            if actor_id in representative_actor_ids and actor.user_id is not None
+        }
+        bound_user_ids = {
+            representative.user_id
+            for representative in locked_representative_rows.values()
+            if representative.entity_id == entity_id
+            and representative.user_id is not None
+        }
+        if validate_representatives and (
+            actor_user_ids != representative_ids
+            or bound_user_ids != representative_ids
+            or any(
+                not locked_users[user_id].is_active
+                or not locked_users[user_id].is_third_party
+                for user_id in representative_ids
+            )
+        ):
+            raise PermissionDenied(
+                "Every representative must be an active third-party contact for this entity."
+            )
+
+        for data_key, (model, _model_field_name) in relation_specs.items():
+            if data_key in requested_ids_by_field:
+                validated_data[data_key] = [
+                    locked[model][item_id]
+                    for item_id in requested_ids_by_field[data_key]
+                ]
+        if instance is None or "entity" in validated_data:
+            validated_data["entity"] = locked_entity
+        for data_key, model in (("perimeter", Perimeter), ("evidence", Evidence)):
+            value = validated_data.get(data_key)
+            if data_key in validated_data and value is not None:
+                validated_data[data_key] = locked[model][value.id]
+        if "folder" in validated_data and validated_data["folder"] is not None:
+            validated_data["folder"] = locked[Folder][validated_data["folder"].id]
+
+        return {
+            "entity": locked_entity,
+            "representatives": (
+                [locked_users[user.id] for user in final_representatives]
+                if validate_representatives
+                else final_representatives
+            ),
+            "solutions": (
+                [locked_solutions[solution.id] for solution in final_solutions]
+                if validate_solutions
+                else final_solutions
+            ),
+        }
+
     def _make_enclave_folder(self, instance):
         return Folder.objects.create(
             content_type=Folder.ContentType.ENCLAVE,
@@ -401,14 +1176,25 @@ class EntityAssessmentWriteSerializer(BaseModelSerializer):
 
     def _finalize_linked_audit(self, instance, audit):
         """Shared tail for create/link."""
+        self._assert_audit_owner_coherence(instance, audit, require_link=False)
+        assignment = audit.requirement_assignments.first()
+        representatives = list(instance.representatives.all())
+        if assignment is not None or representatives:
+            self._check_object_perm(
+                assignment or {},
+                "change" if assignment is not None else "add",
+                folder=audit.folder,
+                model=RequirementAssignment,
+            )
         audit.reviewers.set(instance.reviewers.all())
-        representatives = instance.representatives.all()
         audit.authors.set(
             [rep.actor for rep in representatives if hasattr(rep, "actor")]
         )
         self._create_requirement_assignment(audit, representatives)
         instance.compliance_assessment = audit
         instance.save()
+        self._assert_audit_owner_coherence(instance, audit)
+        return instance
 
     def _create_audit(self, instance, audit_data):
         if not audit_data.get("framework"):
@@ -418,36 +1204,100 @@ class EntityAssessmentWriteSerializer(BaseModelSerializer):
             locked = self._lock_instance_without_audit(instance, "create_audit")
             from core.utils import build_initial_field_visibility
 
+            framework = Framework.objects.select_for_update().get(
+                id=audit_data["framework"].id
+            )
+            request = self.context.get("request")
+            if request is None or framework.id not in set(
+                RoleAssignment.get_viewable_object_ids(request.user, Framework)
+            ):
+                raise PermissionDenied(
+                    {"framework": [_("The framework is unavailable.")]}
+                )
+
+            enclave = self._make_enclave_folder(locked)
+            self._check_object_perm(
+                {},
+                "add",
+                folder=enclave,
+                model=ComplianceAssessment,
+            )
             # Enclave audits carry no perimeter: the enclave folder, not the
             # entity assessment's perimeter, governs their placement.
             audit = ComplianceAssessment.objects.create(
                 name=locked.name,
-                framework=audit_data["framework"],
+                framework=framework,
                 selected_implementation_groups=audit_data[
                     "selected_implementation_groups"
                 ],
-                field_visibility=build_initial_field_visibility(
-                    audit_data["framework"]
-                ),
+                field_visibility=build_initial_field_visibility(framework),
+                folder=enclave,
             )
 
-            enclave = self._make_enclave_folder(instance)
-            audit.folder = enclave
-            audit.save()
-
             audit.create_requirement_assessments()
-            self._finalize_linked_audit(instance, audit)
+            return self._finalize_linked_audit(locked, audit)
 
     def _link_existing_audit(self, instance, audit_data):
         with transaction.atomic():
-            self._lock_instance_without_audit(instance, "link_audit")
+            # Stabilize folder ancestry before any object/owner lock.  Every
+            # IAM decision below is derived from that hierarchy, including the
+            # independent GenericCollection owner check.
+            Folder._lock_folder_tree()
+            locked = self._lock_instance_without_audit(instance, "link_audit")
             source_audit = ComplianceAssessment.objects.select_for_update().get(
                 pk=audit_data["link_audit"].pk
+            )
+            if source_audit.folder_id is not None:
+                source_audit.folder = Folder.objects.select_for_update().get(
+                    id=source_audit.folder_id
+                )
+            request = self.context.get("request")
+            if request is None or not has_full_view_compliance_assessment(
+                request.user, source_audit
+            ):
+                raise PermissionDenied(
+                    {"link_audit": [_("Complete audit data is unavailable.")]}
+                )
+            if source_audit.is_locked or (
+                source_audit.status == ComplianceAssessment.Status.IN_REVIEW
+            ):
+                raise PermissionDenied(
+                    {"link_audit": [_("The audit is not editable.")]}
+                )
+            if not all(
+                is_field_editable_by(source_audit, field_name, "auditor")
+                for field_name in ("authors", "reviewers", "perimeter")
+            ):
+                raise PermissionDenied(
+                    {"link_audit": [_("The audit is not editable.")]}
+                )
+            # Reuse the complete-audit projection gate rather than treating a
+            # generic CA change permission as authority over hidden child rows.
+            from core.views import ComplianceAssessmentViewSet
+
+            ComplianceAssessmentViewSet._assert_complete_assessment_read_access(
+                request.user, source_audit
             )
             # Linking relocates the audit itself, so the user needs
             # change_complianceassessment in the audit's current folder —
             # not this serializer's own change_entityassessment.
             self._check_object_perm(source_audit, "change", model=ComplianceAssessment)
+            assignments, _requirement_assessments = (
+                self._lock_existing_audit_tree_authority(
+                    source_audit,
+                    fields=("authors", "reviewers", "perimeter"),
+                    assignment_sync_required=True,
+                    assignment_create_required=locked.representatives.exists(),
+                )
+            )
+            self._lock_existing_audit_identity_rows(
+                audit=source_audit,
+                entity_assessment=locked,
+                assignments=assignments,
+                validated_data={},
+                identity_fields=("reviewers", "representatives"),
+            )
+            self._lock_existing_audit_relation_owners(source_audit)
             if (
                 EntityAssessment.objects.filter(compliance_assessment=source_audit)
                 .exclude(pk=instance.pk)
@@ -458,38 +1308,55 @@ class EntityAssessmentWriteSerializer(BaseModelSerializer):
                     {"link_audit": ["auditAlreadyLinkedToEntityAssessment"]}
                 )
 
-            enclave = self._make_enclave_folder(instance)
+            enclave = self._make_enclave_folder(locked)
+            self._check_object_perm(
+                source_audit,
+                "add",
+                folder=enclave,
+                model=ComplianceAssessment,
+            )
 
             audit = source_audit
+            source_folder_id = audit.folder_id
             audit.folder = enclave
             # Enclave audits carry no perimeter — drop the one it had in its
             # previous domain.
             audit.perimeter = None
             audit.save()
-            RequirementAssessment.objects.filter(compliance_assessment=audit).update(
-                folder=enclave
-            )
-            Answer.objects.filter(
-                requirement_assessment__compliance_assessment=audit
-            ).update(folder=enclave)
-
-            self._finalize_linked_audit(instance, audit)
-
-    def _create_or_update_audit(self, instance, audit_data):
-        if audit_data["create_audit"]:
-            self._create_audit(instance, audit_data)
-        elif audit_data.get("link_audit"):
-            self._link_existing_audit(instance, audit_data)
-        else:
-            if instance.compliance_assessment:
-                audit = instance.compliance_assessment
-                audit.reviewers.set(instance.reviewers.all())
-                representatives = instance.representatives.all()
-                audit.authors.set(
-                    [rep.actor for rep in representatives if hasattr(rep, "actor")]
+            try:
+                relocate_compliance_assessment_tree(
+                    audit,
+                    source_folder_id=source_folder_id,
                 )
-                self._sync_requirement_assignment(audit, representatives)
-            instance.save()
+            except ComplianceAssessmentRelocationError as exc:
+                raise serializers.ValidationError({"link_audit": [str(exc)]}) from exc
+
+            return self._finalize_linked_audit(locked, audit)
+
+    def _create_or_update_audit(
+        self,
+        instance,
+        audit_data,
+        *,
+        identity_fields=(),
+        locked_audit=None,
+    ):
+        if audit_data["create_audit"]:
+            return self._create_audit(instance, audit_data)
+        elif audit_data.get("link_audit"):
+            return self._link_existing_audit(instance, audit_data)
+        elif identity_fields:
+            audit = locked_audit
+            if audit is not None:
+                if "reviewers" in identity_fields:
+                    audit.reviewers.set(instance.reviewers.all())
+                if "representatives" in identity_fields:
+                    representatives = instance.representatives.all()
+                    audit.authors.set(
+                        [rep.actor for rep in representatives if hasattr(rep, "actor")]
+                    )
+                    self._sync_requirement_assignment(audit, representatives)
+        return instance
 
     def _sync_requirement_assignment(self, audit, representatives):
         """Create or update the RequirementAssignment so its actors match the representatives."""
@@ -517,63 +1384,522 @@ class EntityAssessmentWriteSerializer(BaseModelSerializer):
         self,
         instance: EntityAssessment,
         third_party_users: set[User],
-        old_third_party_users: set[User] = set(),
+        old_third_party_users: set[User] | None = None,
+        *,
+        allow_create: bool = False,
     ):
+        # Callers already hold transaction.atomic() and Folder's root mutex.
+        # Keep the unused legacy argument for internal call compatibility while
+        # replacing the old incremental add/remove behavior with one exact set.
+        del old_third_party_users
         if instance.compliance_assessment:
-            enclave = instance.compliance_assessment.folder
-            respondents, _ = UserGroup.objects.get_or_create(
-                name=UserGroupCodename.THIRD_PARTY_RESPONDENT,
-                folder=enclave,
-                builtin=True,
+            audit = instance.compliance_assessment
+            self._assert_audit_owner_coherence(instance, audit)
+            enclave = audit.folder
+            try:
+                lock_and_assert_no_tprm_idp_group_inheritance(
+                    enclave_folder_ids=(enclave.id,)
+                )
+            except ManagedTprmRespondentIamError as exc:
+                raise PermissionDenied(MANAGED_TPRM_RESPONDENT_IAM_ERROR) from exc
+            final_user_ids = set(instance.representatives.values_list("id", flat=True))
+            supplied_user_ids = {user.id for user in third_party_users}
+            if final_user_ids != supplied_user_ids:
+                raise PermissionDenied(
+                    "The representative set changed concurrently; retry."
+                )
+            request = self.context.get("request")
+            if request is None or not getattr(request.user, "is_authenticated", False):
+                raise PermissionDenied("Respondent identity authority is unavailable.")
+
+            group_name = str(UserGroupCodename.THIRD_PARTY_RESPONDENT)
+            role_name = str(RoleCodename.THIRD_PARTY_RESPONDENT)
+            root_folder_id = Folder.get_root_folder_id()
+            roles = list(
+                Role.objects.select_for_update(of=("self",))
+                .filter(name=role_name)
+                .order_by("id")
             )
-            role_assignment, _ = RoleAssignment.objects.get_or_create(
-                user_group=respondents,
-                role=Role.objects.get(name=RoleCodename.THIRD_PARTY_RESPONDENT),
-                builtin=True,
-                folder=enclave,
-                is_recursive=True,
+            if (
+                root_folder_id is None
+                or len(roles) != 1
+                or not roles[0].builtin
+                or roles[0].folder_id != root_folder_id
+            ):
+                raise PermissionDenied(
+                    "The respondent IAM role is unavailable or inconsistent."
+                )
+            respondent_role = roles[0]
+
+            enclave_groups = list(
+                UserGroup.objects.select_for_update(of=("self",))
+                .filter(folder_id=enclave.id)
+                .order_by("id")
             )
-            role_assignment.perimeter_folders.add(enclave)
-            for user in third_party_users:
-                if not user.is_third_party:
-                    logger.warning("User is not a third-party", user=user)
-                user.user_groups.add(respondents)
-            for user in old_third_party_users:
-                if not user.is_third_party:
-                    logger.warning("User is not a third-party", user=user)
-                user.user_groups.remove(respondents)
+            if not enclave_groups:
+                if not allow_create:
+                    raise PermissionDenied("The respondent IAM scaffold is missing.")
+                respondents = UserGroup.objects.create(
+                    name=group_name,
+                    folder=enclave,
+                    builtin=True,
+                )
+                enclave_groups = [respondents]
+            elif (
+                len(enclave_groups) != 1
+                or enclave_groups[0].name != group_name
+                or not enclave_groups[0].builtin
+            ):
+                raise PermissionDenied("The respondent IAM scaffold is inconsistent.")
+            else:
+                respondents = enclave_groups[0]
+
+            perimeter_field = RoleAssignment._meta.get_field("perimeter_folders")
+            perimeter_through = perimeter_field.remote_field.through
+            perimeter_source = perimeter_field.m2m_field_name()
+            perimeter_target = perimeter_field.m2m_reverse_field_name()
+            reverse_assignment_ids = set(
+                perimeter_through.objects.filter(
+                    **{f"{perimeter_target}_id": enclave.id}
+                ).values_list(f"{perimeter_source}_id", flat=True)
+            )
+            assignment_ids = set(
+                RoleAssignment.objects.filter(folder_id=enclave.id).values_list(
+                    "id", flat=True
+                )
+            )
+            assignment_ids.update(
+                RoleAssignment.objects.filter(user_group_id=respondents.id).values_list(
+                    "id", flat=True
+                )
+            )
+            assignment_ids.update(reverse_assignment_ids)
+            assignments = list(
+                RoleAssignment.objects.select_for_update(of=("self",))
+                .filter(id__in=assignment_ids)
+                .select_related("role", "user_group")
+                .order_by("id")
+            )
+            if {assignment.id for assignment in assignments} != assignment_ids:
+                raise PermissionDenied(
+                    "The respondent IAM scaffold changed concurrently; retry."
+                )
+
+            assignment_created = False
+            if not assignments:
+                if not allow_create:
+                    raise PermissionDenied("The respondent IAM scaffold is missing.")
+                role_assignment = RoleAssignment.objects.create(
+                    user_group=respondents,
+                    role=respondent_role,
+                    builtin=True,
+                    folder=enclave,
+                    is_recursive=True,
+                )
+                assignments = [role_assignment]
+                assignment_ids = {role_assignment.id}
+                assignment_created = True
+            else:
+                role_assignment = assignments[0]
+
+            membership_field = User._meta.get_field("user_groups")
+            membership_through = membership_field.remote_field.through
+            membership_source = membership_field.m2m_field_name()
+            membership_target = membership_field.m2m_reverse_field_name()
+            membership_filter = {f"{membership_target}_id": respondents.id}
+            membership_rows = list(
+                membership_through.objects.select_for_update()
+                .filter(**membership_filter)
+                .order_by("pk")
+            )
+            existing_member_ids = {
+                getattr(row, f"{membership_source}_id") for row in membership_rows
+            }
+
+            perimeter_rows = list(
+                perimeter_through.objects.select_for_update()
+                .filter(**{f"{perimeter_source}_id__in": assignment_ids})
+                .order_by("pk")
+            )
+            assignment_perimeter_ids = {
+                getattr(row, f"{perimeter_target}_id")
+                for row in perimeter_rows
+                if getattr(row, f"{perimeter_source}_id") == role_assignment.id
+            }
+            enclave_assignment_ids = {
+                getattr(row, f"{perimeter_source}_id")
+                for row in perimeter_rows
+                if getattr(row, f"{perimeter_target}_id") == enclave.id
+            }
+
+            if (
+                len(assignments) != 1
+                or role_assignment.folder_id != enclave.id
+                or role_assignment.user_id is not None
+                or role_assignment.user_group_id != respondents.id
+                or role_assignment.role_id != respondent_role.id
+                or not role_assignment.builtin
+                or not role_assignment.is_recursive
+                or (not assignment_created and assignment_perimeter_ids != {enclave.id})
+                or enclave_assignment_ids - {role_assignment.id}
+            ):
+                raise PermissionDenied("The respondent IAM scaffold is inconsistent.")
+
+            protected_user_ids = existing_member_ids | supplied_user_ids
+            locked_users = {
+                user.id: user
+                for user in User.objects.select_for_update(of=("self",))
+                .filter(id__in=protected_user_ids)
+                .order_by("id")
+            }
+            if set(locked_users) != protected_user_ids:
+                raise PermissionDenied(
+                    "One or more respondent identities are unavailable."
+                )
+            try:
+                visible_user_ids = set(
+                    RoleAssignment.get_viewable_object_ids(request.user, User)
+                )
+            except (NotImplementedError, Permission.DoesNotExist):
+                visible_user_ids = set()
+            if not protected_user_ids.issubset(visible_user_ids):
+                raise PermissionDenied(
+                    "One or more respondent identities are unavailable."
+                )
+
+            locked_representatives = list(
+                Representative.objects.select_for_update(of=("self",))
+                .filter(
+                    entity_id=instance.entity_id,
+                    user_id__in=supplied_user_ids,
+                )
+                .order_by("id")
+            )
+            bound_user_ids = {
+                representative.user_id
+                for representative in locked_representatives
+                if representative.entity_id == instance.entity_id
+            }
+            if bound_user_ids != supplied_user_ids or any(
+                not locked_users[user_id].is_active
+                or not locked_users[user_id].is_third_party
+                for user_id in supplied_user_ids
+            ):
+                raise PermissionDenied(
+                    "Every representative must be an active third-party contact for this entity."
+                )
+
+            # Exact replacements prevent stale (including formerly hidden)
+            # memberships or perimeter links from surviving a successful sync.
+            respondents.user_set.set(
+                [locked_users[user_id] for user_id in sorted(supplied_user_ids)]
+            )
+            role_assignment.perimeter_folders.set([enclave])
+
+            final_member_ids = set(
+                membership_through.objects.filter(**membership_filter).values_list(
+                    f"{membership_source}_id", flat=True
+                )
+            )
+            final_perimeter_ids = set(
+                perimeter_through.objects.filter(
+                    **{f"{perimeter_source}_id": role_assignment.id}
+                ).values_list(f"{perimeter_target}_id", flat=True)
+            )
+            if final_member_ids != supplied_user_ids or final_perimeter_ids != {
+                enclave.id
+            }:
+                raise PermissionDenied(
+                    "The respondent IAM scaffold could not be synchronized."
+                )
 
     def create(self, validated_data):
         audit_data = self._extract_audit_data(validated_data)
         with transaction.atomic():
+            Folder._lock_folder_tree()
+            self._lock_and_validate_entity_relations(
+                instance=None,
+                validated_data=validated_data,
+                validate_representatives=(
+                    "representatives" in validated_data
+                    or audit_data["create_audit"]
+                    or bool(audit_data.get("link_audit"))
+                ),
+                validate_reviewers=(
+                    "reviewers" in validated_data
+                    or audit_data["create_audit"]
+                    or bool(audit_data.get("link_audit"))
+                ),
+                validate_solutions="solutions" in validated_data,
+            )
+            perimeter = validated_data.get("perimeter")
+            if perimeter is not None:
+                if perimeter.folder_id is None:
+                    raise PermissionDenied("The perimeter owner is unavailable.")
+                target_folder = Folder.objects.select_for_update().get(
+                    id=perimeter.folder_id
+                )
+                supplied_folder = validated_data.get("folder")
+                if (
+                    supplied_folder is not None
+                    and supplied_folder.id != target_folder.id
+                ):
+                    raise serializers.ValidationError(
+                        {"folder": [_("The folder must match the perimeter owner.")]}
+                    )
+                self._check_object_perm(
+                    validated_data,
+                    "add",
+                    folder=target_folder,
+                    model=EntityAssessment,
+                )
+                validated_data["folder"] = target_folder
             instance = super().create(validated_data)
-            self._create_or_update_audit(instance, audit_data)
+            instance = self._create_or_update_audit(instance, audit_data)
             self._assign_third_party_respondents(
-                instance, set(instance.representatives.all())
+                instance,
+                set(instance.representatives.all()),
+                allow_create=True,
             )
         return instance
 
     def update(self, instance: EntityAssessment, validated_data):
         audit_data = self._extract_audit_data(validated_data)
-        representatives = set(validated_data.get("representatives", []))
-        old_representatives = set(instance.representatives.all()) - set(
-            validated_data.get("representatives", [])
-        )
-
-        # If perimeter is being changed, update folder to match the new perimeter's folder
-        if "perimeter" in validated_data:
-            new_perimeter = validated_data["perimeter"]
-            if new_perimeter and new_perimeter.folder:
-                validated_data["folder"] = new_perimeter.folder
+        identity_fields = {"reviewers", "representatives"} & set(validated_data)
+        identity_sync_requested = bool(identity_fields)
+        representatives_supplied = "representatives" in validated_data
+        expected_folder_id = instance.folder_id
+        expected_audit_id = instance.compliance_assessment_id
 
         with transaction.atomic():
-            instance = super().update(instance, validated_data)
-            self._create_or_update_audit(instance, audit_data)
-            if "representatives" in validated_data:
+            Folder._lock_folder_tree()
+            locked_audit = None
+            locked_assignments = []
+            if expected_audit_id is not None:
+                locked_audit = ComplianceAssessment.objects.select_for_update().get(
+                    id=expected_audit_id
+                )
+            if audit_data.get("link_audit") is not None:
+                # Establish CA -> EntityAssessment ordering before the nested
+                # link routine reuses these locks.
+                ComplianceAssessment.objects.select_for_update().get(
+                    id=audit_data["link_audit"].id
+                )
+            locked_instance = EntityAssessment.objects.select_for_update().get(
+                pk=instance.pk
+            )
+            if (
+                locked_instance.folder_id != expected_folder_id
+                or locked_instance.compliance_assessment_id != expected_audit_id
+            ):
+                raise serializers.ValidationError(
+                    {"detail": [_("The assessment owner changed; retry.")]}
+                )
+
+            if locked_audit is not None:
+                if locked_audit.folder_id is None:
+                    raise PermissionDenied("The linked audit owner is unavailable.")
+                locked_audit.folder = Folder.objects.select_for_update().get(
+                    id=locked_audit.folder_id
+                )
+                self._assert_audit_owner_coherence(locked_instance, locked_audit)
+
+                if (
+                    "folder" in validated_data
+                    and getattr(validated_data["folder"], "id", None)
+                    != locked_instance.folder_id
+                ):
+                    raise PermissionDenied(
+                        {"folder": "A linked assessment owner is immutable"}
+                    )
+                if "perimeter" in validated_data:
+                    requested_perimeter = validated_data["perimeter"]
+                    requested_folder_id = (
+                        requested_perimeter.folder_id
+                        if requested_perimeter is not None
+                        else locked_instance.folder_id
+                    )
+                    if requested_folder_id != locked_instance.folder_id:
+                        raise PermissionDenied(
+                            {"perimeter": "A linked assessment owner is immutable"}
+                        )
+
+            relation_write_requested = bool(
+                {
+                    "entity",
+                    "perimeter",
+                    "evidence",
+                    "folder",
+                    "authors",
+                    "reviewers",
+                    "representatives",
+                    "solutions",
+                }
+                & set(validated_data)
+            )
+            if (
+                relation_write_requested
+                or audit_data["create_audit"]
+                or audit_data.get("link_audit")
+            ):
+                self._lock_and_validate_entity_relations(
+                    instance=locked_instance,
+                    validated_data=validated_data,
+                    validate_representatives=(
+                        representatives_supplied
+                        or audit_data["create_audit"]
+                        or bool(audit_data.get("link_audit"))
+                    ),
+                    validate_reviewers=(
+                        "reviewers" in validated_data
+                        or audit_data["create_audit"]
+                        or bool(audit_data.get("link_audit"))
+                    ),
+                    validate_solutions="solutions" in validated_data,
+                )
+
+            if (
+                locked_audit is not None
+                and identity_sync_requested
+                and not audit_data["create_audit"]
+                and not audit_data.get("link_audit")
+            ):
+                locked_assignments, _locked_requirement_assessments = (
+                    self._lock_existing_audit_tree_authority(
+                        locked_audit,
+                        fields=tuple(
+                            field_name
+                            for field_name, source_name in (
+                                ("authors", "representatives"),
+                                ("reviewers", "reviewers"),
+                            )
+                            if source_name in identity_fields
+                        ),
+                        assignment_sync_required=("representatives" in identity_fields),
+                        assignment_create_required=(
+                            "representatives" in identity_fields
+                            and bool(validated_data.get("representatives"))
+                        ),
+                    )
+                )
+
+            # Perimeter owns the EntityAssessment folder. Re-resolve it only
+            # after the global folder mutex so a concurrent perimeter move
+            # cannot leave the assessment attached to a stale folder object.
+            if "perimeter" in validated_data:
+                new_perimeter = validated_data["perimeter"]
+                if new_perimeter is not None:
+                    new_perimeter = (
+                        type(new_perimeter)
+                        .objects.select_for_update()
+                        .get(id=new_perimeter.id)
+                    )
+                    request = self.context.get("request")
+                    if request is None or new_perimeter.id not in set(
+                        RoleAssignment.get_viewable_object_ids(
+                            request.user, type(new_perimeter)
+                        )
+                    ):
+                        raise PermissionDenied(
+                            {"perimeter": [_("The perimeter is unavailable.")]}
+                        )
+                    validated_data["perimeter"] = new_perimeter
+                    if new_perimeter.folder_id is not None:
+                        target_folder = Folder.objects.select_for_update().get(
+                            id=new_perimeter.folder_id
+                        )
+                        supplied_folder = validated_data.get("folder")
+                        if (
+                            supplied_folder is not None
+                            and supplied_folder.id != target_folder.id
+                        ):
+                            raise serializers.ValidationError(
+                                {
+                                    "folder": [
+                                        _("The folder must match the perimeter owner.")
+                                    ]
+                                }
+                            )
+                        if target_folder.id != locked_instance.folder_id:
+                            self._check_object_perm(
+                                locked_instance,
+                                "add",
+                                folder=target_folder,
+                                model=EntityAssessment,
+                            )
+                        validated_data["folder"] = target_folder
+            elif "folder" in validated_data and locked_instance.perimeter_id:
+                current_perimeter = Perimeter.objects.select_for_update().get(
+                    id=locked_instance.perimeter_id
+                )
+                if validated_data["folder"].id != current_perimeter.folder_id:
+                    raise serializers.ValidationError(
+                        {"folder": [_("The folder must match the perimeter owner.")]}
+                    )
+                if validated_data["folder"].id != locked_instance.folder_id:
+                    self._check_object_perm(
+                        locked_instance,
+                        "add",
+                        folder=validated_data["folder"],
+                        model=EntityAssessment,
+                    )
+
+            final_folder = validated_data.get("folder")
+            final_folder_id = getattr(final_folder, "id", locked_instance.folder_id)
+            final_perimeter = validated_data.get("perimeter")
+            final_perimeter_id = (
+                getattr(final_perimeter, "id", None)
+                if "perimeter" in validated_data
+                else locked_instance.perimeter_id
+            )
+            if (
+                final_folder_id != locked_instance.folder_id
+                or final_perimeter_id != locked_instance.perimeter_id
+            ):
+                self._lock_entity_assessment_relation_owners(locked_instance)
+
+            if locked_audit is not None and identity_sync_requested:
+                self._lock_existing_audit_identity_rows(
+                    audit=locked_audit,
+                    entity_assessment=locked_instance,
+                    assignments=locked_assignments,
+                    validated_data=validated_data,
+                    identity_fields=identity_fields,
+                )
+            requested_representatives = set(
+                validated_data.get(
+                    "representatives", locked_instance.representatives.all()
+                )
+            )
+            old_representatives = (
+                set(locked_instance.representatives.all()) - requested_representatives
+            )
+            self.instance = locked_instance
+            instance = super().update(locked_instance, validated_data)
+            instance = self._create_or_update_audit(
+                instance,
+                audit_data,
+                identity_fields=identity_fields,
+                locked_audit=locked_audit,
+            )
+            if (
+                representatives_supplied
+                or audit_data["create_audit"]
+                or audit_data.get("link_audit")
+            ):
                 self._assign_third_party_respondents(
-                    instance, representatives, old_representatives
+                    instance,
+                    set(instance.representatives.all()),
+                    old_representatives,
+                    allow_create=(
+                        audit_data["create_audit"] or bool(audit_data.get("link_audit"))
+                    ),
                 )
         return instance
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        return self._filter_writable_related_representation(data)
 
     class Meta:
         model = EntityAssessment
