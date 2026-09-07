@@ -2444,25 +2444,42 @@ class ServiceAccount(AbstractBaseModel):
         visible = secret[: len(cls.SECRET_PREFIX) + cls._SECRET_PREVIEW_VISIBLE_CHARS]
         return visible + cls._SECRET_PREVIEW_MASK
 
-    def deactivate(self):
-        """Block token issuance (no grant types) and revoke outstanding tokens."""
+    def _deactivate_locked(self, user):
+        """Apply deactivation after the service-layer identity graph lock."""
+
         self.is_active = False
         self.save(update_fields=["is_active", "updated_at"])
         self.client.set_grant_types([])
         self.client.save(update_fields=["grant_types"])
         Token.objects.filter(client=self.client).delete()
-        self.user.is_active = False
-        self.user.save(update_fields=["is_active"])
+        user.is_active = False
+        user.save(update_fields=["is_active"])
 
-    def activate(self):
+    def _activate_locked(self, user):
+        """Apply activation after the service-layer identity graph lock."""
+
         self.is_active = True
         self.save(update_fields=["is_active", "updated_at"])
         self.client.set_grant_types([Client.GrantType.CLIENT_CREDENTIALS])
         self.client.save(update_fields=["grant_types"])
-        self.user.is_active = True
-        self.user.save(update_fields=["is_active"])
+        user.is_active = True
+        user.save(update_fields=["is_active"])
 
-    def rotate_secret(self, grace_period: timedelta | None = None) -> str:
+    def deactivate(self):
+        """Block token issuance using the canonical lifecycle lock protocol."""
+
+        from iam.service_accounts import set_service_account_active
+
+        return set_service_account_active(self, is_active=False)
+
+    def activate(self):
+        from iam.service_accounts import set_service_account_active
+
+        return set_service_account_active(self, is_active=True)
+
+    def _rotate_secret_locked(self, grace_period: timedelta | None = None) -> str:
+        """Rotate after the service-layer identity graph lock is held."""
+
         plain_secret = self.generate_secret()
         if grace_period:
             self.previous_secret_hash = self.client.secret  # already hashed
@@ -2484,15 +2501,26 @@ class ServiceAccount(AbstractBaseModel):
         Token.objects.filter(client=self.client).delete()
         return plain_secret
 
-    def delete(self, *args, **kwargs):
-        client, user, role = self.client, self.user, self.role
-        with transaction.atomic():
-            result = super().delete(*args, **kwargs)
-            client.delete()  # cascades outstanding OIDC tokens
-            user.delete()  # cascades the role assignment
-            if not role.builtin:
-                role.delete()
+    def rotate_secret(self, grace_period: timedelta | None = None) -> str:
+        from iam.service_accounts import rotate_service_account_secret
+
+        return rotate_service_account_secret(self, grace_period=grace_period)
+
+    def _delete_locked(self, user, *args, **kwargs):
+        """Delete the bundle after root, User and ServiceAccount are locked."""
+
+        client, role = self.client, self.role
+        result = super().delete(*args, **kwargs)
+        client.delete()  # cascades outstanding OIDC tokens
+        user.delete()  # cascades the role assignment
+        if not role.builtin:
+            role.delete()
         return result
+
+    def delete(self, *args, **kwargs):
+        from iam.service_accounts import delete_service_account
+
+        return delete_service_account(self, *args, **kwargs)
 
     def __str__(self):
         return self.name

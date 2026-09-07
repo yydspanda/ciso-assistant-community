@@ -2,6 +2,7 @@ import structlog
 from django.contrib.auth import password_validation
 from rest_framework import serializers
 
+from core.reserved_iam import TPRM_RESPONDENT_ROLE_CODENAME
 from core.serializer_fields import FieldsRelatedField
 from core.utils import RoleCodename
 
@@ -186,7 +187,11 @@ class ServiceAccountWriteSerializer(serializers.Serializer):
         child=serializers.IntegerField(), allow_empty=True, required=False
     )
     role = serializers.PrimaryKeyRelatedField(
-        queryset=Role.objects.filter(builtin=True), required=False, allow_null=True
+        queryset=Role.objects.filter(builtin=True).exclude(
+            name=TPRM_RESPONDENT_ROLE_CODENAME
+        ),
+        required=False,
+        allow_null=True,
     )
     folders = serializers.ListField(child=serializers.UUIDField(), allow_empty=False)
     is_recursive = serializers.BooleanField(default=True)

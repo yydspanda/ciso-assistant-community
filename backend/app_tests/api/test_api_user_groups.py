@@ -396,3 +396,44 @@ class TestUserGroupMembership:
 
         assert response.status_code == status.HTTP_200_OK
         assert builtin_group.user_set.filter(pk=target.pk).exists()
+
+    @pytest.mark.parametrize("action", ["add-members", "remove-members"])
+    def test_generic_membership_actions_reject_managed_tprm_group(
+        self, app_config, action
+    ):
+        """The assessment workflow is the sole writer for enclave respondents."""
+
+        domain, _, manager = self._setup_domain()
+        enclave = Folder.objects.create(
+            name="TPRM managed respondents",
+            parent_folder=domain,
+            content_type=Folder.ContentType.ENCLAVE,
+        )
+        managed_group = UserGroup.objects.create(
+            name="BI-UG-TPR",
+            folder=enclave,
+            builtin=True,
+        )
+        existing = User.objects.create_user(
+            "existing-tprm-member@tests.com",
+            is_published=True,
+            is_third_party=True,
+        )
+        candidate = User.objects.create_user(
+            "candidate-tprm-member@tests.com",
+            is_published=True,
+            is_third_party=True,
+        )
+        managed_group.user_set.add(existing)
+        target = candidate if action == "add-members" else existing
+
+        response = _client_for(manager).post(
+            reverse(f"user-groups-{action}", args=[managed_group.id]),
+            {"users": [str(target.id)]},
+            format="json",
+        )
+
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+        assert response.data == {"error": "managedTprmRespondentMembership"}
+        assert managed_group.user_set.filter(id=existing.id).exists()
+        assert not managed_group.user_set.filter(id=candidate.id).exists()

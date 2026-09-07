@@ -53,6 +53,10 @@ from core.models import (
     Vulnerability,
 )
 from core.tasks import get_missing_email_settings
+from core.reserved_iam import (
+    MANAGED_TPRM_RESPONDENT_IAM_ERROR,
+    is_tprm_reserved_enclave_group,
+)
 from tprm.models import Entity, EntityAssessment
 
 from .context import RESERVED_VARIABLE_KEYS, VARIABLE_KEY_RE, temporal_seeds
@@ -1505,25 +1509,42 @@ class ManageGroupMembershipAction(BaseAction):
             ).first()
         if group is None:
             raise ActionError("manage_group_membership: group not found")
-        # Subtree-only: an ancestor grant would let a domain admin add a user to
-        # the root global-admin group (BI-UG-ADM) via a workflow they publish.
-        if group.folder_id not in _read_scope_folder_ids(instance.folder):
-            raise ActionError(
-                "manage_group_membership: group is outside this workflow's scope"
-            )
-
         operation = config.get("operation", "add")
-        if operation == "remove":
-            # Last-admin protection (mirrors core remove-members): never strip the
-            # final global administrator, or the platform locks out. Only reachable
-            # for a root-scoped workflow, since BI-UG-ADM lives at the root folder.
-            if group.name == "BI-UG-ADM":
-                from django.db import transaction
+        with transaction.atomic():
+            # Serialize with the TPRM exact-replacement service, then refresh
+            # both principals under lock.  The pre-lock lookup is only identity
+            # resolution and never authorizes the eventual write.
+            Folder._lock_folder_tree()
+            group = (
+                UserGroup.objects.select_for_update(of=("self",))
+                .select_related("folder")
+                .filter(id=group.id)
+                .first()
+            )
+            user = (
+                User.objects.select_for_update(of=("self",)).filter(id=user.id).first()
+            )
+            if group is None or user is None:
+                raise ActionError(
+                    "manage_group_membership: user or group changed; retry"
+                )
+            # Subtree-only: an ancestor grant would let a domain admin add a user
+            # to the root global-admin group via a workflow they publish.
+            if group.folder_id not in _read_scope_folder_ids(instance.folder):
+                raise ActionError(
+                    "manage_group_membership: group is outside this workflow's scope"
+                )
+            if is_tprm_reserved_enclave_group(group):
+                raise ActionError(
+                    f"manage_group_membership: {MANAGED_TPRM_RESPONDENT_IAM_ERROR}"
+                )
 
-                with transaction.atomic():
-                    UserGroup.objects.select_for_update().filter(
-                        name="BI-UG-ADM"
-                    ).first()
+            if operation == "remove":
+                # Last-admin protection (mirrors core remove-members): never strip
+                # the final global administrator, or the platform locks out. Only
+                # reachable for a root-scoped workflow, since BI-UG-ADM lives at
+                # the root folder.
+                if group.name == "BI-UG-ADM":
                     others_remain = (
                         User.objects.filter(user_groups__name="BI-UG-ADM")
                         .exclude(id=user.id)
@@ -1534,11 +1555,9 @@ class ManageGroupMembershipAction(BaseAction):
                             "manage_group_membership: cannot remove the last "
                             "administrator"
                         )
-                    user.user_groups.remove(group)
-            else:
                 user.user_groups.remove(group)
-        else:
-            user.user_groups.add(group)
+            else:
+                user.user_groups.add(group)
         return {
             "user_id": str(user.id),
             "group_id": str(group.id),

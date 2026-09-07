@@ -51,6 +51,10 @@ The **members** of an IdP group are managed by SCIM and shown read-only. You wil
 IdP groups are administered globally and are only visible to administrators, just like [user groups](../organization/user-groups.md "mention") and roles.
 {% endhint %}
 
+{% hint style="warning" %}
+TPRM audit-enclave respondent groups are managed exclusively by the assessment workflow and cannot be granted through an IdP group. An upgrade stops if it finds a legacy mapping instead of silently changing access. SCIM membership changes for such a damaged group return a conflict until an administrator removes the mapping or offending role assignment through a reviewed IAM remediation.
+{% endhint %}
+
 ### Configuring SCIM
 
 <figure><img src="../../.gitbook/assets/scim-settings-tab.png" alt=""><figcaption><p>Settings › SCIM — the endpoint URL and bearer-token management.</p></figcaption></figure>

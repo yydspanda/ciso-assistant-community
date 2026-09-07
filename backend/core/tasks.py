@@ -17,6 +17,7 @@ from core.models import (
     ValidationFlow,
 )
 from iam.models import ServiceAccount, User
+from iam.service_accounts import deactivate_service_account_if_expired
 from django.core.mail import get_connection, EmailMessage
 from django.conf import settings
 from django.db import models, transaction
@@ -1532,9 +1533,9 @@ def deactivate_expired_users():
 def deactivate_expired_service_accounts():
     """Deactivate service accounts whose expiry_date has passed.
 
-    Uses ServiceAccount.deactivate(), not a plain is_active flip — it also
-    revokes the OIDC client's grant types and deletes outstanding tokens, so
-    an expired account can't keep authenticating on tokens minted earlier.
+    Candidate selection is only a worklist. The service re-locks root, User and
+    ServiceAccount, then revalidates active/expiry state before revoking grants
+    and tokens, so an expiry extension racing the scan is not overwritten.
     """
     today = date.today()
     expired_service_accounts = ServiceAccount.objects.filter(
@@ -1546,13 +1547,16 @@ def deactivate_expired_service_accounts():
     count = 0
     for service_account in expired_service_accounts:
         try:
-            with transaction.atomic():
-                service_account.deactivate()
+            deactivated = deactivate_service_account_if_expired(
+                service_account.id, today
+            )
         except Exception as e:
             logger.error(
                 f"Failed to deactivate expired service account: {service_account.name} (ID: {service_account.id})",
                 error=str(e),
             )
+            continue
+        if not deactivated:
             continue
         count += 1
         logger.info(

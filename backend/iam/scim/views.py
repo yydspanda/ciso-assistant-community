@@ -28,8 +28,14 @@ from rest_framework.viewsets import ViewSet
 
 from global_settings.models import GlobalSettings
 from iam.models import Folder, IdPGroup, UserGroup
+from iam.service_accounts import lock_user_service_account_rows
 
 from core.permissions import FeatureFlagRequired
+from core.reserved_iam import (
+    MANAGED_TPRM_RESPONDENT_IAM_ERROR,
+    ManagedTprmRespondentIamError,
+    lock_and_assert_no_tprm_idp_group_inheritance,
+)
 from .permissions import IsSCIMToken
 from .schema_definitions import (
     ALL_RESOURCE_TYPES,
@@ -232,6 +238,7 @@ class SCIMUserViewSet(ViewSet):
             scim_list_response(resources, total, start_index, len(resources))
         )
 
+    @transaction.atomic
     def create(self, request):
         try:
             data = json.loads(request.body)
@@ -244,28 +251,39 @@ class SCIMUserViewSet(ViewSet):
 
         external_id = data.get("externalId")
 
-        # Idempotency: externalId first, then email
+        # Serialize adoption/new-user creation with every governed IAM writer.
+        # Existing candidates are re-read under a row lock so neither an
+        # externalId match nor a concurrent privilege change can bypass the
+        # protected-account decision.
+        Folder._lock_folder_tree()
+
+        # Idempotency: externalId first, then email.
         user = None
-        matched_by_external_id = False
         if external_id:
-            user = User.objects.filter(scim_external_id=external_id).first()
-            matched_by_external_id = user is not None
+            user = (
+                User.objects.select_for_update(of=("self",))
+                .filter(scim_external_id=external_id)
+                .first()
+            )
         if user is None:
-            user = User.objects.filter(email__iexact=user_name).first()
+            user = (
+                User.objects.select_for_update(of=("self",))
+                .filter(email__iexact=user_name)
+                .first()
+            )
         if user is not None:
             # Adopt-but-protect: SCIM may link a pre-existing non-privileged
-            # account by email, but must never silently adopt or rewrite an
-            # administrator or a local-login account it does not already own.
-            if (
-                not matched_by_external_id
-                and not _is_scim_managed(user)
-                and _is_protected_account(user)
-            ):
+            # account, but must never silently adopt or rewrite a privileged
+            # local principal.  externalId is IdP-controlled and therefore is
+            # not an ownership/protection bypass.
+            if not _is_scim_managed(user) and _is_protected_account(user):
                 return _scim_error_response(
-                    "A user with this email already exists and cannot be managed by SCIM",
+                    "An existing protected account cannot be managed by SCIM",
                     409,
                     "uniqueness",
                 )
+            if _is_scim_managed(user) and _is_invalid_scim_owned_principal(user):
+                return _protected_scim_principal_error()
             user.is_scim_managed = True
             _update_user_from_scim_data(user, data)
             err = _save_user_or_scim_error(user)
@@ -310,7 +328,10 @@ class SCIMUserViewSet(ViewSet):
             user.scim_external_id = external_id
         user.set_unusable_password()
         try:
-            user.save()
+            # Keep a savepoint inside the request transaction so a translated
+            # uniqueness conflict does not poison the outer atomic block.
+            with transaction.atomic():
+                user.save()
         except IntegrityError:
             return _scim_error_response(
                 "A user with this email or externalId already exists",
@@ -319,11 +340,12 @@ class SCIMUserViewSet(ViewSet):
             )
 
         try:
-            EmailAddress.objects.get_or_create(
-                user=user,
-                email=user.email,
-                defaults={"verified": True, "primary": True},
-            )
+            with transaction.atomic():
+                EmailAddress.objects.get_or_create(
+                    user=user,
+                    email=user.email,
+                    defaults={"verified": True, "primary": True},
+                )
         except Exception as exc:
             logger.warning(
                 "SCIM: failed to create/update EmailAddress for user",
@@ -341,8 +363,11 @@ class SCIMUserViewSet(ViewSet):
             return _scim_error_response(f"User {pk} not found", 404)
         return _scim_response(scim_user_to_dict(user, request))
 
+    @transaction.atomic
     def update(self, request, pk=None):
-        user = _get_scim_user_by_pk(pk)
+        user, protected_error = _lock_scim_user_for_mutation(pk)
+        if protected_error is not None:
+            return protected_error
         if user is None:
             return _scim_error_response(f"User {pk} not found", 404)
         try:
@@ -355,8 +380,11 @@ class SCIMUserViewSet(ViewSet):
             return err
         return _scim_response(scim_user_to_dict(user, request))
 
+    @transaction.atomic
     def partial_update(self, request, pk=None):
-        user = _get_scim_user_by_pk(pk)
+        user, protected_error = _lock_scim_user_for_mutation(pk)
+        if protected_error is not None:
+            return protected_error
         if user is None:
             return _scim_error_response(f"User {pk} not found", 404)
         try:
@@ -416,19 +444,21 @@ class SCIMUserViewSet(ViewSet):
         )
         return _scim_response(scim_user_to_dict(user, request))
 
+    @transaction.atomic
     def destroy(self, request, pk=None):
-        user = _get_scim_user_by_pk(pk)
+        user, protected_error = _lock_scim_user_for_mutation(pk)
+        if protected_error is not None:
+            return protected_error
         if user is None:
             return _scim_error_response(f"User {pk} not found", 404)
-        with transaction.atomic():
-            if _would_orphan_admins(user):
-                return _scim_error_response(
-                    "Refusing to deactivate the last active administrator",
-                    409,
-                    "mutability",
-                )
-            user.is_active = False
-            user.save(update_fields=["is_active"])
+        if _would_orphan_admins(user):
+            return _scim_error_response(
+                "Refusing to deactivate the last active administrator",
+                409,
+                "mutability",
+            )
+        user.is_active = False
+        user.save(update_fields=["is_active"])
         logger.info("SCIM: user deactivated", user_id=pk)
         return JsonResponse({}, status=204)
 
@@ -482,6 +512,7 @@ class SCIMGroupViewSet(ViewSet):
             scim_list_response(resources, total, start_index, len(resources))
         )
 
+    @transaction.atomic
     def create(self, request):
         try:
             data = json.loads(request.body)
@@ -495,10 +526,45 @@ class SCIMGroupViewSet(ViewSet):
         if err:
             return err
 
-        # Auto-create on first push: the group grants nothing until an admin
-        # wires its user_groups, so accepting unknown groups is safe.
-        idp_group, created = IdPGroup.objects.get_or_create(name=display_name)
-        _add_members(idp_group, _member_ids(data.get("members", [])))
+        member_ids = _member_ids(data.get("members", []))
+        Folder._lock_folder_tree()
+        existing_id = (
+            IdPGroup.objects.filter(name=display_name)
+            .values_list("id", flat=True)
+            .first()
+        )
+        idp_group = None
+        if existing_id is not None:
+            idp_group, reserved_error = _lock_scim_idp_group_for_mutation(existing_id)
+            if reserved_error is not None:
+                return reserved_error
+        protected_error = _lock_and_check_scim_group_principals(
+            idp_group=idp_group,
+            proposed_member_ids=member_ids,
+        )
+        if protected_error is not None:
+            return protected_error
+
+        # Auto-create only after every proposed principal is locked and checked;
+        # a rejected request must not leave an empty prefix group behind.
+        created = False
+        if idp_group is None:
+            idp_group, created = IdPGroup.objects.get_or_create(name=display_name)
+            if not created:
+                # Defensive direct-writer race: lock and check the group that
+                # appeared after the pre-check before changing its membership.
+                idp_group, reserved_error = _lock_scim_idp_group_for_mutation(
+                    idp_group.id
+                )
+                if reserved_error is not None:
+                    return reserved_error
+                protected_error = _lock_and_check_scim_group_principals(
+                    idp_group=idp_group,
+                    proposed_member_ids=member_ids,
+                )
+                if protected_error is not None:
+                    return protected_error
+        _add_members(idp_group, member_ids)
         logger.info(
             "SCIM: group provisioned",
             idp_group_id=str(idp_group.id),
@@ -513,9 +579,12 @@ class SCIMGroupViewSet(ViewSet):
             return _scim_error_response(f"Group {pk} not found", 404)
         return _scim_response(scim_group_to_dict(idp_group, request))
 
+    @transaction.atomic
     def update(self, request, pk=None):
         """PUT — full replace. The members list becomes the new membership."""
-        idp_group = _get_idp_group_by_pk(pk)
+        idp_group, reserved_error = _lock_scim_idp_group_for_mutation(pk)
+        if reserved_error is not None:
+            return reserved_error
         if idp_group is None:
             return _scim_error_response(f"Group {pk} not found", 404)
         try:
@@ -527,16 +596,26 @@ class SCIMGroupViewSet(ViewSet):
         err = _display_name_error(display_name)
         if err:
             return err
+        member_ids = _member_ids(data.get("members", []) or [])
+        protected_error = _lock_and_check_scim_group_principals(
+            idp_group=idp_group,
+            proposed_member_ids=member_ids,
+        )
+        if protected_error is not None:
+            return protected_error
         if display_name and not _rename_idp_group(idp_group, display_name):
             return _scim_error_response(
                 f"A group named '{display_name}' already exists", 409, "uniqueness"
             )
 
-        _set_members(idp_group, _member_ids(data.get("members", []) or []))
+        _set_members(idp_group, member_ids)
         return _scim_response(scim_group_to_dict(idp_group, request))
 
+    @transaction.atomic
     def partial_update(self, request, pk=None):
-        idp_group = _get_idp_group_by_pk(pk)
+        idp_group, reserved_error = _lock_scim_idp_group_for_mutation(pk)
+        if reserved_error is not None:
+            return reserved_error
         if idp_group is None:
             return _scim_error_response(f"Group {pk} not found", 404)
         try:
@@ -567,6 +646,7 @@ class SCIMGroupViewSet(ViewSet):
             else:
                 segments.append((action, list(ids)))
 
+        target_display_name = None
         for op in operations:
             op_type = op.get("op", "").lower()
             path = op.get("path", "")
@@ -598,28 +678,40 @@ class SCIMGroupViewSet(ViewSet):
                 if path == "members":
                     _push("set", _member_ids(value or []))
                 elif path == "displayName" and value:
-                    # IdP renamed the group. Only the label changes; the
-                    # IdPGroup PK (the SCIM id) is the stable reference.
                     err = _display_name_error(value)
                     if err:
                         return err
-                    if not _rename_idp_group(idp_group, value):
-                        return _scim_error_response(
-                            f"A group named '{value}' already exists", 409, "uniqueness"
-                        )
+                    target_display_name = value
                 elif isinstance(value, dict):
                     if "displayName" in value:
                         err = _display_name_error(value["displayName"])
                         if err:
                             return err
-                        if not _rename_idp_group(idp_group, value["displayName"]):
-                            return _scim_error_response(
-                                f"A group named '{value['displayName']}' already exists",
-                                409,
-                                "uniqueness",
-                            )
+                        target_display_name = value["displayName"]
                     if "members" in value:
                         _push("set", _member_ids(value["members"] or []))
+
+        proposed_member_ids = [
+            member_id for _action, member_ids in segments for member_id in member_ids
+        ]
+        protected_error = _lock_and_check_scim_group_principals(
+            idp_group=idp_group,
+            proposed_member_ids=proposed_member_ids,
+        )
+        if protected_error is not None:
+            return protected_error
+
+        # Validate all authority-bearing principals before the first rename or
+        # membership write.  Applying only the final requested label also
+        # avoids committing a prefix rename if a later operation is rejected.
+        if target_display_name and not _rename_idp_group(
+            idp_group, target_display_name
+        ):
+            return _scim_error_response(
+                f"A group named '{target_display_name}' already exists",
+                409,
+                "uniqueness",
+            )
 
         for action, ids in segments:
             if action == "add":
@@ -633,15 +725,24 @@ class SCIMGroupViewSet(ViewSet):
 
         return _scim_response(scim_group_to_dict(idp_group, request))
 
+    @transaction.atomic
     def destroy(self, request, pk=None):
         """
         SCIM DELETE — remove the IdP group. Members lose the user groups it
         granted (computed), but their direct (manual) memberships are
         unaffected since those live in a separate relation.
         """
-        idp_group = _get_idp_group_by_pk(pk)
+        idp_group, reserved_error = _lock_scim_idp_group_for_mutation(pk)
+        if reserved_error is not None:
+            return reserved_error
         if idp_group is None:
             return _scim_error_response(f"Group {pk} not found", 404)
+        protected_error = _lock_and_check_scim_group_principals(
+            idp_group=idp_group,
+            proposed_member_ids=(),
+        )
+        if protected_error is not None:
+            return protected_error
         idp_group.delete()
         logger.info("SCIM: group deleted", group_id=pk)
         return JsonResponse({}, status=204)
@@ -674,9 +775,47 @@ def _is_scim_managed(user) -> bool:
 
 
 def _is_protected_account(user) -> bool:
-    """Accounts SCIM must never silently adopt or take over by email collision:
-    administrators and local-login accounts."""
-    return user.is_admin() or user.keep_local_login
+    """Local principals that SCIM must never silently adopt.
+
+    This check runs after the folder-tree mutex and a fresh User row lock are
+    held.  The reverse ServiceAccount row is locked as part of the decision so
+    a machine principal cannot be converted into a directory-owned person.
+    """
+
+    return bool(
+        user.is_superuser
+        or user.is_admin()
+        or user.keep_local_login
+        or _has_service_account(user)
+    )
+
+
+def _has_service_account(user) -> bool:
+    locked_users, service_accounts_by_user = lock_user_service_account_rows(
+        (user.id,)
+    )
+    user_id = str(user.id)
+    return user_id not in locked_users or user_id in service_accounts_by_user
+
+
+def _is_invalid_scim_owned_principal(user) -> bool:
+    """Fail closed for legacy corruption SCIM must not mutate or repair.
+
+    Directory membership can legitimately make a SCIM-owned human an admin,
+    so that state remains governed by the existing last-admin checks.  A
+    superuser bit or reverse ServiceAccount relationship, however, can never
+    be provisioned by SCIM and signals a crossed identity boundary.
+    """
+
+    return bool(user.is_superuser or _has_service_account(user))
+
+
+def _protected_scim_principal_error():
+    return _scim_error_response(
+        "SCIM cannot manage a superuser or service-account principal",
+        409,
+        "mutability",
+    )
 
 
 def _would_orphan_admins(user) -> bool:
@@ -712,11 +851,89 @@ def _get_scim_user_by_pk(pk):
     return user
 
 
+def _lock_scim_user_for_mutation(pk):
+    """Return a fresh SCIM-owned User lock or a fail-closed protection error."""
+
+    user_id = _valid_uuid(pk)
+    if user_id is None:
+        return None, None
+    Folder._lock_folder_tree()
+    user = (
+        User.objects.select_for_update(of=("self",))
+        .filter(id=user_id, is_scim_managed=True)
+        .first()
+    )
+    if user is not None and _is_invalid_scim_owned_principal(user):
+        return None, _protected_scim_principal_error()
+    return user, None
+
+
 def _get_idp_group_by_pk(pk):
     """Resolve the IdPGroup behind a SCIM Group id (the IdPGroup's own PK)."""
     if _valid_uuid(pk) is None:
         return None
     return IdPGroup.objects.filter(id=pk).first()
+
+
+def _lock_scim_idp_group_for_mutation(pk):
+    """Lock one SCIM group and reject legacy inheritance into TPRM authority.
+
+    Every caller is an atomic group mutation.  Taking the same root-folder
+    mutex as generic IAM and TPRM makes the subsequent full graph check stable
+    through the write.  A damaged legacy group is deliberately not repaired by
+    SCIM: administrators must remove the mapping through a reviewed IAM action.
+    """
+
+    group_id = _valid_uuid(pk)
+    if group_id is None:
+        return None, None
+    Folder._lock_folder_tree()
+    try:
+        locked = lock_and_assert_no_tprm_idp_group_inheritance(
+            idp_group_ids=(group_id,)
+        )
+    except ManagedTprmRespondentIamError:
+        return None, _scim_error_response(
+            MANAGED_TPRM_RESPONDENT_IAM_ERROR,
+            409,
+            "mutability",
+        )
+    return locked.get(group_id), None
+
+
+def _lock_and_check_scim_group_principals(*, idp_group, proposed_member_ids):
+    """Lock current/proposed Users then reverse ServiceAccounts and validate.
+
+    The caller already owns the root mutex and, for an existing IdPGroup, its
+    membership through rows.  We nevertheless include every current member and
+    every syntactically valid proposed User ID, including locally-owned users
+    that normal SCIM resolution would ignore.  A superuser or machine principal
+    makes the whole group request immutable; filtering only the new member would
+    let clear/remove/delete silently repair historical identity corruption.
+    """
+
+    current_ids = (
+        set(idp_group.users.values_list("id", flat=True))
+        if idp_group is not None
+        else set()
+    )
+    proposed_ids = {
+        value
+        for value in (_valid_uuid(item) for item in proposed_member_ids)
+        if value is not None
+    }
+    requested_ids = current_ids | proposed_ids
+    locked_users, service_accounts_by_user = lock_user_service_account_rows(
+        requested_ids
+    )
+    if not {str(item) for item in current_ids}.issubset(locked_users):
+        return _protected_scim_principal_error()
+    if any(
+        user.is_superuser or str(user.id) in service_accounts_by_user
+        for user in locked_users.values()
+    ):
+        return _protected_scim_principal_error()
+    return None
 
 
 def _save_user_or_scim_error(user):
@@ -788,7 +1005,10 @@ def _rename_idp_group(idp_group, new_name) -> bool:
         return True
     idp_group.name = new_name
     try:
-        idp_group.save(update_fields=["name"])
+        # Group mutation endpoints own an outer transaction.  Keep a local
+        # savepoint so translating a uniqueness failure does not poison it.
+        with transaction.atomic():
+            idp_group.save(update_fields=["name"])
     except IntegrityError:
         idp_group.refresh_from_db(fields=["name"])
         return False

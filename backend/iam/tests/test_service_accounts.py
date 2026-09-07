@@ -1,14 +1,18 @@
 """Service accounts: provisioning, token flow, RBAC scoping, and lifecycle."""
 
 from datetime import timedelta
+import importlib
 
 import pytest
+from django.apps import apps as django_apps
+from django.core.exceptions import ValidationError
 from django.test import override_settings
 from knox.models import AuthToken
 from rest_framework.test import APIClient
 
 from allauth.idp.oidc.models import Client, Token
 
+from core.reserved_iam import MANAGED_TPRM_RESPONDENT_IAM_ERROR
 from core.startup import startup
 from django.contrib.auth.models import Permission
 from django.utils import timezone
@@ -16,7 +20,11 @@ from global_settings import utils as ff_utils
 from global_settings.models import GlobalSettings
 from global_settings.utils import clear_feature_flags_cache
 from iam.models import Folder, Role, RoleAssignment, ServiceAccount, User, UserGroup
-from iam.service_accounts import get_selectable_permissions
+from iam.service_accounts import (
+    get_selectable_permissions,
+    provision_service_account,
+    update_service_account,
+)
 
 TOKEN_ENDPOINT = "/api/identity/o/api/token"
 SA_ENDPOINT = "/api/iam/service-accounts/"
@@ -420,6 +428,80 @@ class TestServiceAccountTokenFlow:
         assert not Token.objects.filter(client_id=client_id).exists()
         assert _bearer_client(access_token).get("/api/folders/").status_code == 401
 
+    def test_lifecycle_mutators_lock_root_then_user_then_service_account(
+        self, admin_client, domain_folder, monkeypatch
+    ):
+        from datetime import date, timedelta as td
+
+        from django.db.models import QuerySet
+
+        from core.tasks import deactivate_expired_service_accounts
+
+        deactivate_payload = _create_sa(
+            admin_client, domain_folder, name="lock-order-deactivate"
+        )
+        expiry_payload = _create_sa(
+            admin_client, domain_folder, name="lock-order-expiry"
+        )
+        delete_payload = _create_sa(
+            admin_client, domain_folder, name="lock-order-delete"
+        )
+        rotate_payload = _create_sa(
+            admin_client, domain_folder, name="lock-order-rotate"
+        )
+        expiry = ServiceAccount.objects.get(id=expiry_payload["id"])
+        expiry.expiry_date = date.today() - td(days=1)
+        expiry.save(update_fields=["expiry_date"])
+
+        events = []
+        original_root_lock = Folder._lock_folder_tree
+        original_select_for_update = QuerySet.select_for_update
+
+        def tracked_root_lock():
+            events.append("root")
+            return original_root_lock()
+
+        def tracked_select_for_update(queryset, *args, **kwargs):
+            if queryset.model is User:
+                events.append("user")
+            elif queryset.model is ServiceAccount:
+                events.append("service_account")
+            return original_select_for_update(queryset, *args, **kwargs)
+
+        monkeypatch.setattr(Folder, "_lock_folder_tree", staticmethod(tracked_root_lock))
+        monkeypatch.setattr(QuerySet, "select_for_update", tracked_select_for_update)
+
+        def assert_identity_order():
+            assert events.index("root") < events.index("user")
+            assert events.index("user") < events.index("service_account")
+
+        response = admin_client.patch(
+            f"{SA_ENDPOINT}{deactivate_payload['id']}/",
+            {"is_active": False},
+            format="json",
+        )
+        assert response.status_code == 200, response.content
+        assert_identity_order()
+
+        events.clear()
+        response = admin_client.post(
+            f"{SA_ENDPOINT}{rotate_payload['id']}/rotate-secret/",
+            format="json",
+        )
+        assert response.status_code == 200, response.content
+        assert_identity_order()
+
+        events.clear()
+        deactivate_expired_service_accounts.call_local()
+        assert_identity_order()
+        expiry.refresh_from_db()
+        assert expiry.is_active is False
+
+        events.clear()
+        response = admin_client.delete(f"{SA_ENDPOINT}{delete_payload['id']}/")
+        assert response.status_code == 204, response.content
+        assert_identity_order()
+
 
 @pytest.mark.django_db
 class TestServiceAccountExclusions:
@@ -624,14 +706,46 @@ class TestServiceAccountExpiry:
         sa.refresh_from_db()
         assert sa.is_active is True
 
+    def test_expiry_extension_after_candidate_scan_is_revalidated_under_lock(
+        self, admin_client, domain_folder, monkeypatch
+    ):
+        from datetime import date, timedelta as td
+
+        from core import tasks as core_tasks
+
+        payload = _create_sa(admin_client, domain_folder, name="extended-after-scan")
+        service_account = ServiceAccount.objects.get(id=payload["id"])
+        as_of = date.today()
+        service_account.expiry_date = as_of - td(days=1)
+        service_account.save(update_fields=["expiry_date"])
+        original = core_tasks.deactivate_service_account_if_expired
+
+        def extend_then_revalidate(service_account_id, as_of):
+            ServiceAccount.objects.filter(id=service_account_id).update(
+                expiry_date=as_of + td(days=1)
+            )
+            return original(service_account_id, as_of)
+
+        monkeypatch.setattr(
+            core_tasks,
+            "deactivate_service_account_if_expired",
+            extend_then_revalidate,
+        )
+
+        core_tasks.deactivate_expired_service_accounts.call_local()
+
+        service_account.refresh_from_db()
+        assert service_account.expiry_date == as_of + td(days=1)
+        assert service_account.is_active is True
+        assert service_account.user.is_active is True
+
     def test_periodic_task_isolates_per_account_failures(
         self, admin_client, domain_folder
     ):
         from datetime import date, timedelta as td
         from unittest.mock import patch
 
-        from core.tasks import deactivate_expired_service_accounts
-        from iam.models import ServiceAccount as SAModel
+        from core import tasks as core_tasks
 
         payload_broken = _create_sa(admin_client, domain_folder, name="broken")
         payload_ok = _create_sa(admin_client, domain_folder, name="ok")
@@ -641,15 +755,19 @@ class TestServiceAccountExpiry:
             sa.expiry_date = date.today() - td(days=1)
             sa.save(update_fields=["expiry_date"])
 
-        original_deactivate = SAModel.deactivate
+        original_deactivate = core_tasks.deactivate_service_account_if_expired
 
-        def flaky_deactivate(self):
-            if str(self.id) == payload_broken["id"]:
+        def flaky_deactivate(service_account_id, as_of):
+            if str(service_account_id) == payload_broken["id"]:
                 raise RuntimeError("boom")
-            return original_deactivate(self)
+            return original_deactivate(service_account_id, as_of)
 
-        with patch.object(SAModel, "deactivate", flaky_deactivate):
-            deactivate_expired_service_accounts.call_local()
+        with patch.object(
+            core_tasks,
+            "deactivate_service_account_if_expired",
+            flaky_deactivate,
+        ):
+            core_tasks.deactivate_expired_service_accounts.call_local()
 
         broken = ServiceAccount.objects.get(id=payload_broken["id"])
         ok = ServiceAccount.objects.get(id=payload_ok["id"])
@@ -967,6 +1085,149 @@ class TestServiceAccountGlobalAdmin:
         roles = response.json()
         global_only_ids = {r["id"] for r in roles if r["global_only"]}
         assert global_only_ids == {str(self._admin_role().id)}
+
+
+@pytest.mark.django_db
+class TestServiceAccountReservedTprmIam:
+    def _enclave(self, name="service-account-enclave"):
+        return Folder.objects.create(
+            parent_folder=Folder.get_root_folder(),
+            name=name,
+            content_type=Folder.ContentType.ENCLAVE,
+        )
+
+    def _respondent_role(self):
+        return Role.objects.get(name="BI-RL-TPR", builtin=True)
+
+    def test_role_catalog_and_serializer_do_not_offer_respondent_role(
+        self, admin_client, domain_folder
+    ):
+        role = self._respondent_role()
+        catalog = admin_client.get(f"{SA_ENDPOINT}roles/")
+        assert catalog.status_code == 200
+        assert str(role.id) not in {item["id"] for item in catalog.json()}
+
+        response = admin_client.post(
+            SA_ENDPOINT,
+            {
+                "name": "respondent-role-api",
+                "role": str(role.id),
+                "folders": [str(domain_folder.id)],
+            },
+            format="json",
+        )
+        assert response.status_code == 400
+        assert not ServiceAccount.objects.filter(name="respondent-role-api").exists()
+
+    def test_service_layer_rejects_respondent_role_even_without_serializer(
+        self, admin_client, domain_folder
+    ):
+        with pytest.raises(ValidationError) as exc_info:
+            provision_service_account(
+                name="respondent-role-service",
+                description=None,
+                permission_ids=None,
+                role_id=self._respondent_role().id,
+                folder_ids=[domain_folder.id],
+                is_recursive=True,
+                created_by=User.objects.get(email="admin@sa-tests.com"),
+            )
+        assert exc_info.value.messages == [MANAGED_TPRM_RESPONDENT_IAM_ERROR]
+        assert not ServiceAccount.objects.filter(
+            name="respondent-role-service"
+        ).exists()
+
+    def test_create_and_update_reject_enclave_perimeters(
+        self, admin_client, domain_folder
+    ):
+        enclave = self._enclave()
+        create_response = admin_client.post(
+            SA_ENDPOINT,
+            {
+                "name": "enclave-create",
+                "permissions": _view_folder_permission_ids(),
+                "folders": [str(enclave.id)],
+            },
+            format="json",
+        )
+        assert create_response.status_code == 400
+        assert create_response.json()["error"] == [MANAGED_TPRM_RESPONDENT_IAM_ERROR]
+
+        payload = _create_sa(admin_client, domain_folder, name="enclave-update")
+        update_response = admin_client.patch(
+            f"{SA_ENDPOINT}{payload['id']}/",
+            {"folders": [str(enclave.id)]},
+            format="json",
+        )
+        assert update_response.status_code == 400
+        service_account = ServiceAccount.objects.get(id=payload["id"])
+        assert set(
+            service_account.role_assignment.perimeter_folders.values_list(
+                "id", flat=True
+            )
+        ) == {domain_folder.id}
+
+    def test_service_layer_rejects_role_switch_to_respondent_role(
+        self, admin_client, domain_folder
+    ):
+        payload = _create_sa(admin_client, domain_folder, name="role-switch-guard")
+        service_account = ServiceAccount.objects.get(id=payload["id"])
+        original_role_id = service_account.role_id
+
+        with pytest.raises(ValidationError) as exc_info:
+            update_service_account(
+                service_account,
+                role_id=self._respondent_role().id,
+            )
+        assert exc_info.value.messages == [MANAGED_TPRM_RESPONDENT_IAM_ERROR]
+        service_account.refresh_from_db()
+        assert service_account.role_id == original_role_id
+        assert service_account.role_assignment.role_id == original_role_id
+
+    def test_existing_reserved_perimeter_fails_closed_before_repair_or_rename(
+        self, admin_client, domain_folder
+    ):
+        payload = _create_sa(admin_client, domain_folder, name="damaged-perimeter")
+        service_account = ServiceAccount.objects.get(id=payload["id"])
+        enclave = self._enclave("existing-damaged-enclave")
+        service_account.role_assignment.perimeter_folders.add(enclave)
+
+        response = admin_client.patch(
+            f"{SA_ENDPOINT}{payload['id']}/",
+            {
+                "name": "must-not-be-applied",
+                "folders": [str(domain_folder.id)],
+            },
+            format="json",
+        )
+        assert response.status_code == 400
+        assert response.json()["error"] == [MANAGED_TPRM_RESPONDENT_IAM_ERROR]
+        service_account.refresh_from_db()
+        assert service_account.name == "damaged-perimeter"
+        assert set(
+            service_account.role_assignment.perimeter_folders.values_list(
+                "id", flat=True
+            )
+        ) == {domain_folder.id, enclave.id}
+
+    def test_upgrade_preflight_reports_and_preserves_reserved_rows(
+        self, admin_client, domain_folder
+    ):
+        payload = _create_sa(admin_client, domain_folder, name="migration-preflight")
+        service_account = ServiceAccount.objects.get(id=payload["id"])
+        role_assignment = service_account.role_assignment
+        enclave = self._enclave("migration-preflight-enclave")
+        role_assignment.perimeter_folders.add(enclave)
+
+        migration = importlib.import_module(
+            "iam.migrations.0028_preflight_service_account_reserved_iam"
+        )
+        with pytest.raises(RuntimeError, match="made no changes"):
+            migration.reject_reserved_service_account_iam(django_apps, None)
+
+        assert ServiceAccount.objects.filter(id=service_account.id).exists()
+        assert RoleAssignment.objects.filter(id=role_assignment.id).exists()
+        assert role_assignment.perimeter_folders.filter(id=enclave.id).exists()
 
 
 QUOTA_SETTINGS = dict(

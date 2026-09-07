@@ -30,6 +30,7 @@ from django.conf import settings
 
 from global_settings.models import GlobalSettings
 from core.models import Actor
+from core.reserved_iam import TPRM_RESPONDENT_ROLE_CODENAME
 from core.utils import RoleCodename
 from .models import (
     Folder,
@@ -686,7 +687,7 @@ class ServiceAccountViewSet(viewsets.ModelViewSet):
         data = serializer.validated_data
         try:
             with transaction.atomic():
-                update_service_account(
+                service_account = update_service_account(
                     service_account,
                     name=data.get("name"),
                     description=data["description"]
@@ -699,12 +700,10 @@ class ServiceAccountViewSet(viewsets.ModelViewSet):
                     expiry_date=data["expiry_date"]
                     if "expiry_date" in data
                     else UNSET_FIELD,
+                    is_active=data["is_active"]
+                    if "is_active" in data
+                    else UNSET_FIELD,
                 )
-                if "is_active" in data:
-                    if data["is_active"] and not service_account.is_active:
-                        service_account.activate()
-                    elif not data["is_active"] and service_account.is_active:
-                        service_account.deactivate()
         except DjangoValidationError as e:
             return Response({"error": e.messages}, status=status.HTTP_400_BAD_REQUEST)
         service_account.refresh_from_db()
@@ -761,7 +760,11 @@ class ServiceAccountViewSet(viewsets.ModelViewSet):
 
     def builtin_roles(self, request):
         selectable_ids = set(get_selectable_permissions().values_list("id", flat=True))
-        roles = Role.objects.filter(builtin=True).prefetch_related("permissions")
+        roles = (
+            Role.objects.filter(builtin=True)
+            .exclude(name=TPRM_RESPONDENT_ROLE_CODENAME)
+            .prefetch_related("permissions")
+        )
         return Response(
             [
                 {
