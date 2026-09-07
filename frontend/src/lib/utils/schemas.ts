@@ -507,6 +507,14 @@ export const RequirementAssessmentSchema = z.object({
 	nextRequirementAssessmentId: z.string().uuid().optional().nullable()
 });
 
+// Assignment relation modals receive a deliberately redacted RA projection.
+// Their validator must not require hidden ownership/status fields from the
+// full RequirementAssessment write schema.
+export const RequirementAssessmentRelationSchema = z.object({
+	evidences: z.array(z.string().uuid().optional()).optional(),
+	applied_controls: z.array(z.string().uuid().optional()).optional()
+});
+
 export const UserEditSchema = z.object({
 	email: z.string().email(),
 	first_name: z.string().optional(),

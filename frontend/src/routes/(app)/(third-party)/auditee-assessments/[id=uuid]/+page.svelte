@@ -36,6 +36,7 @@
 		AUTO_ALIGNMENT_QUESTION_URN
 	} from '$lib/utils/helpers';
 	import { safeTranslate } from '$lib/utils/i18n';
+	import { RequirementAssessmentRelationSchema } from '$lib/utils/schemas';
 	import { m } from '$paraglide/messages';
 	import { getLocale } from '$paraglide/runtime';
 	import { formatDate } from '$lib/utils/datetime';
@@ -111,7 +112,7 @@
 	const canEditScore = $derived(isFieldEditable('score'));
 	const canEditDocumentationScore = $derived(isFieldEditable('documentation_score'));
 	const canEditObservation = $derived(isFieldEditable('observation'));
-	const canEditAppliedControls = $derived(isFieldEditable('applied_controls'));
+	const canEditAppliedControls = $derived(isAuditor && isFieldEditable('applied_controls'));
 	const canEditEvidences = $derived(isFieldEditable('evidences'));
 	const canEditAnswers = $derived(isFieldEditable('answers'));
 	const canEditAlignment = $derived(isFieldEditable('respondent_alignment'));
@@ -467,13 +468,15 @@
 	}
 
 	function modalUpdateForm(requirementAssessment: Record<string, any>, context: string): void {
+		const field = context === 'selectAppliedControls' ? 'applied_controls' : 'evidences';
 		const modalComponent: ModalComponent = {
 			ref: UpdateModal,
 			props: {
 				form: requirementAssessment.updateForm,
 				model: requirementAssessment.updatedModel,
 				object: requirementAssessment.object,
-				formAction: '?/update&id=' + requirementAssessment.id,
+				formAction: `?/update&id=${requirementAssessment.id}&field=${field}`,
+				schema: RequirementAssessmentRelationSchema,
 				context
 			}
 		};
@@ -1218,14 +1221,16 @@
 										<Accordion.ItemContent>
 											{#if canEditAppliedControls}
 												<div class="flex flex-row space-x-2 items-center">
-													<button
-														class="btn preset-filled-primary-500 self-start"
-														onclick={() =>
-															modalMeasureCreateForm(requirementAssessment.measureCreateForm)}
-														type="button"
-													>
-														<i class="fa-solid fa-plus mr-2"></i>{m.addAppliedControl()}
-													</button>
+													{#if requirementAssessment.measureCreateForm}
+														<button
+															class="btn preset-filled-primary-500 self-start"
+															onclick={() =>
+																modalMeasureCreateForm(requirementAssessment.measureCreateForm)}
+															type="button"
+														>
+															<i class="fa-solid fa-plus mr-2"></i>{m.addAppliedControl()}
+														</button>
+													{/if}
 													<button
 														class="btn preset-filled-secondary-500 self-start"
 														type="button"
@@ -1281,15 +1286,17 @@
 										<Accordion.ItemContent>
 											{#if canEditEvidences}
 												<div class="flex flex-row space-x-2 items-center">
-													<button
-														class="btn preset-filled-primary-500 self-start"
-														onclick={() =>
-															modalEvidenceCreateForm(requirementAssessment.evidenceCreateForm)}
-														type="button"
-														data-testid="create-evidence-button"
-													>
-														<i class="fa-solid fa-plus mr-2"></i>{m.addEvidence()}
-													</button>
+													{#if requirementAssessment.evidenceCreateForm}
+														<button
+															class="btn preset-filled-primary-500 self-start"
+															onclick={() =>
+																modalEvidenceCreateForm(requirementAssessment.evidenceCreateForm)}
+															type="button"
+															data-testid="create-evidence-button"
+														>
+															<i class="fa-solid fa-plus mr-2"></i>{m.addEvidence()}
+														</button>
+													{/if}
 													<button
 														class="btn preset-filled-secondary-500 self-start"
 														type="button"

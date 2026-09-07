@@ -1,8 +1,8 @@
-import { handleErrorResponse, nestedWriteFormAction } from '$lib/utils/actions';
+import { defaultWriteFormAction, handleErrorResponse } from '$lib/utils/actions';
 import { BASE_API_URL } from '$lib/utils/constants';
 import { getModelInfo } from '$lib/utils/crud';
 import { safeTranslate } from '$lib/utils/i18n';
-import { modelSchema } from '$lib/utils/schemas';
+import { modelSchema, RequirementAssessmentRelationSchema } from '$lib/utils/schemas';
 import { m } from '$paraglide/messages';
 import { error, fail, type Actions } from '@sveltejs/kit';
 import { setFlash } from 'sveltekit-flash-message/server';
@@ -11,6 +11,32 @@ import { zod4 as zod } from 'sveltekit-superforms/adapters';
 import { z } from 'zod';
 import type { ModelInfo } from '$lib/utils/types';
 import type { PageServerLoad } from './$types';
+
+const assignmentRequirementMutableFields = new Set([
+	'answers',
+	'documentation_score',
+	'evidences',
+	'extended_result',
+	'is_score_overridden',
+	'is_scored',
+	'observation',
+	'respondent_alignment',
+	'result',
+	'score',
+	'status'
+]);
+const relationUpdateFields = ['evidences', 'applied_controls'] as const;
+type RelationUpdateField = (typeof relationUpdateFields)[number];
+
+function isRelationUpdateField(value: string | null): value is RelationUpdateField {
+	return value !== null && relationUpdateFields.some((field) => field === value);
+}
+
+function assignmentPatch(data: Record<string, unknown>) {
+	return Object.fromEntries(
+		Object.entries(data).filter(([fieldName]) => assignmentRequirementMutableFields.has(fieldName))
+	);
+}
 
 export const load = (async ({ fetch, params }) => {
 	// params.id is the assignment ID
@@ -67,25 +93,28 @@ export const load = (async ({ fetch, params }) => {
 	});
 
 	const requirement_assessments = await Promise.all(
-		tableMode.requirement_assessments.map(async (requirementAssessment) => {
-			const measureInitialData = {
-				requirement_assessments: [requirementAssessment.id],
-				folder: requirementAssessment.folder.id
-			};
-			const measureCreateForm = await superValidate(measureInitialData, zod(measureCreateSchema), {
-				errors: false
-			});
-			const evidenceInitialData = {
-				requirement_assessments: [requirementAssessment.id],
-				folder: requirementAssessment.folder.id
-			};
-			const evidenceCreateForm = await superValidate(
-				evidenceInitialData,
-				zod(evidenceCreateSchema),
-				{
-					errors: false
-				}
-			);
+		tableMode.requirement_assessments.map(async (requirementAssessment: any) => {
+			const folderId = requirementAssessment.folder?.id ?? null;
+			const measureCreateForm = folderId
+				? await superValidate(
+						{
+							requirement_assessments: [requirementAssessment.id],
+							folder: folderId
+						},
+						zod(measureCreateSchema),
+						{ errors: false }
+					)
+				: null;
+			const evidenceCreateForm = folderId
+				? await superValidate(
+						{
+							requirement_assessments: [requirementAssessment.id],
+							folder: folderId
+						},
+						zod(evidenceCreateSchema),
+						{ errors: false }
+					)
+				: null;
 			const observationBuffer = requirementAssessment.observation;
 			const scoreForm = await superValidate(
 				{
@@ -95,21 +124,27 @@ export const load = (async ({ fetch, params }) => {
 				},
 				zod(scoreSchema)
 			);
-			const updateSchema = modelSchema('requirement-assessments');
 			const updatedModel: ModelInfo = getModelInfo('requirement-assessments');
 			const object = {
 				...requirementAssessment,
-				folder: requirementAssessment.folder.id,
+				folder: folderId,
 				requirement: requirementAssessment.requirement.id,
 				compliance_assessment: requirementAssessment.compliance_assessment.id,
 				...(requirementAssessment.evidences !== undefined && {
-					evidences: requirementAssessment.evidences.map((evidence) => evidence.id)
+					evidences: requirementAssessment.evidences.map((evidence: any) => evidence.id)
 				}),
 				...(requirementAssessment.applied_controls !== undefined && {
-					applied_controls: requirementAssessment.applied_controls.map((ac) => ac.id)
+					applied_controls: requirementAssessment.applied_controls.map((ac: any) => ac.id)
 				})
 			};
-			const updateForm = await superValidate(object, zod(updateSchema), { errors: false });
+			const updateForm = await superValidate(
+				{
+					evidences: object.evidences ?? [],
+					applied_controls: object.applied_controls ?? []
+				},
+				zod(RequirementAssessmentRelationSchema),
+				{ errors: false }
+			);
 			return {
 				...requirementAssessment,
 				measureCreateForm,
@@ -124,14 +159,14 @@ export const load = (async ({ fetch, params }) => {
 	);
 
 	const requirementAssessmentsById = requirement_assessments.reduce(
-		(acc, requirementAssessment) => {
-			acc[requirementAssessment.requirement] = requirementAssessment;
+		(acc: Record<string, any>, requirementAssessment: any) => {
+			acc[requirementAssessment.requirement.id] = requirementAssessment;
 			return acc;
 		},
-		{}
+		{} as Record<string, any>
 	);
 
-	const requirements = tableMode.requirements.map((requirement) => {
+	const requirements = tableMode.requirements.map((requirement: any) => {
 		if (requirementAssessmentsById[requirement.id]) {
 			return requirementAssessmentsById[requirement.id];
 		}
@@ -154,40 +189,60 @@ export const load = (async ({ fetch, params }) => {
 export const actions: Actions = {
 	updateRequirementAssessment: async (event) => {
 		const data = await event.request.json();
-		const value: { id: string; result: string } = data;
-		const URLModel = 'requirement-assessments';
-		const endpoint = `${BASE_API_URL}/${URLModel}/${value.id}/`;
+		const value = z.object({ id: z.string().uuid() }).passthrough().safeParse(data);
+		if (!value.success) {
+			return fail(400, { error: 'Invalid requirement assessment identifier.' });
+		}
+		const endpoint = `${BASE_API_URL}/requirement-assignments/${event.params.id}/requirement-assessments/${value.data.id}/`;
 
 		const requestInitOptions: RequestInit = {
 			method: 'PATCH',
-			body: JSON.stringify(value)
+			body: JSON.stringify(assignmentPatch(value.data))
 		};
 
 		const res = await event.fetch(endpoint, requestInitOptions);
 		return { status: res.status, body: await res.json() };
 	},
 	createEvidence: async (event) => {
-		const result = await nestedWriteFormAction({ event, action: 'create' });
-		if (result.form) return { form: result.form, newEvidence: result.form.message.object };
-		else return result;
+		const result = await defaultWriteFormAction({
+			event,
+			urlModel: 'evidences',
+			action: 'create',
+			doRedirect: false
+		});
+		if ('form' in result && result.form) {
+			return { form: result.form, newEvidence: result.form.message.object };
+		}
+		return result;
 	},
 	createAppliedControl: async (event) => {
-		return nestedWriteFormAction({ event, action: 'create' });
+		return defaultWriteFormAction({
+			event,
+			urlModel: 'applied-controls',
+			action: 'create',
+			doRedirect: false
+		});
 	},
 	update: async (event) => {
-		const schema = modelSchema('requirement-assessments');
+		const schema = RequirementAssessmentRelationSchema;
 		const id = event.url.searchParams.get('id');
-		if (!id) return fail(400, { form: await superValidate(event.request, zod(schema)) });
+		const field = event.url.searchParams.get('field');
+		const requirementAssessmentId = z.string().uuid().safeParse(id);
+		if (!requirementAssessmentId.success) {
+			return fail(400, { form: await superValidate(event.request, zod(schema)) });
+		}
+		if (!isRelationUpdateField(field)) {
+			return fail(400, { error: 'Unsupported assignment relation update.' });
+		}
 
 		const form = await superValidate(event.request, zod(schema));
 		if (!form.valid) return fail(400, { form });
 
-		const formData: Record<string, any> = { ...form.data };
-		for (const key of ['status', 'result', 'extended_result', 'respondent_alignment']) {
-			if (formData[key] === '' || formData[key] === null) delete formData[key];
-		}
+		const relationValue = form.data[field];
+		if (!Array.isArray(relationValue)) return fail(400, { form });
+		const formData = { [field]: relationValue };
 
-		const endpoint = `${BASE_API_URL}/requirement-assessments/${id}/`;
+		const endpoint = `${BASE_API_URL}/requirement-assignments/${event.params.id}/requirement-assessments/${requirementAssessmentId.data}/`;
 		const response = await event.fetch(endpoint, {
 			method: 'PATCH',
 			body: JSON.stringify(formData)

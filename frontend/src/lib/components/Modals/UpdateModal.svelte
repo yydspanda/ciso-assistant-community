@@ -28,6 +28,7 @@
 		debug?: boolean;
 		customNameDescription?: boolean;
 		customFolder?: boolean;
+		schema?: any;
 	}
 
 	let {
@@ -42,7 +43,8 @@
 		selectOptions = {},
 		debug = false,
 		customNameDescription = true,
-		customFolder = false
+		customFolder = false,
+		schema = undefined
 	}: Props = $props();
 </script>
 
@@ -76,6 +78,7 @@
 			caching={true}
 			{selectOptions}
 			{debug}
+			{schema}
 		/>
 	</div>
 {/if}

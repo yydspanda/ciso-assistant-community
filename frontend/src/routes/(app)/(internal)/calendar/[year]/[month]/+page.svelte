@@ -52,16 +52,23 @@
 				})),
 			...(data.tasks ?? [])
 				.filter((t: any) => t.due_date)
-				.map((task: any) => ({
-					label: task.name,
-					date: localDate(task.due_date),
-					link: !task.is_recurrent
-						? `/task-templates/${task.task_template.id}`
-						: `/task-nodes/${task.id}`,
-					users: task.assigned_to ?? [],
-					category: 'task' as const,
-					status: task.status
-				})),
+				.map((task: any) => {
+					const templateId = task.task_template?.id ?? task.task_template;
+					return {
+						label: task.name,
+						date: localDate(task.due_date),
+						// A read-only calendar may return an occurrence that has not
+						// been explicitly materialized yet. Keep it navigable via the
+						// template instead of treating the template UUID as a node UUID.
+						link:
+							task.virtual || !task.is_recurrent
+								? `/task-templates/${templateId}`
+								: `/task-nodes/${task.id}`,
+						users: task.assigned_to ?? [],
+						category: 'task' as const,
+						status: task.status
+					};
+				}),
 			...(data.contracts ?? [])
 				.filter((c: any) => c.end_date)
 				.map((contract: any) => ({
