@@ -1064,67 +1064,16 @@ def _generate_occurrences(template, start_date, end_date):
 
 
 def _is_question_visible(question, answers_by_urn, questions_by_urn=None, visited=None):
-    """Check if a question is visible based on depends_on logic.
+    """Resolve conditional visibility through the shared strict evaluator."""
 
-    Works with Question model objects (new relational models).
-    - question: a Question model instance
-    - answers_by_urn: dict of {question.urn: answer_value}
-    - questions_by_urn: dict of {question.urn: Question} (optional, for lookups)
-    - visited: set of urns already visited (cycle protection)
-    """
-    depends_on = (
-        question.depends_on
-        if hasattr(question, "depends_on")
-        else question.get("depends_on")
-        if isinstance(question, dict)
-        else None
+    from core.questionnaire import is_question_visible_strict
+
+    return is_question_visible_strict(
+        question,
+        answers_by_urn,
+        questions_by_urn,
+        frozenset(visited or ()),
     )
-    if not depends_on:
-        return True
-
-    dep_ref = depends_on.get("question") if isinstance(depends_on, dict) else None
-    if not dep_ref:
-        return True
-
-    # Cycle protection
-    if visited is None:
-        visited = set()
-    q_urn = getattr(question, "urn", None) or (
-        question.get("urn") if isinstance(question, dict) else None
-    )
-    if q_urn:
-        if q_urn in visited:
-            return True
-        visited = visited | {q_urn}
-
-    # Check parent question visibility first (recursive chain)
-    if questions_by_urn:
-        parent_question = questions_by_urn.get(dep_ref)
-        if parent_question and not _is_question_visible(
-            parent_question, answers_by_urn, questions_by_urn, visited
-        ):
-            return False
-
-    target_answer = answers_by_urn.get(dep_ref)
-    # Use explicit None/empty-list check to avoid hiding on falsy values like 0 or False
-    if target_answer is None or (isinstance(target_answer, list) and not target_answer):
-        return False
-
-    condition = depends_on.get("condition", "any")
-    dep_answers = depends_on.get("answers", [])
-
-    if condition == "any":
-        if isinstance(target_answer, list):
-            return any(a in dep_answers for a in target_answer)
-        return target_answer in dep_answers
-
-    if condition == "all":
-        if isinstance(target_answer, list):
-            return all(a in target_answer for a in dep_answers)
-        # Single-value answer can only satisfy "all" if there's exactly one expected answer
-        return len(dep_answers) == 1 and target_answer == dep_answers[0]
-
-    return False
 
 
 def build_answers_dict(answers_qs):

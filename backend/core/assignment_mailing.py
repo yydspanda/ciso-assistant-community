@@ -22,11 +22,14 @@ from django.db.models import F, Q
 from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
+from core.assignment_access import assert_assignment_folder_owner
+from core.relation_locking import lock_rows_in_global_model_order
 from core.models import (
     Actor,
     ComplianceAssessment,
     RequirementAssignment,
     RequirementAssignmentEvent,
+    RequirementAssignmentMailEvidence,
     RequirementAssignmentMailOutbox,
 )
 from core.utils import has_full_view_compliance_assessment
@@ -40,6 +43,72 @@ MAIL_OBJECT: Final = "auditee-assessments"
 PAYLOAD_SCHEMA: Final = "requirement-assignment-mail-v1"
 CLAIM_TIMEOUT: Final = timedelta(minutes=15)
 logger = structlog.get_logger(__name__)
+
+
+def _record_assignment_mail_evidence(
+    outbox: RequirementAssignmentMailOutbox,
+    *,
+    prior_status: str,
+    source: str = RequirementAssignmentMailEvidence.Source.SYSTEM,
+    recorded_by_id: UUID | None = None,
+    action: str = "",
+    reason: str = "",
+    evidence_reference: str = "",
+) -> RequirementAssignmentMailEvidence:
+    """Persist one immutable, privacy-minimized delivery-state snapshot."""
+
+    recorded_at = timezone.now()
+    payload = {
+        "action": action,
+        "assignment_id_snapshot": str(outbox.assignment_id),
+        "attempts": outbox.attempts,
+        "evidence_reference": evidence_reference,
+        "failure_code": outbox.failure_code,
+        "folder_id_snapshot": str(outbox.folder_id),
+        "outbox_id_snapshot": str(outbox.id),
+        "payload_digest": outbox.payload_digest,
+        "prior_status": prior_status,
+        "reason": reason,
+        "recipient_actor_id_snapshot": (
+            str(outbox.recipient_actor_id) if outbox.recipient_actor_id else None
+        ),
+        "recipient_address_hash": outbox.recipient_address_hash,
+        "recorded_at": recorded_at.isoformat(),
+        "recorded_by_id_snapshot": (
+            str(recorded_by_id) if recorded_by_id is not None else None
+        ),
+        "requested_by_id_snapshot": (
+            str(outbox.requested_by_id) if outbox.requested_by_id else None
+        ),
+        "source": source,
+        "status": outbox.status,
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return RequirementAssignmentMailEvidence.objects.create(
+        outbox_id_snapshot=outbox.id,
+        assignment_id_snapshot=outbox.assignment_id,
+        folder_id_snapshot=outbox.folder_id,
+        recipient_actor_id_snapshot=outbox.recipient_actor_id,
+        requested_by_id_snapshot=outbox.requested_by_id,
+        recorded_by_id_snapshot=recorded_by_id,
+        source=source,
+        prior_status=prior_status,
+        status=outbox.status,
+        action=action,
+        attempts=outbox.attempts,
+        payload_digest=outbox.payload_digest,
+        recipient_address_hash=outbox.recipient_address_hash,
+        failure_code=outbox.failure_code,
+        reason=reason,
+        evidence_reference=evidence_reference,
+        record_digest=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        recorded_at=recorded_at,
+    )
 
 
 def _exact_permission(app_label: str, model: str, codename: str) -> Permission:
@@ -146,6 +215,7 @@ def queue_requirement_assignment_mails(
     """Lock, re-authorize, transition, and persist delivery intents atomically."""
 
     with transaction.atomic():
+        Folder._lock_folder_tree()
         assessment = (
             ComplianceAssessment.objects.select_for_update()
             .select_related("folder")
@@ -171,6 +241,9 @@ def queue_requirement_assignment_mails(
             .order_by("created_at", "id")
         )
         assignment_ids = [assignment.id for assignment in assignments]
+        for assignment in assignments:
+            assignment.compliance_assessment = assessment
+            assert_assignment_folder_owner(assignment)
 
         # Lock the relationship rows that define the exact author/recipient set.
         author_links = list(
@@ -185,14 +258,7 @@ def queue_requirement_assignment_mails(
         )
         actor_ids = set(author_links)
         actor_ids.update(actor_id for _, actor_id in assignment_actor_links)
-        actors = {
-            actor.id: actor
-            for actor in Actor.objects.select_for_update().filter(id__in=actor_ids)
-        }
-        user_ids = [actor.user_id for actor in actors.values() if actor.user_id]
-        if user_ids:
-            # Stabilise the mail-capable subtype and its address while hashing.
-            list(User.objects.select_for_update().filter(id__in=user_ids))
+        actors = lock_rows_in_global_model_order({Actor: actor_ids})[Actor]
 
         view_assignment = _exact_permission(
             "core", "requirementassignment", "view_requirementassignment"
@@ -253,7 +319,7 @@ def queue_requirement_assignment_mails(
                     recipient_actor_id=actor.id,
                     recipient_address_hash=recipient_hash,
                 )
-                outbox, _ = RequirementAssignmentMailOutbox.objects.get_or_create(
+                outbox, created = RequirementAssignmentMailOutbox.objects.get_or_create(
                     assignment=assignment,
                     recipient_actor=actor,
                     defaults={
@@ -264,7 +330,8 @@ def queue_requirement_assignment_mails(
                     },
                 )
                 if (
-                    outbox.payload_digest != digest
+                    outbox.folder_id != assignment.folder_id
+                    or outbox.payload_digest != digest
                     or outbox.recipient_address_hash != recipient_hash
                     or outbox.status != RequirementAssignmentMailOutbox.Status.QUEUED
                 ):
@@ -273,6 +340,11 @@ def queue_requirement_assignment_mails(
                     # misleading queued=0 success for this inconsistent state.
                     raise ValidationError(
                         {"error": ["An assignment mail intent requires review."]}
+                    )
+                if created:
+                    _record_assignment_mail_evidence(
+                        outbox,
+                        prior_status="",
                     )
                 outbox_ids.append(outbox.id)
 
@@ -310,21 +382,33 @@ def deliver_requirement_assignment_mail_outbox(outbox_id: UUID | str) -> str:
     """
 
     claimed_at = timezone.now()
-    claimed = RequirementAssignmentMailOutbox.objects.filter(
-        id=outbox_id,
-        status=RequirementAssignmentMailOutbox.Status.QUEUED,
-        available_at__lte=claimed_at,
-    ).update(
-        status=RequirementAssignmentMailOutbox.Status.SENDING,
-        claimed_at=claimed_at,
-        failed_at=None,
-        failure_code="",
-        attempts=F("attempts") + 1,
-    )
-    if claimed != 1:
-        return "noop"
+    with transaction.atomic():
+        claimed = RequirementAssignmentMailOutbox.objects.filter(
+            id=outbox_id,
+            status=RequirementAssignmentMailOutbox.Status.QUEUED,
+            available_at__lte=claimed_at,
+        ).update(
+            status=RequirementAssignmentMailOutbox.Status.SENDING,
+            claimed_at=claimed_at,
+            failed_at=None,
+            failure_code="",
+            attempts=F("attempts") + 1,
+        )
+        if claimed != 1:
+            return "noop"
+        claimed_outbox = (
+            RequirementAssignmentMailOutbox.objects.select_for_update().get(
+                id=outbox_id,
+                status=RequirementAssignmentMailOutbox.Status.SENDING,
+            )
+        )
+        _record_assignment_mail_evidence(
+            claimed_outbox,
+            prior_status=RequirementAssignmentMailOutbox.Status.QUEUED,
+        )
 
     failure_code = "delivery_error"
+    smtp_outcome_unknown = False
     try:
         with transaction.atomic():
             try:
@@ -340,11 +424,20 @@ def deliver_requirement_assignment_mail_outbox(outbox_id: UUID | str) -> str:
             assignment = RequirementAssignment.objects.select_for_update().get(
                 id=outbox.assignment_id
             )
+            assignment.compliance_assessment = ComplianceAssessment.objects.get(
+                id=assignment.compliance_assessment_id
+            )
+            assert_assignment_folder_owner(assignment)
+            if outbox.folder_id != assignment.folder_id:
+                failure_code = "outbox_folder_mismatch"
+                raise ValueError(failure_code)
             actor_id = outbox.recipient_actor_id
             if actor_id is None:
                 failure_code = "recipient_missing"
                 raise ValueError(failure_code)
-            actor = Actor.objects.select_for_update().get(id=actor_id)
+            actor = lock_rows_in_global_model_order({Actor: {actor_id}})[Actor][
+                actor_id
+            ]
 
             # Only the direct User subtype owns this mail API. Locking Actor and
             # User prevents subtype/address changes after the exact recipient
@@ -352,7 +445,8 @@ def deliver_requirement_assignment_mail_outbox(outbox_id: UUID | str) -> str:
             if actor.user_id is None:
                 failure_code = "recipient_changed"
                 raise ValueError(failure_code)
-            recipient_user = User.objects.select_for_update().get(id=actor.user_id)
+            # The shared Actor lock plan already holds this User before Actor.
+            recipient_user = User.objects.get(id=actor.user_id)
             actor.user = recipient_user
 
             assignment_actor_links = list(
@@ -436,6 +530,11 @@ def deliver_requirement_assignment_mail_outbox(outbox_id: UUID | str) -> str:
                 failure_code = "recipient_changed"
                 raise ValueError(failure_code)
 
+            # Once control enters the mail backend, an exception or process
+            # death cannot prove whether SMTP accepted the message.  Keep this
+            # marker true until both the external result and our durable state
+            # commit are complete.
+            smtp_outcome_unknown = True
             delivered = recipient_user.mailing(
                 email_template_name=MAIL_TEMPLATE,
                 subject=MAIL_SUBJECT,
@@ -445,9 +544,11 @@ def deliver_requirement_assignment_mail_outbox(outbox_id: UUID | str) -> str:
                 redact_logs=True,
             )
             if delivered is not True:
+                smtp_outcome_unknown = False
                 failure_code = "delivery_not_confirmed"
                 raise ValueError(failure_code)
 
+            prior_status = outbox.status
             outbox.status = RequirementAssignmentMailOutbox.Status.DELIVERED
             outbox.delivered_at = timezone.now()
             outbox.failed_at = None
@@ -460,23 +561,48 @@ def deliver_requirement_assignment_mail_outbox(outbox_id: UUID | str) -> str:
                     "failure_code",
                 ]
             )
+            _record_assignment_mail_evidence(
+                outbox,
+                prior_status=prior_status,
+            )
+        smtp_outcome_unknown = False
         return "delivered"
     except Exception as exc:
-        RequirementAssignmentMailOutbox.objects.filter(
-            id=outbox_id,
-            status=RequirementAssignmentMailOutbox.Status.SENDING,
-        ).update(
-            status=RequirementAssignmentMailOutbox.Status.FAILED,
-            failed_at=timezone.now(),
-            failure_code=failure_code,
+        final_status = (
+            RequirementAssignmentMailOutbox.Status.UNCERTAIN
+            if smtp_outcome_unknown
+            else RequirementAssignmentMailOutbox.Status.FAILED
         )
+        if smtp_outcome_unknown:
+            failure_code = "smtp_outcome_unknown"
+        with transaction.atomic():
+            failed_outbox = (
+                RequirementAssignmentMailOutbox.objects.select_for_update()
+                .filter(
+                    id=outbox_id,
+                    status=RequirementAssignmentMailOutbox.Status.SENDING,
+                )
+                .first()
+            )
+            if failed_outbox is not None:
+                prior_status = failed_outbox.status
+                failed_outbox.status = final_status
+                failed_outbox.failed_at = timezone.now()
+                failed_outbox.failure_code = failure_code
+                failed_outbox.save(
+                    update_fields=["status", "failed_at", "failure_code"]
+                )
+                _record_assignment_mail_evidence(
+                    failed_outbox,
+                    prior_status=prior_status,
+                )
         logger.error(
             "requirement_assignment_mail_delivery_failed",
             outbox_id=str(outbox_id),
             failure_code=failure_code,
             error_type=type(exc).__name__,
         )
-        return "failed"
+        return final_status
 
 
 def get_due_requirement_assignment_mail_ids(*, limit: int = 100) -> list[UUID]:
@@ -492,23 +618,156 @@ def get_due_requirement_assignment_mail_ids(*, limit: int = 100) -> list[UUID]:
 
 
 def fail_stale_requirement_assignment_mail_claims() -> int:
-    """Close abandoned claims without retrying a possibly delivered email.
+    """Escalate abandoned claims without retrying a possibly delivered email.
 
     A process can die after SMTP acceptance but before persisting ``delivered``.
     Automatically re-queueing that row would risk duplicate mail, so the
-    sweeper records a bounded terminal failure for explicit operator review.
+    sweeper records a review-required state and immutable evidence for a named
+    human decision.
     """
 
     now = timezone.now()
     cutoff = now - CLAIM_TIMEOUT
-    return (
-        RequirementAssignmentMailOutbox.objects.filter(
-            status=RequirementAssignmentMailOutbox.Status.SENDING
+    with transaction.atomic():
+        stale_outboxes = list(
+            RequirementAssignmentMailOutbox.objects.select_for_update()
+            .filter(status=RequirementAssignmentMailOutbox.Status.SENDING)
+            .filter(Q(claimed_at__lte=cutoff) | Q(claimed_at__isnull=True))
+            .order_by("id")
         )
-        .filter(Q(claimed_at__lte=cutoff) | Q(claimed_at__isnull=True))
-        .update(
-            status=RequirementAssignmentMailOutbox.Status.FAILED,
-            failed_at=now,
-            failure_code="claim_timeout",
-        )
+        for outbox in stale_outboxes:
+            prior_status = outbox.status
+            outbox.status = RequirementAssignmentMailOutbox.Status.REVIEW_REQUIRED
+            outbox.failed_at = now
+            outbox.failure_code = "claim_timeout"
+            outbox.save(update_fields=["status", "failed_at", "failure_code"])
+            _record_assignment_mail_evidence(outbox, prior_status=prior_status)
+    return len(stale_outboxes)
+
+
+def resolve_requirement_assignment_mail_outbox(
+    *,
+    outbox_id: UUID | str,
+    checker: User,
+    action: str,
+    reason: str,
+    evidence_reference: str,
+) -> str:
+    """Resolve an ambiguous SMTP outcome through a named maker/checker gate.
+
+    This is an internal service boundary, not an unauthenticated worker hook.
+    A future UI/API may call it only after normal CISO Assistant IAM.  The
+    decision binds the exact retained outbox payload and stores no mail body or
+    recipient address.
+    """
+
+    allowed_actions = {
+        RequirementAssignmentMailEvidence.Action.CONFIRM_DELIVERED,
+        RequirementAssignmentMailEvidence.Action.CONFIRM_NOT_DELIVERED,
+    }
+    if action not in allowed_actions:
+        raise ValidationError({"action": ["Unsupported mail resolution action."]})
+    reason = reason.strip() if isinstance(reason, str) else ""
+    evidence_reference = (
+        evidence_reference.strip() if isinstance(evidence_reference, str) else ""
     )
+    if not reason or len(reason) > 2000:
+        raise ValidationError({"reason": ["A bounded decision reason is required."]})
+    if not evidence_reference or len(evidence_reference) > 2048:
+        raise ValidationError(
+            {"evidence_reference": ["A bounded evidence reference is required."]}
+        )
+    if not getattr(checker, "is_authenticated", False) or not checker.id:
+        raise PermissionDenied("A named human checker is required.")
+
+    with transaction.atomic():
+        Folder._lock_folder_tree()
+        try:
+            checker = User.objects.select_for_update().get(id=checker.id)
+        except User.DoesNotExist as exc:
+            raise PermissionDenied("A named human checker is required.") from exc
+        if (
+            not checker.is_active
+            or User.objects.filter(
+                id=checker.id,
+                service_account__isnull=False,
+            ).exists()
+        ):
+            raise PermissionDenied("A named human checker is required.")
+
+        try:
+            outbox = RequirementAssignmentMailOutbox.objects.select_for_update().get(
+                id=outbox_id
+            )
+            assignment = RequirementAssignment.objects.select_for_update().get(
+                id=outbox.assignment_id
+            )
+            folder = Folder.objects.get(id=outbox.folder_id)
+        except (
+            RequirementAssignmentMailOutbox.DoesNotExist,
+            RequirementAssignment.DoesNotExist,
+            Folder.DoesNotExist,
+        ) as exc:
+            raise PermissionDenied("The mail intent is unavailable.") from exc
+
+        assignment.compliance_assessment = ComplianceAssessment.objects.get(
+            id=assignment.compliance_assessment_id
+        )
+        assert_assignment_folder_owner(assignment)
+        if outbox.folder_id != assignment.folder_id:
+            raise PermissionDenied("The mail intent owner is inconsistent.")
+        if outbox.requested_by_id == checker.id:
+            raise PermissionDenied(
+                "The mail requester cannot resolve their own intent."
+            )
+        if outbox.status not in {
+            RequirementAssignmentMailOutbox.Status.UNCERTAIN,
+            RequirementAssignmentMailOutbox.Status.REVIEW_REQUIRED,
+        }:
+            raise ValidationError(
+                {"action": ["Only an ambiguous mail intent can be resolved."]}
+            )
+
+        reconcile_permission = _exact_permission(
+            "core",
+            "requirementassignmentmailoutbox",
+            "resolve_requirementassignmentmailoutbox",
+        )
+        view_assignment = _exact_permission(
+            "core",
+            "requirementassignment",
+            "view_requirementassignment",
+        )
+        _require_folder_permission(checker, reconcile_permission, folder)
+        _require_folder_permission(checker, view_assignment, folder)
+
+        prior_status = outbox.status
+        now = timezone.now()
+        if action == RequirementAssignmentMailEvidence.Action.CONFIRM_DELIVERED:
+            outbox.status = RequirementAssignmentMailOutbox.Status.DELIVERED
+            outbox.delivered_at = now
+            outbox.failed_at = None
+            outbox.failure_code = "human_confirmed_delivered"
+        else:
+            outbox.status = RequirementAssignmentMailOutbox.Status.FAILED
+            outbox.delivered_at = None
+            outbox.failed_at = now
+            outbox.failure_code = "human_confirmed_not_delivered"
+        outbox.save(
+            update_fields=[
+                "status",
+                "delivered_at",
+                "failed_at",
+                "failure_code",
+            ]
+        )
+        _record_assignment_mail_evidence(
+            outbox,
+            prior_status=prior_status,
+            source=RequirementAssignmentMailEvidence.Source.HUMAN,
+            recorded_by_id=checker.id,
+            action=action,
+            reason=reason,
+            evidence_reference=evidence_reference,
+        )
+    return outbox.status

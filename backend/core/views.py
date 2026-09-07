@@ -41,9 +41,11 @@ from django.db.models import (
     QuerySet,
     Prefetch,
 )
+from django.db.models.fields.related import ManyToManyRel
 from django.db.models.functions import Coalesce
 
 from collections import defaultdict
+from copy import deepcopy
 import pytz
 from uuid import UUID
 from itertools import chain, cycle
@@ -64,8 +66,16 @@ from django.db.models.functions import Lower
 
 from docxtpl import DocxTemplate
 from jinja2.sandbox import SandboxedEnvironment
-from integrations.models import SyncMapping
-from integrations.tasks import sync_object_to_integrations
+from integrations.models import (
+    IntegrationConfiguration,
+    IntegrationProvider,
+    IntegrationSyncJob,
+    SyncEvent,
+    SyncMapping,
+)
+from integrations.capabilities import persist_outbound_sync_jobs
+from integrations.remote_ids import InvalidRemoteIdentifier, normalize_remote_id
+from integrations.sync_mixin import IntegrationSyncableMixin
 from webhooks.service import dispatch_webhook_event
 from .generators import gen_audit_context
 from .serializer_fields import FieldsRelatedField
@@ -79,7 +89,33 @@ from django.core.cache import cache
 
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from core.constants import LEGACY_TTP_LIBRARIES
+from core.compliance_deletion import lock_compliance_assessment_deletion_graph
+from core.deletion_authority import (
+    assert_generic_folder_deletion_has_no_governed_roots,
+    assert_generic_folder_structure_mutation_allowed,
+    lock_folder_mutation_scope,
+)
+from core.assignment_access import (
+    assert_assignment_folder_owner,
+    capture_assignment_questionnaire_scope,
+    get_assignment_visible_question_counts,
+    lock_assignment_actor_authority,
+    lock_requirement_assessment_relation_scope,
+)
 from core.permissions import FeatureFlagRequired
+from core.reserved_iam import (
+    MANAGED_TPRM_RESPONDENT_IAM_ERROR,
+    is_tprm_reserved_enclave_group,
+)
+from core.relation_locking import (
+    lock_questionnaire_owner_graph,
+    lock_rows_in_global_model_order,
+)
+from core.questionnaire import (
+    QuestionnaireAnswerError,
+    is_question_dependency_valid_strict,
+    normalize_question_answer,
+)
 from core.helpers import get_instance_metrics
 from core.instance_metrics import (
     nb_users_gauge,
@@ -105,13 +141,14 @@ from core.instance_metrics import (
 
 from django.apps import apps
 from django.contrib.auth.models import AnonymousUser, Permission
+from django.contrib.contenttypes.models import ContentType
 from django.conf import settings
 from django.core.exceptions import FieldDoesNotExist
 from django.core.files.storage import default_storage
 from django.core.serializers.json import DjangoJSONEncoder
 from django.contrib.auth.base_user import AbstractBaseUser
 
-from django.db import models, transaction
+from django.db import DatabaseError, models, transaction
 from django.forms import IntegerField as FormIntegerField
 from django.forms import ValidationError
 from django.http import FileResponse, HttpResponse, StreamingHttpResponse
@@ -143,6 +180,7 @@ from rest_framework.response import Response
 from rest_framework.utils.serializer_helpers import ReturnDict
 from rest_framework.views import APIView
 from rest_framework.exceptions import (
+    APIException,
     NotFound,
     PermissionDenied,
     ValidationError as DRFValidationError,
@@ -1391,6 +1429,50 @@ class BaseModelViewSet(viewsets.ModelViewSet):
 
     serializers_module = "core.serializers"
 
+    @staticmethod
+    def _retryable_database_conflict_code(exc):
+        """Return a PostgreSQL concurrency code without exposing DB details."""
+
+        seen = set()
+        current = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            code = getattr(current, "sqlstate", None) or getattr(
+                current, "pgcode", None
+            )
+            if code:
+                return code
+            diagnostics = getattr(current, "diag", None)
+            code = getattr(diagnostics, "sqlstate", None)
+            if code:
+                return code
+            current = getattr(current, "__cause__", None) or getattr(
+                current, "__context__", None
+            )
+        return None
+
+    def handle_exception(self, exc):
+        # Heterogeneous GRC relationships have legacy writers outside this
+        # mixin. PostgreSQL may choose either transaction as a deadlock victim
+        # or enforce a lock timeout. The atomic block has already rolled back
+        # when DRF reaches this boundary; return a stable, retryable conflict
+        # instead of leaking a database exception as HTTP 500.
+        if self._retryable_database_conflict_code(exc) in {"40P01", "55P03"}:
+            logger.warning(
+                "Retryable database concurrency conflict",
+                model=getattr(getattr(self, "model", None), "_meta", None)
+                and self.model._meta.label_lower,
+                action=getattr(self, "action", None),
+            )
+            response = Response(
+                {"detail": "A concurrent update conflicted; retry the request."},
+                status=status.HTTP_409_CONFLICT,
+            )
+            response["Retry-After"] = "1"
+            response.exception = True
+            return response
+        return super().handle_exception(exc)
+
     @property
     def filterset_class(self):
         # If you have defined filterset_fields, build the FilterSet on the fly.
@@ -1707,7 +1789,18 @@ class BaseModelViewSet(viewsets.ModelViewSet):
         return instance
 
     def perform_update(self, serializer):
-        instance = serializer.save()
+        syncable_instance = isinstance(serializer.instance, IntegrationSyncableMixin)
+        if syncable_instance:
+            serializer.instance._integration_sync_requested_by_id_snapshot = (
+                self.request.user.id
+            )
+        try:
+            instance = serializer.save()
+        finally:
+            if syncable_instance:
+                serializer.instance.__dict__.pop(
+                    "_integration_sync_requested_by_id_snapshot", None
+                )
         dispatch_webhook_event(instance, "updated", serializer=serializer)
         return instance
 
@@ -2314,8 +2407,14 @@ class BaseModelViewSet(viewsets.ModelViewSet):
     @action(detail=True, name="Get write data")
     def object(self, request, pk):
         serializer_class = self.get_serializer_class(action="update")
-
-        return Response(serializer_class(super().get_object()).data)
+        serializer = serializer_class(
+            super().get_object(),
+            context=self.get_serializer_context(),
+        )
+        data = serializer.data
+        if isinstance(serializer, BaseModelSerializer):
+            data = serializer._filter_writable_related_representation(data)
+        return Response(data)
 
 
 # Content types
@@ -2625,6 +2724,451 @@ class AssetCapabilityViewSet(BaseModelViewSet):
     search_fields = ["name"]
 
 
+def _lock_visible_integration_configuration(
+    *, user, integration_config_id, object_folder_id
+) -> IntegrationConfiguration:
+    """Lock and authorize an exact same-folder integration configuration."""
+
+    if not transaction.get_connection().in_atomic_block:
+        raise RuntimeError("Integration linking requires an atomic transaction.")
+    try:
+        configuration = (
+            IntegrationConfiguration.objects.select_for_update(of=("self",))
+            .select_related("folder")
+            .get(id=integration_config_id)
+        )
+        provider = (
+            IntegrationProvider.objects.select_for_update(of=("self",))
+            .select_related("folder")
+            .get(id=configuration.provider_id)
+        )
+    except IntegrationConfiguration.DoesNotExist as exc:
+        raise PermissionDenied("The integration configuration is unavailable.") from exc
+    except IntegrationProvider.DoesNotExist as exc:
+        raise PermissionDenied("The integration configuration is unavailable.") from exc
+
+    configuration.provider = provider
+
+    try:
+        visible_ids = RoleAssignment.get_viewable_object_ids(
+            user, IntegrationConfiguration
+        )
+    except (NotImplementedError, Permission.DoesNotExist) as exc:
+        raise PermissionDenied("The integration configuration is unavailable.") from exc
+    if configuration.id not in visible_ids:
+        raise PermissionDenied("The integration configuration is unavailable.")
+    if (
+        not configuration.is_active
+        or not provider.is_active
+        or configuration.folder_id != object_folder_id
+        or (
+            provider.folder_id != configuration.folder_id
+            and not configuration.folder.ancestors.filter(
+                id=provider.folder_id
+            ).exists()
+        )
+    ):
+        raise PermissionDenied("The integration configuration is unavailable.")
+    return configuration
+
+
+def _integration_owner_folder_ids(configuration) -> set:
+    """Take an unlocked relationship snapshot used only to order later locks."""
+
+    provider_folder_id = (
+        IntegrationProvider.objects.filter(id=configuration.provider_id)
+        .values_list("folder_id", flat=True)
+        .first()
+    )
+    if provider_folder_id is None:
+        raise PermissionDenied("The integration configuration is unavailable.")
+    return {configuration.folder_id, provider_folder_id}
+
+
+def _lock_integration_owner_folders(folder_ids) -> dict:
+    """Lock exact owners after the root mutex and before integration rows."""
+
+    requested_ids = {folder_id for folder_id in folder_ids if folder_id is not None}
+    locked = {
+        folder.id: folder
+        for folder in Folder.objects.select_for_update(of=("self",))
+        .filter(id__in=requested_ids)
+        .order_by("id")
+    }
+    if set(locked) != requested_ids:
+        raise PermissionDenied("An integration owner folder is unavailable.")
+    return locked
+
+
+def _lock_configuration_sync_mappings(
+    configuration: IntegrationConfiguration,
+) -> list[SyncMapping]:
+    """Lock the complete child set while its configuration mutex is held."""
+
+    return list(
+        SyncMapping.objects.select_for_update(of=("self",))
+        .filter(configuration_id=configuration.id)
+        .order_by("id")
+    )
+
+
+def _lock_integration_link_graph(
+    *, user, candidate_configuration, object_folder_ids, final_object_folder_id
+) -> tuple[IntegrationConfiguration | None, list[SyncMapping]]:
+    """Lock owner folders -> configuration -> provider -> child mappings."""
+
+    owner_folder_ids = set(object_folder_ids)
+    if candidate_configuration is not None:
+        owner_folder_ids.update(_integration_owner_folder_ids(candidate_configuration))
+    locked_folders = _lock_integration_owner_folders(owner_folder_ids)
+    if candidate_configuration is None:
+        return None, []
+
+    configuration = _lock_visible_integration_configuration(
+        user=user,
+        integration_config_id=candidate_configuration.id,
+        object_folder_id=final_object_folder_id,
+    )
+    if (
+        configuration.folder_id not in locked_folders
+        or configuration.provider.folder_id not in locked_folders
+    ):
+        raise PermissionDenied(
+            "The integration configuration changed owner concurrently."
+        )
+    return configuration, _lock_configuration_sync_mappings(configuration)
+
+
+class SyncMappingConflict(APIException):
+    """Non-disclosing conflict for one remote object's exclusive ownership."""
+
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = _("The remote object is already linked or unavailable.")
+    default_code = "sync_mapping_conflict"
+
+
+class LocalObjectSyncMappingConflict(APIException):
+    """A linked local object must be explicitly unlinked before relocation/deletion."""
+
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = _(
+        "Unlink all synchronized objects before moving or deleting this object."
+    )
+    default_code = "local_object_sync_mapping_conflict"
+
+
+_UNRESOLVED_INTEGRATION_JOB_STATUSES = (
+    IntegrationSyncJob.Status.QUEUED,
+    IntegrationSyncJob.Status.PROCESSING,
+    IntegrationSyncJob.Status.UNCERTAIN,
+    IntegrationSyncJob.Status.REVIEW_REQUIRED,
+)
+
+
+def _record_user_mapping_event(
+    *, mapping: SyncMapping, user, action: str, before: dict, after: dict
+) -> None:
+    """Append a durable user-attributed mapping-identity transition."""
+
+    SyncEvent.objects.create(
+        mapping=mapping,
+        mapping_id_snapshot=mapping.id,
+        configuration_id_snapshot=mapping.configuration_id,
+        content_type_id_snapshot=mapping.content_type_id,
+        local_object_id_snapshot=mapping.local_object_id,
+        remote_id_snapshot=mapping.remote_id,
+        job_id_snapshot=None,
+        request_digest_snapshot="",
+        actor_id_snapshot=getattr(user, "id", None),
+        direction=SyncMapping.SyncDirection.PUSH,
+        changes={
+            "action": action,
+            "before": before,
+            "after": after,
+            "mapping_version": mapping.version,
+        },
+        triggered_by=SyncEvent.TriggeredBy.USER,
+        success=True,
+    )
+
+
+def _lock_and_reject_unresolved_mapping_jobs(mapping: SyncMapping) -> None:
+    """Lock the mapping's unresolved work after its local object is locked."""
+
+    if (
+        IntegrationSyncJob.objects.select_for_update(of=("self",))
+        .filter(
+            mapping_id_snapshot=mapping.id,
+            status__in=_UNRESOLVED_INTEGRATION_JOB_STATUSES,
+        )
+        .order_by("created_at", "id")
+        .exists()
+    ):
+        raise SyncMappingConflict()
+
+
+def _lock_and_assert_local_mapping_mutation_allowed(
+    *, instance, final_folder_id=None
+) -> None:
+    """Reject relocation/deletion of a mapped object under the root mutex.
+
+    The unlocked reads only establish a deterministic lock plan.  Configuration,
+    provider and mapping rows are then locked and the exact generic-relation set
+    is re-read before the local object may be locked or mutated by the caller.
+    """
+
+    if not transaction.get_connection().in_atomic_block:
+        raise RuntimeError("Integration mutation guards require an atomic transaction.")
+
+    content_type = ContentType.objects.get_for_model(type(instance))
+    snapshot = {
+        mapping_id: (configuration_id, folder_id)
+        for mapping_id, configuration_id, folder_id in (
+            SyncMapping.objects.filter(
+                content_type=content_type,
+                local_object_id=instance.id,
+            )
+            .order_by("id")
+            .values_list("id", "configuration_id", "folder_id")
+        )
+    }
+    configuration_ids = {row[0] for row in snapshot.values()}
+    configuration_snapshot = {
+        configuration_id: (provider_id, folder_id)
+        for configuration_id, provider_id, folder_id in (
+            IntegrationConfiguration.objects.filter(id__in=configuration_ids)
+            .order_by("id")
+            .values_list("id", "provider_id", "folder_id")
+        )
+    }
+    if set(configuration_snapshot) != configuration_ids:
+        raise LocalObjectSyncMappingConflict()
+
+    provider_ids = {row[0] for row in configuration_snapshot.values()}
+    provider_folder_snapshot = dict(
+        IntegrationProvider.objects.filter(id__in=provider_ids)
+        .order_by("id")
+        .values_list("id", "folder_id")
+    )
+    if set(provider_folder_snapshot) != provider_ids:
+        raise LocalObjectSyncMappingConflict()
+
+    owner_folder_ids = {
+        instance.folder_id,
+        final_folder_id,
+        *(row[1] for row in configuration_snapshot.values()),
+        *provider_folder_snapshot.values(),
+    }
+    _lock_integration_owner_folders(owner_folder_ids)
+
+    configurations = {
+        row.id: row
+        for row in IntegrationConfiguration.objects.select_for_update(of=("self",))
+        .filter(id__in=configuration_ids)
+        .order_by("id")
+    }
+    if set(configurations) != configuration_ids or any(
+        (row.provider_id, row.folder_id) != configuration_snapshot[row.id]
+        for row in configurations.values()
+    ):
+        raise LocalObjectSyncMappingConflict()
+
+    providers = {
+        row.id: row
+        for row in IntegrationProvider.objects.select_for_update(of=("self",))
+        .filter(id__in=provider_ids)
+        .order_by("id")
+    }
+    if set(providers) != provider_ids or any(
+        row.folder_id != provider_folder_snapshot[row.id] for row in providers.values()
+    ):
+        raise LocalObjectSyncMappingConflict()
+
+    locked_snapshot = {
+        mapping.id: (mapping.configuration_id, mapping.folder_id)
+        for mapping in SyncMapping.objects.select_for_update(of=("self",))
+        .filter(id__in=snapshot)
+        .order_by("id")
+    }
+    observed_snapshot = {
+        mapping_id: (configuration_id, folder_id)
+        for mapping_id, configuration_id, folder_id in (
+            SyncMapping.objects.filter(
+                content_type=content_type,
+                local_object_id=instance.id,
+            )
+            .order_by("id")
+            .values_list("id", "configuration_id", "folder_id")
+        )
+    }
+    if locked_snapshot != snapshot or observed_snapshot != snapshot or snapshot:
+        raise LocalObjectSyncMappingConflict()
+
+
+def _lock_or_create_sync_mapping(
+    *,
+    user,
+    configuration,
+    instance,
+    content_type,
+    remote_id,
+    locked_mappings: list[SyncMapping] | None = None,
+) -> SyncMapping:
+    """Write one coherent, exclusively-owned remote mapping under DB locks."""
+
+    if not transaction.get_connection().in_atomic_block:
+        raise RuntimeError("Integration linking requires an atomic transaction.")
+
+    if locked_mappings is None:
+        raise RuntimeError(
+            "Integration mapping writes require the prelocked relationship graph."
+        )
+    if any(
+        candidate.configuration_id != configuration.id for candidate in locked_mappings
+    ):
+        raise RuntimeError("Locked mappings do not belong to the configuration.")
+
+    try:
+        remote_id = normalize_remote_id(
+            configuration.provider.name,
+            remote_id,
+            allow_blank=True,
+        )
+    except InvalidRemoteIdentifier as exc:
+        raise DRFValidationError(
+            {"remote_object_id": "The remote identifier is invalid."}
+        ) from exc
+
+    candidates = locked_mappings
+    mapping = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.content_type_id == content_type.id
+            and candidate.local_object_id == instance.id
+        ),
+        None,
+    )
+    if remote_id:
+        try:
+            conflicting_mapping = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.id != getattr(mapping, "id", None)
+                    and normalize_remote_id(
+                        configuration.provider.name,
+                        candidate.remote_id,
+                        allow_blank=True,
+                    )
+                    == remote_id
+                ),
+                None,
+            )
+        except InvalidRemoteIdentifier as exc:
+            # A malformed historical sibling prevents an exact uniqueness
+            # proof. Do not reveal which row caused the denial.
+            raise SyncMappingConflict() from exc
+        if conflicting_mapping is not None:
+            raise SyncMappingConflict()
+
+    if mapping is None:
+        _assert_folder_action_permission(
+            user=user,
+            model=SyncMapping,
+            folder=configuration.folder,
+            action="add",
+        )
+        try:
+            # Use a savepoint so a constraint failure can be translated without
+            # leaving the surrounding object-update transaction unusable.
+            with transaction.atomic():
+                mapping = SyncMapping.objects.create(
+                    configuration=configuration,
+                    content_type=content_type,
+                    local_object_id=instance.id,
+                    remote_id=remote_id,
+                    sync_status=SyncMapping.SyncStatus.PENDING,
+                    folder=configuration.folder,
+                )
+                _record_user_mapping_event(
+                    mapping=mapping,
+                    user=user,
+                    action="link",
+                    before={},
+                    after={
+                        "local_object_id": str(mapping.local_object_id),
+                        "remote_id": mapping.remote_id,
+                        "sync_status": mapping.sync_status,
+                    },
+                )
+                return mapping
+        except IntegrityError as exc:
+            raise SyncMappingConflict() from exc
+
+    try:
+        visible_mapping_ids = RoleAssignment.get_viewable_object_ids(user, SyncMapping)
+    except (NotImplementedError, Permission.DoesNotExist) as exc:
+        raise PermissionDenied("The integration mapping is unavailable.") from exc
+    if mapping.id not in visible_mapping_ids:
+        raise PermissionDenied("The integration mapping is unavailable.")
+    if (
+        mapping.folder_id != configuration.folder_id
+        or mapping.folder_id != instance.folder_id
+    ):
+        raise PermissionDenied("The integration mapping is unavailable.")
+    _assert_object_action_permission(user=user, instance=mapping, action="change")
+    _lock_and_reject_unresolved_mapping_jobs(mapping)
+    before = {
+        "local_object_id": str(mapping.local_object_id),
+        "remote_id": mapping.remote_id,
+        "sync_status": mapping.sync_status,
+    }
+    changed = (
+        mapping.remote_id != remote_id
+        or mapping.sync_status != SyncMapping.SyncStatus.PENDING
+    )
+    mapping.remote_id = remote_id
+    mapping.sync_status = SyncMapping.SyncStatus.PENDING
+    if not changed:
+        return mapping
+    mapping.version += 1
+    try:
+        with transaction.atomic():
+            mapping.save(
+                update_fields=["remote_id", "sync_status", "version", "updated_at"]
+            )
+    except IntegrityError as exc:
+        raise SyncMappingConflict() from exc
+    _record_user_mapping_event(
+        mapping=mapping,
+        user=user,
+        action="relink",
+        before=before,
+        after={
+            "local_object_id": str(mapping.local_object_id),
+            "remote_id": mapping.remote_id,
+            "sync_status": mapping.sync_status,
+        },
+    )
+    return mapping
+
+
+def _queue_integration_sync_after_commit(
+    *, content_type, object_id, configuration_id, changed_fields, requested_by_id
+) -> None:
+    """Register the external integration enqueue only after durable commit."""
+
+    persist_outbound_sync_jobs(
+        content_type_id=content_type.id,
+        object_id=object_id,
+        configuration_ids=[configuration_id],
+        changed_fields=list(changed_fields),
+        origin_principal="ciso-assistant:api-integration-link",
+        requested_by_id=requested_by_id,
+    )
+
+
 class IntegrationLinkViewSetMixin:
     """Viewset hooks to link a local object to a remote ITSM record.
 
@@ -2641,73 +3185,124 @@ class IntegrationLinkViewSetMixin:
         key = getattr(self.model, "INTEGRATION_MODEL_KEY", None)
         return list(mappable_field_keys(key)) if key else []
 
+    @transaction.atomic
     def perform_create(self, serializer):
+        Folder._lock_folder_tree()
         create_remote_object = serializer.validated_data.pop(
             "create_remote_object", False
         )
         integration_config = serializer.validated_data.pop("integration_config", None)
         serializer.validated_data.pop("remote_object_id", None)
 
+        candidate_folder = serializer.validated_data.get("folder")
+        final_folder_id = (
+            candidate_folder.id
+            if candidate_folder is not None
+            else Folder.get_root_folder_id()
+        )
+        integration_config, locked_mappings = _lock_integration_link_graph(
+            user=self.request.user,
+            candidate_configuration=integration_config,
+            object_folder_ids={final_folder_id},
+            final_object_folder_id=final_folder_id,
+        )
         super().perform_create(serializer)
+        if serializer.instance.folder_id != final_folder_id:
+            raise PermissionDenied("The object's owner folder changed concurrently.")
 
-        if create_remote_object and integration_config:
-            from django.contrib.contenttypes.models import ContentType
-
-            try:
-                sync_object_to_integrations.schedule(
-                    args=(
-                        ContentType.objects.get_for_model(self.model),
-                        serializer.instance.id,
-                        [integration_config.id],
-                        self._integration_initial_fields(),
-                    ),
-                    delay=1,
+        if integration_config:
+            if create_remote_object:
+                content_type = ContentType.objects.get_for_model(self.model)
+                _lock_or_create_sync_mapping(
+                    user=self.request.user,
+                    configuration=integration_config,
+                    instance=serializer.instance,
+                    content_type=content_type,
+                    remote_id="",
+                    locked_mappings=locked_mappings,
                 )
-            except Exception:
-                logger.error(
-                    "Error creating remote object",
+                _queue_integration_sync_after_commit(
+                    content_type=content_type,
                     object_id=serializer.instance.id,
-                    exc_info=True,
+                    configuration_id=integration_config.id,
+                    changed_fields=self._integration_initial_fields(),
+                    requested_by_id=self.request.user.id,
                 )
 
+    @transaction.atomic
     def perform_update(self, serializer):
+        Folder._lock_folder_tree()
         integration_config = serializer.validated_data.pop("integration_config", None)
         remote_object_id = serializer.validated_data.pop("remote_object_id", None)
         serializer.validated_data.pop("create_remote_object", None)
 
+        expected_folder_id = serializer.instance.folder_id
+        candidate_folder = serializer.validated_data.get("folder")
+        final_folder_id = (
+            candidate_folder.id if candidate_folder is not None else expected_folder_id
+        )
+        if final_folder_id != expected_folder_id:
+            _lock_and_assert_local_mapping_mutation_allowed(
+                instance=serializer.instance,
+                final_folder_id=final_folder_id,
+            )
+        integration_config, locked_mappings = _lock_integration_link_graph(
+            user=self.request.user,
+            candidate_configuration=integration_config,
+            object_folder_ids={expected_folder_id, final_folder_id},
+            final_object_folder_id=final_folder_id,
+        )
+        locked_instance = (
+            self.model.objects.select_for_update(of=("self",))
+            .select_related("folder")
+            .get(id=serializer.instance.id)
+        )
+        if locked_instance.folder_id != expected_folder_id:
+            raise PermissionDenied("The object's owner folder changed concurrently.")
+        serializer.instance = locked_instance
         super().perform_update(serializer)
+        if serializer.instance.folder_id != final_folder_id:
+            raise PermissionDenied("The object's owner folder changed concurrently.")
 
-        if not (integration_config and remote_object_id):
+        if not integration_config:
             return
+        if not remote_object_id:
+            return
+        content_type = ContentType.objects.get_for_model(self.model)
+        sync_mapping = _lock_or_create_sync_mapping(
+            user=self.request.user,
+            configuration=integration_config,
+            instance=serializer.instance,
+            content_type=content_type,
+            remote_id=remote_object_id,
+            locked_mappings=locked_mappings,
+        )
+        # Empty changed_fields establishes the mapping and refreshes cached
+        # remote data without overwriting the linked remote record.
+        _queue_integration_sync_after_commit(
+            content_type=sync_mapping.content_type,
+            object_id=serializer.instance.id,
+            configuration_id=integration_config.id,
+            changed_fields=[],
+            requested_by_id=self.request.user.id,
+        )
 
-        from django.contrib.contenttypes.models import ContentType
-
-        try:
-            # SyncMapping is unique on (configuration, content_type,
-            # local_object_id); relinking must reuse the row, not INSERT a
-            # duplicate (which would raise IntegrityError).
-            sync_mapping, _ = SyncMapping.objects.update_or_create(
-                configuration=integration_config,
-                content_type=ContentType.objects.get_for_model(self.model),
-                local_object_id=serializer.instance.id,
-                defaults={
-                    "remote_id": remote_object_id,
-                    "sync_status": SyncMapping.SyncStatus.PENDING,
-                },
-            )
-            # Empty changed_fields: establish the mapping and refresh the cached
-            # remote_data without overwriting the linked remote record.
-            sync_object_to_integrations.schedule(
-                args=(
-                    sync_mapping.content_type,
-                    serializer.instance.id,
-                    [integration_config.id],
-                    [],
-                ),
-                delay=1,
-            )
-        except Exception:
-            logger.error("Error creating SyncMapping", exc_info=True)
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        Folder._lock_folder_tree()
+        _lock_and_assert_local_mapping_mutation_allowed(instance=instance)
+        locked_instance = get_object_or_404(
+            self.model.objects.select_for_update(of=("self",)),
+            id=instance.id,
+        )
+        if locked_instance.folder_id != instance.folder_id:
+            raise PermissionDenied("The object's owner folder changed concurrently.")
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=locked_instance,
+            action="delete",
+        )
+        return super().perform_destroy(locked_instance)
 
 
 class AssetViewSet(IntegrationLinkViewSetMixin, ExportMixin, BaseModelViewSet):
@@ -3008,7 +3603,13 @@ class AssetViewSet(IntegrationLinkViewSetMixin, ExportMixin, BaseModelViewSet):
     @action(detail=True, name="Get asset write data")
     def object(self, request, pk):
         serializer_class = self.get_serializer_class(action="update")
-        asset_data = serializer_class(super().get_object()).data
+        serializer = serializer_class(
+            super().get_object(),
+            context=self.get_serializer_context(),
+        )
+        asset_data = serializer.data
+        if isinstance(serializer, BaseModelSerializer):
+            asset_data = serializer._filter_writable_related_representation(asset_data)
 
         general_settings = GlobalSettings.objects.filter(name="general").first()
         scale_key = (
@@ -5352,6 +5953,614 @@ APPLIED_CONTROL_LINKED_FIELDS = [
 APPLIED_CONTROL_LINKED_FIELD_NAMES = [f[0] for f in APPLIED_CONTROL_LINKED_FIELDS]
 
 
+class RequirementAssessmentRelationGuardMixin:
+    """Constrain reverse audit-row links at the generic model boundary."""
+
+    requirement_relation_allow_respondent = False
+    requirement_relation_scope_field: str | None = None
+    guarded_single_relation_fields = ("reference_control",)
+
+    @staticmethod
+    def _requested_requirement_assessment_ids(serializer):
+        values = serializer.validated_data.get("requirement_assessments")
+        if values is None:
+            return None
+        return {value.id for value in values}
+
+    @staticmethod
+    def _lock_current_requirement_assessment_ids(instance):
+        reverse_relation = instance._meta.get_field("requirement_assessments")
+        forward_field = getattr(reverse_relation, "field", reverse_relation)
+        source_name = forward_field.m2m_field_name()
+        target_name = forward_field.m2m_reverse_field_name()
+        current_ids = set(
+            forward_field.remote_field.through.objects.select_for_update()
+            .filter(**{f"{target_name}_id": instance.id})
+            .order_by("pk")
+            .values_list(f"{source_name}_id", flat=True)
+        )
+        return current_ids
+
+    @staticmethod
+    def _capture_non_requirement_relation_snapshots(serializer):
+        snapshots = {}
+        instance = serializer.instance
+        for input_name, field in serializer.fields.items():
+            source_name = field.source or input_name
+            if source_name in ("*", "requirement_assessments"):
+                continue
+            values = serializer.validated_data.get(source_name)
+            manager = getattr(instance, source_name, None)
+            if not isinstance(values, list) or manager is None:
+                continue
+            if values and not all(isinstance(item, models.Model) for item in values):
+                continue
+            if not hasattr(manager, "through") or not hasattr(manager, "values_list"):
+                continue
+            snapshots[source_name] = set(manager.values_list("id", flat=True))
+        return snapshots
+
+    def _capture_guarded_single_relation_snapshots(self, serializer):
+        snapshots = {}
+        for field_name in self.guarded_single_relation_fields:
+            if field_name not in serializer.validated_data:
+                continue
+            try:
+                model_field = serializer.Meta.model._meta.get_field(field_name)
+            except FieldDoesNotExist:
+                continue
+            if not isinstance(model_field, (ForeignKey, OneToOneField)):
+                continue
+            requested = serializer.validated_data[field_name]
+            snapshots[field_name] = (
+                getattr(serializer.instance, f"{field_name}_id"),
+                getattr(requested, "id", None),
+            )
+        return snapshots
+
+    @staticmethod
+    def _lock_rows_in_global_model_order(target_ids_by_model):
+        return _lock_rows_in_global_model_order(target_ids_by_model)
+
+    def _lock_and_authorize_create_relations(self, serializer):
+        """Re-resolve every submitted generic relation inside the create lock."""
+
+        target_ids_by_model = defaultdict(set)
+        requested_folder = serializer.validated_data.get("folder")
+        if requested_folder is not None:
+            target_ids_by_model[Folder].add(requested_folder.id)
+        relation_specs = []
+        for input_name, field in serializer.fields.items():
+            source_name = field.source or input_name
+            if source_name in ("*", "requirement_assessments"):
+                continue
+            requested_items = serializer.validated_data.get(source_name)
+            if not isinstance(requested_items, list) or not requested_items:
+                continue
+            if not all(isinstance(item, models.Model) for item in requested_items):
+                continue
+            related_model = requested_items[0]._meta.model
+            requested_ids = [item.id for item in requested_items]
+            target_ids_by_model[related_model].update(requested_ids)
+            relation_specs.append(
+                (input_name, source_name, related_model, requested_ids)
+            )
+
+        single_specs = []
+        for field_name in self.guarded_single_relation_fields:
+            requested = serializer.validated_data.get(field_name)
+            if requested is None:
+                continue
+            try:
+                model_field = serializer.Meta.model._meta.get_field(field_name)
+            except FieldDoesNotExist:
+                continue
+            related_model = model_field.related_model
+            target_ids_by_model[related_model].add(requested.id)
+            single_specs.append((field_name, related_model, requested.id))
+
+        locked_by_model = self._lock_rows_in_global_model_order(target_ids_by_model)
+        if requested_folder is not None:
+            locked_folder = locked_by_model[Folder][requested_folder.id]
+            serializer.validated_data["folder"] = locked_folder
+            _assert_folder_action_permission(
+                user=self.request.user,
+                model=self.model,
+                folder=locked_folder,
+                action="add",
+            )
+        visible_by_model = {}
+
+        def visible_ids(model):
+            if model not in visible_by_model:
+                try:
+                    visible_by_model[model] = set(
+                        RoleAssignment.get_viewable_object_ids(self.request.user, model)
+                    )
+                except (NotImplementedError, Permission.DoesNotExist):
+                    visible_by_model[model] = set()
+            return visible_by_model[model]
+
+        for input_name, source_name, model, requested_ids in relation_specs:
+            if set(requested_ids) - visible_ids(model):
+                raise PermissionDenied(
+                    f"One or more {input_name} objects are unavailable."
+                )
+            serializer.validated_data[source_name] = [
+                locked_by_model[model][item_id] for item_id in requested_ids
+            ]
+        for field_name, model, requested_id in single_specs:
+            if requested_id not in visible_ids(model):
+                raise PermissionDenied(f"The {field_name} relationship is unavailable.")
+            serializer.validated_data[field_name] = locked_by_model[model][requested_id]
+
+    def _lock_update_object_and_targets(
+        self,
+        serializer,
+        expected_relation_snapshots,
+        expected_single_relation_snapshots,
+    ):
+        """Lock parent, owner folders, and submitted targets globally."""
+
+        target_ids_by_model = defaultdict(set)
+        target_ids_by_model[self.model].add(serializer.instance.id)
+        expected_current_folder_id = getattr(serializer.instance, "folder_id", None)
+        requested_folder = serializer.validated_data.get("folder")
+        requested_folder_id = getattr(requested_folder, "id", None)
+        target_ids_by_model[Folder].update(
+            folder_id
+            for folder_id in (expected_current_folder_id, requested_folder_id)
+            if folder_id is not None
+        )
+        for input_name, field in serializer.fields.items():
+            source_name = field.source or input_name
+            if source_name not in expected_relation_snapshots:
+                continue
+            requested_items = serializer.validated_data.get(source_name)
+            manager = getattr(serializer.instance, source_name, None)
+            if not isinstance(requested_items, list) or manager is None:
+                continue
+            related_model = manager.model
+            target_ids_by_model[related_model].update(
+                expected_relation_snapshots[source_name]
+            )
+            target_ids_by_model[related_model].update(
+                item.id for item in requested_items
+            )
+        for field_name, (
+            current_id,
+            requested_id,
+        ) in expected_single_relation_snapshots.items():
+            model_field = serializer.Meta.model._meta.get_field(field_name)
+            related_model = model_field.related_model
+            target_ids_by_model[related_model].update(
+                value for value in (current_id, requested_id) if value is not None
+            )
+
+        locked_by_model = self._lock_rows_in_global_model_order(target_ids_by_model)
+        locked_instance = locked_by_model[self.model][serializer.instance.id]
+        if getattr(locked_instance, "folder_id", None) != expected_current_folder_id:
+            raise PermissionDenied(
+                "The object's owner folder changed concurrently; retry."
+            )
+        if expected_current_folder_id is not None:
+            locked_instance.folder = locked_by_model[Folder][expected_current_folder_id]
+        return (
+            locked_instance,
+            locked_by_model,
+        )
+
+    @staticmethod
+    def _replace_relation_payload(payload, input_name, related_ids):
+        values = [str(related_id) for related_id in related_ids]
+        if hasattr(payload, "setlist"):
+            payload.setlist(input_name, values)
+        else:
+            payload[input_name] = values
+
+    def _preserve_hidden_non_requirement_relations(
+        self,
+        *,
+        serializer,
+        locked_instance,
+        locked_by_model,
+        payload,
+        expected_snapshots,
+    ):
+        """Preserve every hidden writable M2M on guarded generic objects."""
+
+        for input_name, field in serializer.fields.items():
+            source_name = field.source or input_name
+            if source_name in ("*", "requirement_assessments"):
+                continue
+            requested_items = serializer.validated_data.get(source_name)
+            manager = getattr(locked_instance, source_name, None)
+            if not isinstance(requested_items, list) or manager is None:
+                continue
+            if requested_items and not all(
+                isinstance(item, models.Model) for item in requested_items
+            ):
+                continue
+            if not hasattr(manager, "through") or source_name not in expected_snapshots:
+                continue
+            try:
+                relation = locked_instance._meta.get_field(source_name)
+            except FieldDoesNotExist:
+                relation = next(
+                    (
+                        candidate
+                        for candidate in locked_instance._meta.get_fields()
+                        if isinstance(candidate, ManyToManyRel)
+                        and candidate.get_accessor_name() == source_name
+                    ),
+                    None,
+                )
+                if relation is None:
+                    continue
+            if isinstance(relation, ManyToManyRel):
+                forward_field = relation.field
+                instance_name = forward_field.m2m_reverse_field_name()
+                related_name = forward_field.m2m_field_name()
+            elif isinstance(relation, ManyToManyField):
+                forward_field = relation
+                instance_name = forward_field.m2m_field_name()
+                related_name = forward_field.m2m_reverse_field_name()
+            else:
+                continue
+
+            requested_ids = [item.id for item in requested_items]
+            discovered_current_ids = set(manager.values_list("id", flat=True))
+            if discovered_current_ids != expected_snapshots[source_name]:
+                raise PermissionDenied(
+                    f"The {input_name} relationship changed concurrently; retry."
+                )
+            target_ids = discovered_current_ids | set(requested_ids)
+            related_model = manager.model
+            locked_targets = locked_by_model.get(related_model, {})
+            if target_ids - set(locked_targets):
+                raise PermissionDenied(
+                    f"One or more {input_name} objects are unavailable."
+                )
+            locked_current_ids = set(
+                forward_field.remote_field.through.objects.select_for_update()
+                .filter(**{f"{instance_name}_id": locked_instance.id})
+                .order_by("pk")
+                .values_list(f"{related_name}_id", flat=True)
+            )
+            if locked_current_ids != discovered_current_ids:
+                raise PermissionDenied(
+                    f"The {input_name} relationship changed concurrently; retry."
+                )
+            try:
+                visible_ids = set(
+                    RoleAssignment.get_viewable_object_ids(
+                        self.request.user, related_model
+                    )
+                )
+            except (NotImplementedError, Permission.DoesNotExist):
+                visible_ids = set()
+            if (set(requested_ids) - locked_current_ids) - visible_ids:
+                raise PermissionDenied(
+                    f"One or more {input_name} objects are unavailable."
+                )
+            protected_ids = locked_current_ids - visible_ids
+            final_ids = [
+                *dict.fromkeys(requested_ids),
+                *sorted(protected_ids - set(requested_ids), key=str),
+            ]
+            self._replace_relation_payload(payload, input_name, final_ids)
+
+    def _preserve_hidden_guarded_single_relations(
+        self,
+        *,
+        serializer,
+        locked_instance,
+        locked_by_model,
+        payload,
+        expected_snapshots,
+    ):
+        """Lock nullable authority-bearing FKs and preserve hidden owners."""
+
+        for field_name, (
+            expected_current_id,
+            requested_id,
+        ) in expected_snapshots.items():
+            try:
+                model_field = locked_instance._meta.get_field(field_name)
+            except FieldDoesNotExist:
+                continue
+            related_model = model_field.related_model
+            locked_current_id = getattr(locked_instance, f"{field_name}_id")
+            if locked_current_id != expected_current_id:
+                raise PermissionDenied(
+                    f"The {field_name} relationship changed concurrently; retry."
+                )
+            target_ids = {
+                value
+                for value in (locked_current_id, requested_id)
+                if value is not None
+            }
+            locked_targets = locked_by_model.get(related_model, {})
+            if target_ids - set(locked_targets):
+                raise PermissionDenied(f"The {field_name} relationship is unavailable.")
+            try:
+                visible_ids = set(
+                    RoleAssignment.get_viewable_object_ids(
+                        self.request.user, related_model
+                    )
+                )
+            except (NotImplementedError, Permission.DoesNotExist):
+                visible_ids = set()
+
+            if locked_current_id is not None and locked_current_id not in visible_ids:
+                if requested_id not in (None, locked_current_id):
+                    raise PermissionDenied(
+                        f"The current {field_name} relationship is unavailable."
+                    )
+                # A redacted full-form value (normally null) is omission. The
+                # locked serializer must keep the independently hidden owner.
+                payload.pop(field_name, None)
+            elif requested_id is not None and requested_id not in visible_ids:
+                raise PermissionDenied(f"The {field_name} relationship is unavailable.")
+
+    def _prepare_locked_object_serializer(
+        self,
+        serializer,
+        locked_instance,
+        locked_by_model,
+        expected_relation_snapshots,
+        expected_single_relation_snapshots,
+    ):
+        payload = serializer.initial_data.copy()
+        self._preserve_hidden_non_requirement_relations(
+            serializer=serializer,
+            locked_instance=locked_instance,
+            locked_by_model=locked_by_model,
+            payload=payload,
+            expected_snapshots=expected_relation_snapshots,
+        )
+        self._preserve_hidden_guarded_single_relations(
+            serializer=serializer,
+            locked_instance=locked_instance,
+            locked_by_model=locked_by_model,
+            payload=payload,
+            expected_snapshots=expected_single_relation_snapshots,
+        )
+        locked_serializer = self.get_serializer(
+            locked_instance,
+            data=payload,
+            partial=serializer.partial,
+        )
+        locked_serializer.is_valid(raise_exception=True)
+        if issubclass(self.model, AppliedControl):
+            for field_name in (
+                "integration_config",
+                "remote_object_id",
+                "create_remote_object",
+            ):
+                locked_serializer.validated_data.pop(field_name, None)
+        return locked_serializer
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        Folder._lock_folder_tree()
+        requested_ids = self._requested_requirement_assessment_ids(serializer)
+        if requested_ids:
+            folder = serializer.validated_data.get("folder")
+            locked_rows, _respondent_scope = lock_requirement_assessment_relation_scope(
+                user=self.request.user,
+                requirement_assessment_ids=requested_ids,
+                relation_field=self.requirement_relation_scope_field,
+                object_folder_id=getattr(folder, "id", None),
+                allow_respondent=self.requirement_relation_allow_respondent,
+            )
+            if {row.id for row in locked_rows} != requested_ids:
+                raise PermissionDenied(
+                    "One or more requirement assessments changed concurrently."
+                )
+            locked_rows_by_id = {row.id: row for row in locked_rows}
+            serializer.validated_data["requirement_assessments"] = [
+                locked_rows_by_id[row.id]
+                for row in serializer.validated_data["requirement_assessments"]
+            ]
+            _assert_folder_action_permission(
+                user=self.request.user,
+                model=self.model,
+                folder=folder,
+                action="add",
+            )
+        self._lock_and_authorize_create_relations(serializer)
+        return super().perform_create(serializer)
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        Folder._lock_folder_tree()
+        expected_relation_snapshots = self._capture_non_requirement_relation_snapshots(
+            serializer
+        )
+        expected_single_relation_snapshots = (
+            self._capture_guarded_single_relation_snapshots(serializer)
+        )
+        requested_ids = self._requested_requirement_assessment_ids(serializer)
+        source_instance = serializer.instance
+        current_ids = set(
+            source_instance.requirement_assessments.values_list("id", flat=True)
+        )
+        requested_folder = serializer.validated_data.get("folder")
+        folder_changes = (
+            requested_folder is not None
+            and requested_folder.id != source_instance.folder_id
+        )
+        visible_current_ids = current_ids & set(
+            RoleAssignment.get_viewable_object_ids(
+                self.request.user, RequirementAssessment
+            )
+        )
+        if not folder_changes and (
+            requested_ids is None or requested_ids == visible_current_ids
+        ):
+            locked_instance, locked_by_model = self._lock_update_object_and_targets(
+                serializer,
+                expected_relation_snapshots,
+                expected_single_relation_snapshots,
+            )
+            locked_current_ids = self._lock_current_requirement_assessment_ids(
+                locked_instance
+            )
+            if requested_ids is not None and requested_ids != (
+                locked_current_ids
+                & set(
+                    RoleAssignment.get_viewable_object_ids(
+                        self.request.user, RequirementAssessment
+                    )
+                )
+            ):
+                raise PermissionDenied(
+                    "The requirement-assessment relationship changed concurrently; retry."
+                )
+            _assert_object_action_permission(
+                user=self.request.user,
+                instance=locked_instance,
+                action="change",
+            )
+            locked_serializer = self._prepare_locked_object_serializer(
+                serializer,
+                locked_instance,
+                locked_by_model,
+                expected_relation_snapshots,
+                expected_single_relation_snapshots,
+            )
+            # A full-form round trip that repeats the persisted relation is an
+            # object edit, not an audit-scope mutation. Do not let a stale form
+            # overwrite a relationship changed by another locked writer.
+            locked_serializer.validated_data.pop("requirement_assessments", None)
+            result = super().perform_update(locked_serializer)
+            serializer.instance = locked_serializer.instance
+            return result
+
+        scope_ids = current_ids | (requested_ids or set())
+        locked_rows, respondent_scope = lock_requirement_assessment_relation_scope(
+            user=self.request.user,
+            requirement_assessment_ids=scope_ids,
+            relation_field=self.requirement_relation_scope_field,
+            object_folder_id=None,
+            allow_respondent=self.requirement_relation_allow_respondent,
+        )
+
+        locked_instance, locked_by_model = self._lock_update_object_and_targets(
+            serializer,
+            expected_relation_snapshots,
+            expected_single_relation_snapshots,
+        )
+        locked_current_ids = self._lock_current_requirement_assessment_ids(
+            locked_instance
+        )
+        if locked_current_ids != current_ids:
+            raise PermissionDenied(
+                "The requirement-assessment relationship changed concurrently; retry."
+            )
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=locked_instance,
+            action="change",
+        )
+
+        locked_serializer = self._prepare_locked_object_serializer(
+            serializer,
+            locked_instance,
+            locked_by_model,
+            expected_relation_snapshots,
+            expected_single_relation_snapshots,
+        )
+        locked_requested_ids = self._requested_requirement_assessment_ids(
+            locked_serializer
+        )
+        if locked_requested_ids != requested_ids:
+            raise PermissionDenied(
+                "One or more requirement assessments changed concurrently."
+            )
+        target_folder = locked_serializer.validated_data.get(
+            "folder", locked_instance.folder
+        )
+        if respondent_scope and any(
+            row.folder_id != getattr(target_folder, "id", None) for row in locked_rows
+        ):
+            raise PermissionDenied(
+                "Respondent-linked objects must remain in the assignment folder."
+            )
+        if target_folder is not None and target_folder.id != locked_instance.folder_id:
+            _assert_folder_action_permission(
+                user=self.request.user,
+                model=self.model,
+                folder=target_folder,
+                action="add",
+            )
+        result = super().perform_update(locked_serializer)
+        serializer.instance = locked_serializer.instance
+        return result
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        Folder._lock_folder_tree()
+        current_ids = set(instance.requirement_assessments.values_list("id", flat=True))
+        if not current_ids:
+            locked_instance = get_object_or_404(
+                self.model.objects.select_for_update(of=("self",)),
+                id=instance.id,
+            )
+            if locked_instance.folder_id is not None:
+                locked_instance.folder = get_object_or_404(
+                    Folder.objects.select_for_update(of=("self",)),
+                    id=locked_instance.folder_id,
+                )
+            if self._lock_current_requirement_assessment_ids(locked_instance):
+                raise PermissionDenied(
+                    "The requirement-assessment relationship changed concurrently; retry."
+                )
+            _assert_object_action_permission(
+                user=self.request.user,
+                instance=locked_instance,
+                action="delete",
+            )
+            return super().perform_destroy(locked_instance)
+
+        locked_rows, respondent_scope = lock_requirement_assessment_relation_scope(
+            user=self.request.user,
+            requirement_assessment_ids=current_ids,
+            relation_field=self.requirement_relation_scope_field,
+            object_folder_id=None,
+            allow_respondent=self.requirement_relation_allow_respondent,
+        )
+        locked_instance = get_object_or_404(
+            self.model.objects.select_for_update(of=("self",)),
+            id=instance.id,
+        )
+        if locked_instance.folder_id is not None:
+            locked_instance.folder = get_object_or_404(
+                Folder.objects.select_for_update(of=("self",)),
+                id=locked_instance.folder_id,
+            )
+        if (
+            self._lock_current_requirement_assessment_ids(locked_instance)
+            != current_ids
+        ):
+            raise PermissionDenied(
+                "The requirement-assessment relationship changed concurrently; retry."
+            )
+        if respondent_scope and any(
+            row.folder_id != locked_instance.folder_id for row in locked_rows
+        ):
+            raise PermissionDenied(
+                "Respondent-linked objects must remain in the assignment folder."
+            )
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=locked_instance,
+            action="delete",
+        )
+        return super().perform_destroy(locked_instance)
+
+
 class AppliedControlFilterSet(TimestampRangeFilterMixin, GenericFilterSet):
     folder = df.ModelMultipleChoiceFilter(queryset=Folder.objects.all())
     reference_control = df.ModelMultipleChoiceFilter(
@@ -5524,12 +6733,15 @@ class AppliedControlFilterSet(TimestampRangeFilterMixin, GenericFilterSet):
         }
 
 
-class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
+class AppliedControlViewSet(
+    RequirementAssessmentRelationGuardMixin, ExportMixin, BaseModelViewSet
+):
     """
     API endpoint that allows applied controls to be viewed or edited.
     """
 
     model = AppliedControl
+    requirement_relation_scope_field = "applied_controls"
     filterset_class = AppliedControlFilterSet
     filter_backends = [
         CustomFieldSearchFilter if b is filters.SearchFilter else b
@@ -5798,80 +7010,111 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
         )
         return Response(result)
 
+    @transaction.atomic
     def perform_create(self, serializer):
+        Folder._lock_folder_tree()
         create_remote_object = serializer.validated_data.pop(
             "create_remote_object", False
         )
         integration_config = serializer.validated_data.pop("integration_config", None)
         serializer.validated_data.pop("remote_object_id", None)  # Remove if present
 
-        # Create the local object first
+        candidate_folder = serializer.validated_data.get("folder")
+        final_folder_id = (
+            candidate_folder.id
+            if candidate_folder is not None
+            else Folder.get_root_folder_id()
+        )
+        integration_config, locked_mappings = _lock_integration_link_graph(
+            user=self.request.user,
+            candidate_configuration=integration_config,
+            object_folder_ids={final_folder_id},
+            final_object_folder_id=final_folder_id,
+        )
         super().perform_create(serializer)
         instance = serializer.instance
+        if instance.folder_id != final_folder_id:
+            raise PermissionDenied("The object's owner folder changed concurrently.")
 
-        if create_remote_object and integration_config:
-            try:
-                logger.info(
-                    "Creating remote object for Applied Control",
-                    applied_control_id=instance.id,
-                    integration_config_id=integration_config.id,
+        if integration_config:
+            if create_remote_object:
+                content_type = ContentType.objects.get_for_model(self.model)
+                _lock_or_create_sync_mapping(
+                    user=self.request.user,
+                    configuration=integration_config,
+                    instance=instance,
+                    content_type=content_type,
+                    remote_id="",
+                    locked_mappings=locked_mappings,
                 )
-                sync_object_to_integrations.schedule(
-                    args=(
-                        ContentType.objects.get_for_model(self.model),
-                        serializer.instance.id,
-                        [integration_config.id],
-                        ["name", "description", "status", "priority"],
-                    ),
-                    delay=1,  # Small delay to ensure transaction is committed
-                )
-
-            except Exception:
-                logger.error(
-                    "Error creating remote object for Applied Control",
-                    applied_control_id=instance.id,
-                    exc_info=True,
+                _queue_integration_sync_after_commit(
+                    content_type=content_type,
+                    object_id=instance.id,
+                    configuration_id=integration_config.id,
+                    changed_fields=["name", "description", "status", "priority"],
+                    requested_by_id=self.request.user.id,
                 )
 
+    @transaction.atomic
     def perform_update(self, serializer):
+        Folder._lock_folder_tree()
         integration_config = serializer.validated_data.pop("integration_config", None)
         remote_object_id = serializer.validated_data.pop("remote_object_id", None)
         serializer.validated_data.pop("create_remote_object", None)  # Remove if present
 
+        expected_folder_id = serializer.instance.folder_id
+        candidate_folder = serializer.validated_data.get("folder")
+        final_folder_id = (
+            candidate_folder.id if candidate_folder is not None else expected_folder_id
+        )
+        if final_folder_id != expected_folder_id:
+            _lock_and_assert_local_mapping_mutation_allowed(
+                instance=serializer.instance,
+                final_folder_id=final_folder_id,
+            )
+        integration_config, locked_mappings = _lock_integration_link_graph(
+            user=self.request.user,
+            candidate_configuration=integration_config,
+            object_folder_ids={expected_folder_id, final_folder_id},
+            final_object_folder_id=final_folder_id,
+        )
+        locked_instance = (
+            self.model.objects.select_for_update(of=("self",))
+            .select_related("folder")
+            .get(id=serializer.instance.id)
+        )
+        if locked_instance.folder_id != expected_folder_id:
+            raise PermissionDenied("The object's owner folder changed concurrently.")
+        serializer.instance = locked_instance
         super().perform_update(serializer)
-        if not integration_config or not remote_object_id:
+        if serializer.instance.folder_id != final_folder_id:
+            raise PermissionDenied("The object's owner folder changed concurrently.")
+        if not integration_config:
             return
-        try:
-            if remote_object_id:
-                logger.info(
-                    "Attaching applied control to external object",
-                    applied_control_id=serializer.instance.id,
-                    remote_id=remote_object_id,
-                )
-                # Upsert: SyncMapping is unique on (configuration, content_type,
-                # local_object_id); relinking must reuse the row instead of
-                # raising IntegrityError (swallowed below → silent relink loss).
-                sync_mapping, _ = SyncMapping.objects.update_or_create(
-                    configuration=integration_config,
-                    content_type=ContentType.objects.get_for_model(self.model),
-                    local_object_id=serializer.instance.id,
-                    defaults={
-                        "remote_id": remote_object_id,
-                        "sync_status": SyncMapping.SyncStatus.PENDING,
-                    },
-                )
-                sync_object_to_integrations.schedule(
-                    args=(
-                        sync_mapping.content_type,
-                        serializer.instance.id,
-                        [integration_config.id],
-                        ["status"],
-                    ),
-                    delay=1,  # Small delay to ensure transaction is committed
-                )
+        if not remote_object_id:
+            return
+        content_type = ContentType.objects.get_for_model(self.model)
+        sync_mapping = _lock_or_create_sync_mapping(
+            user=self.request.user,
+            configuration=integration_config,
+            instance=serializer.instance,
+            content_type=content_type,
+            remote_id=remote_object_id,
+            locked_mappings=locked_mappings,
+        )
+        _queue_integration_sync_after_commit(
+            content_type=sync_mapping.content_type,
+            object_id=serializer.instance.id,
+            configuration_id=integration_config.id,
+            changed_fields=[],
+            requested_by_id=self.request.user.id,
+        )
 
-        except Exception:
-            logger.error("Error creating SyncMapping", exc_info=True)
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        Folder._lock_folder_tree()
+        _lock_and_assert_local_mapping_mutation_allowed(instance=instance)
+        return super().perform_destroy(instance)
 
     @method_decorator(cache_page(60 * LONG_CACHE_TTL))
     @action(detail=False, name="Get linked models choices")
@@ -8277,6 +9520,7 @@ class UserViewSet(AutocompleteMixin, BaseModelViewSet):
             and user.user_groups.filter(name="BI-UG-ADM").exists()
         ):
             with transaction.atomic():
+                Folder._lock_folder_tree()
                 # Lock the admin group row so this check-then-act can't race a
                 # concurrent admin-membership change into a zero-admin lockout.
                 admin_group = (
@@ -8303,6 +9547,7 @@ class UserViewSet(AutocompleteMixin, BaseModelViewSet):
         # Protect the last direct (locally-managed) administrator — see update().
         if user.user_groups.filter(name="BI-UG-ADM").exists():
             with transaction.atomic():
+                Folder._lock_folder_tree()
                 # Lock the admin group row so this check-then-act can't race a
                 # concurrent admin removal into a zero-admin lockout.
                 UserGroup.objects.select_for_update().filter(name="BI-UG-ADM").first()
@@ -8470,6 +9715,19 @@ class UserGroupViewSet(BaseModelViewSet):
 
     MEMBER_BATCH_LIMIT = BATCH_SIZE_LIMIT
 
+    def _lock_membership_group(self, request, group: UserGroup) -> UserGroup:
+        """Lock and re-authorize the group used by an incremental write."""
+
+        Folder._lock_folder_tree()
+        locked_group = get_object_or_404(
+            UserGroup.objects.select_for_update(of=("self",)).select_related("folder"),
+            id=group.id,
+        )
+        if locked_group.folder_id != group.folder_id:
+            raise PermissionDenied("The user-group owner changed; retry.")
+        self.check_object_permissions(request, locked_group)
+        return locked_group
+
     def _member_ids(self, request) -> list[str]:
         ids = request.data.get("users")
         if isinstance(ids, str):
@@ -8484,11 +9742,17 @@ class UserGroupViewSet(BaseModelViewSet):
         return ids
 
     @action(detail=True, methods=["post"], url_path="add-members")
+    @transaction.atomic
     def add_members(self, request, pk=None):
         """Add users to this group. Only the M2M through-rows are written — no User
         attribute is touched — so membership management is granted without leaking
         change_user. Authorized on the group's folder (see permission_overrides)."""
-        group = self.get_object()
+        group = self._lock_membership_group(request, self.get_object())
+        if is_tprm_reserved_enclave_group(group):
+            return Response(
+                {"error": MANAGED_TPRM_RESPONDENT_IAM_ERROR},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         users = User.objects.filter(pk__in=self._member_ids(request))
         group.user_set.add(*users)
         logger.info(
@@ -8525,11 +9789,17 @@ class UserGroupViewSet(BaseModelViewSet):
         return True
 
     @action(detail=True, methods=["post"], url_path="remove-members")
+    @transaction.atomic
     def remove_members(self, request, pk=None):
         """Remove users from this group (batch). Same authorization as add_members.
         Protects the last direct BI-UG-ADM administrator, mirroring UserViewSet, so
         membership management can never strip the lockout-proof admin anchor."""
-        group = self.get_object()
+        group = self._lock_membership_group(request, self.get_object())
+        if is_tprm_reserved_enclave_group(group):
+            return Response(
+                {"error": MANAGED_TPRM_RESPONDENT_IAM_ERROR},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         ids = self._member_ids(request)
         users = User.objects.filter(pk__in=ids)
 
@@ -8635,6 +9905,53 @@ class FolderViewSet(BaseModelViewSet):
         """
         folder = serializer.save()
         Folder.create_default_ug_and_ra(folder)
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        """Keep TPRM-owned enclave structure off the generic folder path."""
+
+        proposed_parent = serializer.validated_data.get("parent_folder")
+        scope = lock_folder_mutation_scope(
+            folder_id=serializer.instance.id,
+            proposed_parent_id=(
+                proposed_parent.id if proposed_parent is not None else None
+            ),
+        )
+        serializer.instance = scope.folder
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=scope.folder,
+            action="change",
+        )
+
+        if proposed_parent is not None:
+            if scope.proposed_parent is None:
+                raise PermissionDenied("The destination folder is unavailable.")
+            serializer.validated_data["parent_folder"] = scope.proposed_parent
+            if scope.folder.parent_folder_id != scope.proposed_parent.id:
+                _assert_folder_action_permission(
+                    user=self.request.user,
+                    model=Folder,
+                    folder=scope.proposed_parent,
+                    action="add",
+                )
+                assert_generic_folder_structure_mutation_allowed(scope)
+
+        return super().perform_update(serializer)
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        """Reject generic deletion of an enclave or any containing subtree."""
+
+        scope = lock_folder_mutation_scope(folder_id=instance.id)
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=scope.folder,
+            action="delete",
+        )
+        assert_generic_folder_structure_mutation_allowed(scope)
+        assert_generic_folder_deletion_has_no_governed_roots(scope)
+        return super().perform_destroy(scope.folder)
 
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
@@ -9598,6 +10915,39 @@ class FrameworkViewSet(BaseModelViewSet):
     filterset_class = FrameworkFilter
     search_fields = ["name", "description"]
 
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        """Keep Framework CASCADE from bypassing owned audit deletion gates."""
+
+        Folder._lock_folder_tree()
+        expected_folder_id = instance.folder_id
+        locked_folder = get_object_or_404(
+            Folder.objects.select_for_update(of=("self",)),
+            id=expected_folder_id,
+        )
+        locked_instance = get_object_or_404(
+            Framework.objects.select_for_update(of=("self",)),
+            id=instance.id,
+        )
+        if locked_instance.folder_id != expected_folder_id:
+            raise PermissionDenied("The framework owner changed; retry.")
+        locked_instance.folder = locked_folder
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=locked_instance,
+            action="delete",
+        )
+        dependent_audits = list(
+            ComplianceAssessment.objects.select_for_update(of=("self",))
+            .filter(framework_id=locked_instance.id)
+            .order_by("id")
+        )
+        if dependent_audits:
+            raise PermissionDenied(
+                "Delete dependent compliance assessments through their owned endpoint first."
+            )
+        return super().perform_destroy(locked_instance)
+
     def get_queryset(self):
         qs = super().get_queryset().prefetch_related("requirement_nodes")
 
@@ -10135,7 +11485,40 @@ class FrameworkViewSet(BaseModelViewSet):
         return response
 
 
-class RequirementNodeViewSet(BaseModelViewSet):
+class RequirementNodeDestroyGuardMixin:
+    """Keep both RequirementNode routes on one guarded delete contract."""
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        Folder._lock_folder_tree()
+        graph = lock_questionnaire_owner_graph(
+            user=self.request.user,
+            requirement_node_ids={instance.id},
+        )
+        locked_node = graph["nodes"][instance.id]
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=locked_node,
+            action="delete",
+        )
+        locked_questions = list(
+            Question.objects.select_for_update(of=("self",))
+            .filter(requirement_node_id=locked_node.id)
+            .order_by("id")
+        )
+        list(
+            QuestionChoice.objects.select_for_update(of=("self",))
+            .filter(question_id__in=[question.id for question in locked_questions])
+            .order_by("id")
+        )
+        if RequirementAssessment.objects.filter(requirement_id=locked_node.id).exists():
+            raise PermissionDenied(
+                "A requirement used by an assessment cannot be deleted."
+            )
+        return super().perform_destroy(locked_node)
+
+
+class RequirementNodeViewSet(RequirementNodeDestroyGuardMixin, BaseModelViewSet):
     """
     API endpoint that allows requirement groups to be viewed or edited.
     """
@@ -10148,7 +11531,7 @@ class RequirementNodeViewSet(BaseModelViewSet):
         return super().list(request, *args, **kwargs)
 
 
-class RequirementViewSet(BaseModelViewSet):
+class RequirementViewSet(RequirementNodeDestroyGuardMixin, BaseModelViewSet):
     """
     API endpoint that allows requirements to be viewed or edited.
     """
@@ -10428,12 +11811,14 @@ class EvidenceFilterSet(TimestampRangeFilterMixin, GenericFilterSet):
         ]
 
 
-class EvidenceViewSet(BaseModelViewSet):
+class EvidenceViewSet(RequirementAssessmentRelationGuardMixin, BaseModelViewSet):
     """
     API endpoint that allows evidences to be viewed or edited.
     """
 
     model = Evidence
+    requirement_relation_allow_respondent = True
+    requirement_relation_scope_field = "evidences"
     filterset_class = EvidenceFilterSet
 
     def get_queryset(self):
@@ -11369,6 +12754,314 @@ def _serialize_suggestion_preview(entries: list[dict]) -> list[dict]:
     return payload
 
 
+def _assert_assessment_mutation_state(compliance_assessment) -> None:
+    """Reject custom writes that bypass the model serializer's state gate."""
+
+    if compliance_assessment.is_locked:
+        raise PermissionDenied("Cannot mutate this audit: audit is locked.")
+    if compliance_assessment.status == ComplianceAssessment.Status.IN_REVIEW:
+        raise PermissionDenied("Cannot mutate this audit: audit is in review.")
+
+
+def _assert_folder_action_permission(*, user, model, folder, action: str) -> None:
+    """Reprove the exact model/action permission after mutation locks wait."""
+
+    try:
+        permission = Permission.objects.get(
+            content_type__app_label=model._meta.app_label,
+            content_type__model=model._meta.model_name,
+            codename=f"{action}_{model._meta.model_name}",
+        )
+    except Permission.DoesNotExist as exc:
+        raise PermissionDenied(
+            "You do not have permission to perform this action."
+        ) from exc
+    if folder is None or not RoleAssignment.is_access_allowed(
+        user=user,
+        perm=permission,
+        folder=folder,
+    ):
+        raise PermissionDenied("You do not have permission to perform this action.")
+
+
+def _assert_object_action_permission(*, user, instance, action: str) -> None:
+    _assert_folder_action_permission(
+        user=user,
+        model=type(instance),
+        folder=Folder.get_folder(instance),
+        action=action,
+    )
+
+
+def _lock_compliance_assessment_for_mutation(compliance_assessment_id):
+    """Lock and recheck the authority-bearing audit state for one write."""
+
+    compliance_assessment = get_object_or_404(
+        ComplianceAssessment.objects.select_for_update(of=("self",)),
+        id=compliance_assessment_id,
+    )
+    _assert_assessment_mutation_state(compliance_assessment)
+    return compliance_assessment
+
+
+def _lock_requirement_assessment_for_mutation(requirement_assessment):
+    """Lock CA then RA so all generic writes share the assignment lock order."""
+
+    compliance_assessment = _lock_compliance_assessment_for_mutation(
+        requirement_assessment.compliance_assessment_id
+    )
+    locked_requirement_assessment = get_object_or_404(
+        RequirementAssessment.objects.select_for_update(of=("self",)),
+        id=requirement_assessment.id,
+        compliance_assessment_id=compliance_assessment.id,
+    )
+    locked_requirement_assessment.compliance_assessment = compliance_assessment
+    return locked_requirement_assessment
+
+
+def _lock_requirement_assessment_questionnaire_for_mutation(requirement_assessment):
+    """Lock and validate the full questionnaire graph owned by one RA."""
+
+    locked_requirement_assessment = _lock_requirement_assessment_for_mutation(
+        requirement_assessment
+    )
+    compliance_assessment = locked_requirement_assessment.compliance_assessment
+    if locked_requirement_assessment.folder_id != compliance_assessment.folder_id:
+        raise PermissionDenied(
+            "The requirement assessment has an inconsistent audit folder."
+        )
+    locked_node = get_object_or_404(
+        RequirementNode.objects.select_for_update(of=("self",)),
+        id=locked_requirement_assessment.requirement_id,
+        framework_id=compliance_assessment.framework_id,
+    )
+    locked_questions = list(
+        Question.objects.select_for_update(of=("self",))
+        .filter(requirement_node_id=locked_node.id)
+        .order_by("id")
+    )
+    question_ids = {question.id for question in locked_questions}
+    locked_choices = list(
+        QuestionChoice.objects.select_for_update(of=("self",))
+        .filter(question_id__in=question_ids)
+        .order_by("id")
+    )
+    choice_questions = {choice.id: choice.question_id for choice in locked_choices}
+    locked_answers = list(
+        Answer.objects.select_for_update(of=("self",))
+        .filter(requirement_assessment_id=locked_requirement_assessment.id)
+        .order_by("id")
+    )
+    answer_questions = {answer.id: answer.question_id for answer in locked_answers}
+    if any(
+        answer.question_id not in question_ids
+        or answer.folder_id != locked_requirement_assessment.folder_id
+        for answer in locked_answers
+    ):
+        raise PermissionDenied("The requirement questionnaire is inconsistent.")
+
+    selected_choice_links = list(
+        Answer.selected_choices.through.objects.select_for_update()
+        .filter(answer_id__in=answer_questions)
+        .order_by("pk")
+        .values_list("answer_id", "questionchoice_id")
+    )
+    if any(
+        choice_questions.get(choice_id) != answer_questions.get(answer_id)
+        for answer_id, choice_id in selected_choice_links
+    ):
+        raise PermissionDenied("The requirement questionnaire is inconsistent.")
+    return locked_requirement_assessment
+
+
+def _lock_m2m_links(instance, field_name, *, target_ids=None):
+    """Lock relationship rows without DISTINCT or nullable outer joins."""
+
+    field = instance._meta.get_field(field_name)
+    source_name = field.m2m_field_name()
+    target_name = field.m2m_reverse_field_name()
+    filters = {f"{source_name}_id": instance.id}
+    if target_ids is not None:
+        filters[f"{target_name}_id__in"] = target_ids
+    return (
+        field.remote_field.through.objects.select_for_update()
+        .filter(**filters)
+        .order_by("pk")
+    )
+
+
+def _lock_rows_in_global_model_order(target_ids_by_model):
+    """Lock heterogeneous targets by concrete ``(model label, UUID)`` order."""
+
+    return lock_rows_in_global_model_order(target_ids_by_model)
+
+
+def _preserve_requirement_assessment_m2m_links(
+    *,
+    user,
+    instance,
+    payload,
+    respondent_scope,
+):
+    """Preserve hidden links and lock/revalidate every requested RA relation."""
+
+    relation_models = (
+        ("evidences", Evidence),
+        ("applied_controls", AppliedControl),
+        ("security_exceptions", SecurityException),
+    )
+    relation_specs = []
+    target_ids_by_model = defaultdict(set)
+    for field_name, model in relation_models:
+        if field_name not in payload or not isinstance(payload[field_name], list):
+            continue
+        requested_ids = []
+        for raw_id in payload[field_name]:
+            try:
+                object_id = UUID(str(raw_id))
+            except (TypeError, ValueError) as exc:
+                raise DRFValidationError(
+                    {field_name: "One or more relationship IDs are invalid."}
+                ) from exc
+            if object_id not in requested_ids:
+                requested_ids.append(object_id)
+
+        field = instance._meta.get_field(field_name)
+        source_name = field.m2m_field_name()
+        target_name = field.m2m_reverse_field_name()
+        through = field.remote_field.through
+        through_filter = {f"{source_name}_id": instance.id}
+        current_ids = set(
+            through.objects.filter(**through_filter).values_list(
+                f"{target_name}_id", flat=True
+            )
+        )
+        target_ids = current_ids | set(requested_ids)
+        target_ids_by_model[model].update(target_ids)
+        relation_specs.append(
+            (
+                field_name,
+                model,
+                requested_ids,
+                current_ids,
+                target_name,
+            )
+        )
+
+    locked_by_model = _lock_rows_in_global_model_order(target_ids_by_model)
+    for (
+        field_name,
+        model,
+        requested_ids,
+        expected_current_ids,
+        target_name,
+    ) in relation_specs:
+        locked_targets = locked_by_model.get(model, {})
+        target_ids = expected_current_ids | set(requested_ids)
+        if target_ids - set(locked_targets):
+            raise PermissionDenied(
+                f"One or more {field_name} are unavailable for this caller."
+            )
+        locked_target_folders = {
+            target_id: getattr(target, "folder_id", None)
+            for target_id, target in locked_targets.items()
+        }
+
+        current_ids = set(
+            _lock_m2m_links(instance, field_name).values_list(
+                f"{target_name}_id", flat=True
+            )
+        )
+        if current_ids != expected_current_ids:
+            raise PermissionDenied(
+                f"The {field_name} relationship changed concurrently; retry."
+            )
+
+        visible_ids = set(RoleAssignment.get_viewable_object_ids(user, model))
+        requested_id_set = set(requested_ids)
+        visible_existing = current_ids & visible_ids
+        requested_new = requested_id_set - current_ids
+        requested_linkable = (requested_id_set & visible_existing) | (
+            requested_new & visible_ids
+        )
+        editable_existing = current_ids & visible_ids
+        if respondent_scope:
+            requested_linkable = (requested_id_set & visible_existing) | {
+                object_id
+                for object_id in requested_new & visible_ids
+                if locked_target_folders[object_id] == instance.folder_id
+            }
+            editable_existing = {
+                object_id
+                for object_id in editable_existing
+                if locked_target_folders[object_id] == instance.folder_id
+            }
+        if requested_id_set - requested_linkable:
+            raise PermissionDenied(
+                f"One or more {field_name} are unavailable for this caller."
+            )
+
+        protected_existing_ids = current_ids - editable_existing
+        payload[field_name] = [
+            *requested_ids,
+            *sorted(protected_existing_ids - requested_id_set, key=str),
+        ]
+
+
+def _lock_answer_questionnaire_for_mutation(
+    requirement_assessment,
+    *,
+    question_id,
+    answer=None,
+):
+    """Lock CA, RA, node, question, choices, then the optional Answer."""
+
+    locked_requirement_assessment = _lock_requirement_assessment_for_mutation(
+        requirement_assessment
+    )
+    compliance_assessment = locked_requirement_assessment.compliance_assessment
+    if locked_requirement_assessment.folder_id != compliance_assessment.folder_id:
+        raise PermissionDenied(
+            "The requirement assessment has an inconsistent audit folder."
+        )
+    locked_requirement_node = get_object_or_404(
+        RequirementNode.objects.select_for_update(of=("self",)),
+        id=locked_requirement_assessment.requirement_id,
+        framework_id=compliance_assessment.framework_id,
+    )
+    locked_question = get_object_or_404(
+        Question.objects.select_for_update(of=("self",)),
+        id=question_id,
+        requirement_node_id=locked_requirement_node.id,
+    )
+    locked_choices = list(
+        QuestionChoice.objects.select_for_update(of=("self",))
+        .filter(question_id=locked_question.id)
+        .order_by("id")
+    )
+    if answer is None:
+        return locked_requirement_assessment, locked_question, None
+    locked_answer = get_object_or_404(
+        Answer.objects.select_for_update(of=("self",)),
+        id=answer.id,
+        requirement_assessment_id=locked_requirement_assessment.id,
+        question_id=locked_question.id,
+        folder_id=locked_requirement_assessment.folder_id,
+    )
+    locked_answer.requirement_assessment = locked_requirement_assessment
+    locked_answer.question = locked_question
+    locked_choice_ids = {choice.id for choice in locked_choices}
+    selected_choice_ids = set(
+        Answer.selected_choices.through.objects.select_for_update()
+        .filter(answer_id=locked_answer.id)
+        .order_by("pk")
+        .values_list("questionchoice_id", flat=True)
+    )
+    if not selected_choice_ids.issubset(locked_choice_ids):
+        raise PermissionDenied("The answer contains an inconsistent selected choice.")
+    return locked_requirement_assessment, locked_question, locked_answer
+
+
 def _preview_suggestions_for_compliance_assessment(
     compliance_assessment,
     *,
@@ -11470,6 +13163,669 @@ def _preview_suggestions_for_compliance_assessment(
     return list(best.values())
 
 
+_SAME_FRAMEWORK_BASELINE_COPY_FIELDS = (
+    "result",
+    "status",
+    "score",
+    "is_scored",
+    "is_score_overridden",
+    "documentation_score",
+    "observation",
+    "answers",
+    "applied_controls",
+    "evidences",
+)
+
+_BASELINE_RA_PROJECTION_FIELDS = (
+    "id",
+    "requirement_id",
+    "folder_id",
+    "result",
+    "status",
+    "score",
+    "documentation_score",
+    "is_scored",
+    "is_score_overridden",
+    "observation",
+)
+
+_BASELINE_ANSWER_PROJECTION_FIELDS = (
+    "id",
+    "requirement_assessment_id",
+    "question_id",
+    "folder_id",
+    "value",
+)
+
+
+def _baseline_relation_rows(owner_ids, model, field_name, *, lock=False):
+    """Return one deterministic snapshot of an auto-through relationship."""
+
+    field = model._meta.get_field(field_name)
+    source_id_field = f"{field.m2m_field_name()}_id"
+    target_id_field = f"{field.m2m_reverse_field_name()}_id"
+    queryset = field.remote_field.through.objects.filter(
+        **{f"{source_id_field}__in": owner_ids}
+    ).order_by("pk")
+    if lock:
+        queryset = queryset.select_for_update(of=("self",))
+    return list(queryset.values_list("pk", source_id_field, target_id_field))
+
+
+def _canonical_baseline_snapshot_digest(payload) -> str:
+    """Bind clone provenance to one deterministic, content-complete graph."""
+
+    try:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            cls=DjangoJSONEncoder,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise PermissionDenied("The baseline snapshot is not canonical.") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_baseline_snapshot_for_target(
+    target: ComplianceAssessment,
+    snapshot: ComplianceAssessmentBaselineSnapshot,
+) -> None:
+    """Validate copied scalars against the target's exact scoring contract."""
+
+    if (
+        any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in (target.min_score, target.max_score)
+        )
+        or target.min_score >= target.max_score
+    ):
+        raise DRFValidationError("The target scoring contract is invalid.")
+
+    requirements = {row.id: row for row in snapshot.requirements}
+    question_requirement_ids = {
+        question.requirement_node_id for question in snapshot.questions
+    }
+    valid_results = set(RequirementAssessment.Result.values)
+    valid_statuses = set(RequirementAssessment.Status.values)
+
+    for row in snapshot.requirement_assessments:
+        requirement = requirements.get(row.requirement_id)
+        if requirement is None:
+            raise DRFValidationError("The baseline assessment tree is inconsistent.")
+        if row.result not in valid_results or row.status not in valid_statuses:
+            raise DRFValidationError(
+                "The baseline contains an invalid requirement state."
+            )
+
+        minimum = (
+            requirement.min_score
+            if requirement.min_score is not None
+            else target.min_score
+        )
+        maximum = (
+            requirement.max_score
+            if requirement.max_score is not None
+            else target.max_score
+        )
+        if minimum is None or maximum is None or minimum >= maximum:
+            raise DRFValidationError("The target scoring contract is invalid.")
+
+        if requirement.scores_definition_ref:
+            score_contract = (
+                target.scores_definition
+                if isinstance(target.scores_definition, dict)
+                else {}
+            )
+            alternatives = score_contract.get("alternatives") or {}
+            if not isinstance(alternatives, dict):
+                raise DRFValidationError("The target scoring contract is invalid.")
+            alternative = alternatives.get(requirement.scores_definition_ref)
+            if not isinstance(alternative, list):
+                raise DRFValidationError(
+                    "The target scoring contract is missing a requirement scale."
+                )
+            covered_scores = {
+                entry.get("score")
+                for entry in alternative
+                if isinstance(entry, dict)
+                and isinstance(entry.get("score"), int)
+                and not isinstance(entry.get("score"), bool)
+            }
+            in_range_scores = {
+                score for score in covered_scores if minimum <= score <= maximum
+            }
+            if len(in_range_scores) != maximum - minimum + 1:
+                raise DRFValidationError(
+                    "The target requirement score scale is incomplete."
+                )
+
+        for field_name, value in (
+            ("score", row.score),
+            ("documentation_score", row.documentation_score),
+        ):
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise DRFValidationError(
+                    f"The baseline {field_name} is not a valid integer."
+                )
+            if not minimum <= value <= maximum:
+                raise DRFValidationError(
+                    f"The baseline {field_name} is outside the target score range."
+                )
+
+        if (
+            row.requirement_id in question_requirement_ids
+            and row.is_score_overridden
+            and row.is_scored != (row.score is not None)
+        ):
+            raise DRFValidationError(
+                "The baseline questionnaire score override is inconsistent."
+            )
+
+
+def _assert_baseline_questionnaire_scalars(
+    target: ComplianceAssessment,
+    snapshot: ComplianceAssessmentBaselineSnapshot,
+) -> None:
+    """Recompute question-owned fields and reject a stale source projection."""
+
+    expected = {row.requirement_id: row for row in snapshot.requirement_assessments}
+    question_requirement_ids = {
+        question.requirement_node_id for question in snapshot.questions
+    }
+    assessments = (
+        RequirementAssessment.objects.filter(
+            compliance_assessment=target,
+            requirement_id__in=question_requirement_ids,
+        )
+        .select_related("requirement", "compliance_assessment")
+        .prefetch_related(
+            "requirement__questions__choices",
+            "answers__question",
+            "answers__selected_choices",
+        )
+        .order_by("id")
+    )
+    if {row.requirement_id for row in assessments} != question_requirement_ids:
+        raise DRFValidationError("The cloned questionnaire tree is incomplete.")
+
+    for assessment in assessments:
+        source = expected[assessment.requirement_id]
+        assessment.recompute_assessment()
+        if assessment.result != source.result:
+            raise DRFValidationError(
+                "The baseline questionnaire result is stale or inconsistent."
+            )
+        if not source.is_score_overridden and (
+            assessment.score != source.score or assessment.is_scored != source.is_scored
+        ):
+            raise DRFValidationError(
+                "The baseline questionnaire score is stale or inconsistent."
+            )
+
+
+def _lock_baseline_copy_graph(*, baseline_id, target_framework):
+    """Lock and freeze every row consumed by a same-framework baseline copy.
+
+    The caller owns IAM and field-policy decisions. This helper owns only the
+    transaction-scoped persistence proof: parent rows, questionnaire owners,
+    copied children, related targets and each through row are stable before a
+    target audit is inserted.
+    """
+
+    if not transaction.get_connection().in_atomic_block:
+        raise RuntimeError("Baseline copying requires an atomic transaction.")
+
+    # Every create path takes Framework before ComplianceAssessment.  Re-lock
+    # the already resolved row here so this helper cannot introduce the inverse
+    # CA -> Framework order when reused independently.
+    locked_target_framework = get_object_or_404(
+        Framework.objects.select_for_update(of=("self",)),
+        id=target_framework.id,
+    )
+    if locked_target_framework.id != target_framework.id:
+        raise PermissionDenied("The target framework is unavailable.")
+    target_framework = locked_target_framework
+
+    locked_baselines = list(
+        ComplianceAssessment.objects.select_for_update(of=("self",))
+        .select_related("framework", "folder")
+        .filter(id=baseline_id)
+        .order_by("id")
+    )
+    if len(locked_baselines) != 1:
+        raise PermissionDenied("The baseline audit is unavailable.")
+    baseline = locked_baselines[0]
+    if baseline.framework_id != target_framework.id:
+        return baseline, None
+    baseline.framework = target_framework
+
+    ra_projection = list(
+        RequirementAssessment.objects.filter(compliance_assessment_id=baseline.id)
+        .order_by("id")
+        .values(*_BASELINE_RA_PROJECTION_FIELDS)
+    )
+    ra_ids = {row["id"] for row in ra_projection}
+    requirement_ids = {row["requirement_id"] for row in ra_projection}
+
+    node_projection = list(
+        RequirementNode.objects.filter(framework_id=target_framework.id)
+        .order_by("id")
+        .values("id", "framework_id", "folder_id")
+    )
+    all_requirement_ids = {row["id"] for row in node_projection}
+    if (
+        len(ra_projection) != len(requirement_ids)
+        or requirement_ids != all_requirement_ids
+    ):
+        raise PermissionDenied("The baseline assessment tree is inconsistent.")
+
+    question_projection = list(
+        Question.objects.filter(requirement_node_id__in=all_requirement_ids)
+        .order_by("id")
+        .values("id", "requirement_node_id", "folder_id")
+    )
+    question_ids = {row["id"] for row in question_projection}
+    choice_projection = list(
+        QuestionChoice.objects.filter(question_id__in=question_ids)
+        .order_by("id")
+        .values("id", "question_id", "folder_id")
+    )
+    choice_ids = {row["id"] for row in choice_projection}
+
+    answer_projection = list(
+        Answer.objects.filter(requirement_assessment_id__in=ra_ids)
+        .order_by("id")
+        .values(*_BASELINE_ANSWER_PROJECTION_FIELDS)
+    )
+    answer_ids = {row["id"] for row in answer_projection}
+    question_owner = {
+        row["id"]: row["requirement_node_id"] for row in question_projection
+    }
+    ra_requirement_by_id = {row["id"]: row["requirement_id"] for row in ra_projection}
+    expected_answer_pairs = {
+        (ra_id, question_id)
+        for ra_id, requirement_id in ra_requirement_by_id.items()
+        for question_id, question_requirement_id in question_owner.items()
+        if question_requirement_id == requirement_id
+    }
+    actual_answer_pairs = {
+        (row["requirement_assessment_id"], row["question_id"])
+        for row in answer_projection
+    }
+    if (
+        len(answer_projection) != len(actual_answer_pairs)
+        or actual_answer_pairs != expected_answer_pairs
+    ):
+        raise PermissionDenied("The baseline questionnaire is incomplete.")
+
+    relation_specs = (
+        (Answer, "selected_choices", answer_ids),
+        (RequirementAssessment, "applied_controls", ra_ids),
+        (RequirementAssessment, "evidences", ra_ids),
+    )
+    relation_snapshots = {
+        (model, field_name): _baseline_relation_rows(owner_ids, model, field_name)
+        for model, field_name, owner_ids in relation_specs
+    }
+
+    locked_ras = list(
+        RequirementAssessment.objects.select_for_update(of=("self",))
+        .filter(id__in=ra_ids, compliance_assessment_id=baseline.id)
+        .order_by("id")
+    )
+    if [
+        {field: getattr(row, field) for field in _BASELINE_RA_PROJECTION_FIELDS}
+        for row in locked_ras
+    ] != ra_projection:
+        raise PermissionDenied("The baseline assessment tree changed; retry.")
+
+    questionnaire = lock_questionnaire_owner_graph(
+        requirement_node_ids=all_requirement_ids,
+        question_ids=question_ids,
+        choice_ids=choice_ids,
+    )
+
+    locked_answers = list(
+        Answer.objects.select_for_update(of=("self",))
+        .filter(id__in=answer_ids, requirement_assessment_id__in=ra_ids)
+        .order_by("id")
+    )
+    if [
+        {field: getattr(row, field) for field in _BASELINE_ANSWER_PROJECTION_FIELDS}
+        for row in locked_answers
+    ] != answer_projection:
+        raise PermissionDenied("The baseline questionnaire changed; retry.")
+
+    selected_choice_rows = relation_snapshots[(Answer, "selected_choices")]
+    control_rows = relation_snapshots[(RequirementAssessment, "applied_controls")]
+    evidence_rows = relation_snapshots[(RequirementAssessment, "evidences")]
+    selected_choice_ids = {row[2] for row in selected_choice_rows}
+    if selected_choice_ids - choice_ids:
+        raise PermissionDenied("The baseline questionnaire is inconsistent.")
+
+    locked_targets = lock_rows_in_global_model_order(
+        {
+            AppliedControl: {row[2] for row in control_rows},
+            Evidence: {row[2] for row in evidence_rows},
+        }
+    )
+
+    # Lock through tables in one stable model-label order, then compare exact
+    # carrier rows (including PKs) with the pre-lock relationship snapshot.
+    locked_relation_rows = {}
+    for model, field_name, owner_ids in sorted(
+        relation_specs,
+        key=lambda item: (
+            item[0]._meta.get_field(item[1]).remote_field.through._meta.label_lower
+        ),
+    ):
+        locked_relation_rows[(model, field_name)] = _baseline_relation_rows(
+            owner_ids,
+            model,
+            field_name,
+            lock=True,
+        )
+    if locked_relation_rows != relation_snapshots:
+        raise PermissionDenied("A baseline relationship changed; retry.")
+
+    # Recheck membership and ownership after every carrier lock. Proper write
+    # paths also take the locked baseline parent; this catches legacy writers
+    # and same-transaction races before the target audit is created.
+    if (
+        list(
+            RequirementAssessment.objects.filter(compliance_assessment_id=baseline.id)
+            .order_by("id")
+            .values(*_BASELINE_RA_PROJECTION_FIELDS)
+        )
+        != ra_projection
+        or list(
+            Answer.objects.filter(requirement_assessment_id__in=ra_ids)
+            .order_by("id")
+            .values(*_BASELINE_ANSWER_PROJECTION_FIELDS)
+        )
+        != answer_projection
+        or list(
+            RequirementNode.objects.filter(framework_id=target_framework.id)
+            .order_by("id")
+            .values("id", "framework_id", "folder_id")
+        )
+        != node_projection
+        or list(
+            Question.objects.filter(requirement_node_id__in=all_requirement_ids)
+            .order_by("id")
+            .values("id", "requirement_node_id", "folder_id")
+        )
+        != question_projection
+        or list(
+            QuestionChoice.objects.filter(question_id__in=question_ids)
+            .order_by("id")
+            .values("id", "question_id", "folder_id")
+        )
+        != choice_projection
+    ):
+        raise PermissionDenied("The baseline questionnaire changed; retry.")
+
+    locked_ra_by_id = {row.id: row for row in locked_ras}
+    locked_answer_by_id = {row.id: row for row in locked_answers}
+    choice_owner = {row["id"]: row["question_id"] for row in choice_projection}
+    for row in locked_ras:
+        if row.folder_id != baseline.folder_id:
+            raise PermissionDenied("The baseline assessment tree is inconsistent.")
+    for row in locked_answers:
+        owner = locked_ra_by_id[row.requirement_assessment_id]
+        if (
+            row.folder_id != baseline.folder_id
+            or question_owner.get(row.question_id) != owner.requirement_id
+        ):
+            raise PermissionDenied("The baseline questionnaire is inconsistent.")
+    for _pk, answer_id, choice_id in selected_choice_rows:
+        if choice_owner.get(choice_id) != locked_answer_by_id[answer_id].question_id:
+            raise PermissionDenied("The baseline questionnaire is inconsistent.")
+
+    evidence_ids_by_ra = defaultdict(list)
+    for _pk, ra_id, evidence_id in evidence_rows:
+        evidence_ids_by_ra[ra_id].append(evidence_id)
+    control_ids_by_ra = defaultdict(list)
+    for _pk, ra_id, control_id in control_rows:
+        control_ids_by_ra[ra_id].append(control_id)
+    choice_ids_by_answer = defaultdict(list)
+    for _pk, answer_id, choice_id in selected_choice_rows:
+        choice_ids_by_answer[answer_id].append(choice_id)
+
+    # Validate dependencies and every stored answer against the exact locked
+    # Question/QuestionChoice contract.  The normalizer is shared with public
+    # answer writes, so baseline bulk creation cannot bypass type, choice-owner,
+    # duplicate-choice, finite-number, or date checks.
+    choices_by_question = defaultdict(list)
+    for choice in questionnaire["choices"].values():
+        choices_by_question[choice.question_id].append(choice)
+    questions_by_requirement = defaultdict(list)
+    for question in questionnaire["questions"].values():
+        question._prefetched_objects_cache = {
+            **(getattr(question, "_prefetched_objects_cache", None) or {}),
+            "choices": sorted(
+                choices_by_question[question.id], key=lambda item: str(item.id)
+            ),
+        }
+        questions_by_requirement[question.requirement_node_id].append(question)
+    for questions in questions_by_requirement.values():
+        questions_by_urn = {question.urn: question for question in questions}
+        if len(questions_by_urn) != len(questions) or any(
+            not is_question_dependency_valid_strict(question, questions_by_urn)
+            for question in questions
+        ):
+            raise PermissionDenied("The baseline questionnaire contract is invalid.")
+
+    normalized_answers = {}
+    for answer in locked_answers:
+        question = questionnaire["questions"][answer.question_id]
+        selected_ids = tuple(sorted(choice_ids_by_answer.get(answer.id, ()), key=str))
+        selected_choices = [
+            questionnaire["choices"][choice_id] for choice_id in selected_ids
+        ]
+        try:
+            if question.type == Question.Type.UNIQUE_CHOICE:
+                if answer.value not in (None, "", [], {}):
+                    raise QuestionnaireAnswerError(
+                        "Choice answers cannot also carry a scalar value."
+                    )
+                raw_value = (
+                    selected_choices[0].urn
+                    if len(selected_choices) == 1
+                    else (
+                        None
+                        if not selected_choices
+                        else [choice.urn for choice in selected_choices]
+                    )
+                )
+            elif question.type == Question.Type.MULTIPLE_CHOICE:
+                if answer.value not in (None, "", [], {}):
+                    raise QuestionnaireAnswerError(
+                        "Choice answers cannot also carry a scalar value."
+                    )
+                raw_value = [choice.urn for choice in selected_choices]
+            else:
+                if selected_choices:
+                    raise QuestionnaireAnswerError(
+                        "Scalar answers cannot carry selected choices."
+                    )
+                raw_value = answer.value
+            normalized = normalize_question_answer(
+                question,
+                raw_value,
+                allowed_choice_ids={
+                    choice.id for choice in choices_by_question[question.id]
+                },
+            )
+            if tuple(choice.id for choice in normalized.choices) != selected_ids:
+                raise QuestionnaireAnswerError(
+                    "The selected choices cannot be normalized exactly."
+                )
+        except QuestionnaireAnswerError as exc:
+            raise PermissionDenied(
+                "The baseline contains an invalid questionnaire answer."
+            ) from exc
+        normalized_answers[answer.id] = (
+            deepcopy(normalized.value),
+            tuple(choice.id for choice in normalized.choices),
+        )
+
+    snapshot_payload = {
+        "schema_version": 1,
+        "baseline": {
+            "id": baseline.id,
+            "framework_id": baseline.framework_id,
+            "folder_id": baseline.folder_id,
+            "min_score": baseline.min_score,
+            "max_score": baseline.max_score,
+            "scores_definition": baseline.scores_definition,
+            "score_calculation_method": baseline.score_calculation_method,
+            "field_visibility": baseline.field_visibility,
+            "selected_implementation_groups": baseline.selected_implementation_groups,
+        },
+        "target_framework": {
+            "id": target_framework.id,
+            "min_score": target_framework.min_score,
+            "max_score": target_framework.max_score,
+            "scores_definition": target_framework.scores_definition,
+            "implementation_groups_definition": (
+                target_framework.implementation_groups_definition
+            ),
+            "outcomes_definition": target_framework.outcomes_definition,
+            "field_visibility": target_framework.field_visibility,
+        },
+        "requirements": [
+            {
+                "id": row.id,
+                "urn": row.urn,
+                "ref_id": row.ref_id,
+                "folder_id": row.folder_id,
+                "parent_urn": row.parent_urn,
+                "order_id": row.order_id,
+                "assessable": row.assessable,
+                "weight": row.weight,
+                "min_score": row.min_score,
+                "max_score": row.max_score,
+                "scores_definition_ref": row.scores_definition_ref,
+                "implementation_groups": row.implementation_groups,
+                "visibility_expression": row.visibility_expression,
+            }
+            for row in sorted(
+                questionnaire["nodes"].values(), key=lambda item: str(item.id)
+            )
+        ],
+        "questions": [
+            {
+                "id": row.id,
+                "requirement_id": row.requirement_node_id,
+                "folder_id": row.folder_id,
+                "urn": row.urn,
+                "type": row.type,
+                "config": row.config,
+                "depends_on": row.depends_on,
+                "weight": row.weight,
+                "order": row.order,
+            }
+            for row in sorted(
+                questionnaire["questions"].values(), key=lambda item: str(item.id)
+            )
+        ],
+        "choices": [
+            {
+                "id": row.id,
+                "question_id": row.question_id,
+                "folder_id": row.folder_id,
+                "urn": row.urn,
+                "add_score": row.add_score,
+                "compute_result": row.compute_result,
+                "select_implementation_groups": row.select_implementation_groups,
+                "order": row.order,
+            }
+            for row in sorted(
+                questionnaire["choices"].values(), key=lambda item: str(item.id)
+            )
+        ],
+        "requirement_assessments": [
+            {
+                "requirement_id": row.requirement_id,
+                "result": row.result,
+                "status": row.status,
+                "score": row.score,
+                "documentation_score": row.documentation_score,
+                "is_scored": row.is_scored,
+                "is_score_overridden": row.is_score_overridden,
+                "observation": row.observation,
+                "evidence_ids": sorted(
+                    str(value) for value in evidence_ids_by_ra[row.id]
+                ),
+                "applied_control_ids": sorted(
+                    str(value) for value in control_ids_by_ra[row.id]
+                ),
+            }
+            for row in sorted(locked_ras, key=lambda item: str(item.requirement_id))
+        ],
+        "answers": [
+            {
+                "requirement_id": locked_ra_by_id[
+                    row.requirement_assessment_id
+                ].requirement_id,
+                "question_id": row.question_id,
+                "value": normalized_answers[row.id][0],
+                "selected_choice_ids": sorted(
+                    str(value) for value in normalized_answers[row.id][1]
+                ),
+            }
+            for row in sorted(locked_answers, key=lambda item: str(item.question_id))
+        ],
+    }
+    baseline_snapshot = ComplianceAssessmentBaselineSnapshot(
+        baseline_id=baseline.id,
+        framework_id=target_framework.id,
+        requirements=tuple(
+            questionnaire["nodes"][row["id"]] for row in node_projection
+        ),
+        questions=tuple(
+            questionnaire["questions"][row["id"]] for row in question_projection
+        ),
+        requirement_assessments=tuple(
+            BaselineRequirementAssessmentRow(
+                requirement_id=row.requirement_id,
+                result=row.result,
+                status=row.status,
+                score=row.score,
+                documentation_score=row.documentation_score,
+                is_scored=row.is_scored,
+                is_score_overridden=row.is_score_overridden,
+                observation=row.observation,
+                evidence_ids=tuple(evidence_ids_by_ra[row.id]),
+                applied_control_ids=tuple(control_ids_by_ra[row.id]),
+            )
+            for row in locked_ras
+        ),
+        answers=tuple(
+            BaselineAnswerRow(
+                requirement_id=locked_ra_by_id[
+                    row.requirement_assessment_id
+                ].requirement_id,
+                question_id=row.question_id,
+                value=normalized_answers[row.id][0],
+                selected_choice_ids=normalized_answers[row.id][1],
+            )
+            for row in locked_answers
+        ),
+        snapshot_sha256=_canonical_baseline_snapshot_digest(snapshot_payload),
+    )
+    if set(locked_targets[AppliedControl]) != {row[2] for row in control_rows} or set(
+        locked_targets[Evidence]
+    ) != {row[2] for row in evidence_rows}:
+        raise PermissionDenied("One or more baseline relations are unavailable.")
+    return baseline, baseline_snapshot
+
+
 class ComplianceAssessmentViewSet(BaseModelViewSet):
     """
     API endpoint that allows compliance assessments to be viewed or edited.
@@ -11540,6 +13896,41 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
         required = self.permission_overrides.get(getattr(self, "action", None))
         if required == "core.view_compliance_assessment_full":
             self._assert_complete_assessment_read_access(request.user, obj)
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        """Delete only after re-locking and re-proving the complete audit."""
+
+        Folder._lock_folder_tree()
+        locked_instance = get_object_or_404(
+            ComplianceAssessment.objects.select_for_update(of=("self",)).select_related(
+                "folder", "framework", "perimeter"
+            ),
+            id=instance.id,
+        )
+        locked_folder = get_object_or_404(
+            Folder.objects.select_for_update(of=("self",)),
+            id=locked_instance.folder_id,
+        )
+        locked_instance.folder = locked_folder
+        _assert_assessment_mutation_state(locked_instance)
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=locked_instance,
+            action="delete",
+        )
+        if not has_full_view_compliance_assessment(
+            self.request.user,
+            locked_instance,
+        ):
+            raise PermissionDenied(
+                "Complete audit data is unavailable for this caller."
+            )
+        lock_compliance_assessment_deletion_graph(
+            user=self.request.user,
+            audit=locked_instance,
+        )
+        return super().perform_destroy(locked_instance)
 
     @staticmethod
     def _assert_complete_assessment_read_access(user, compliance_assessment) -> None:
@@ -12295,6 +14686,16 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
         ):
             raise PermissionDenied(
                 "Complete audit data is unavailable for this caller."
+            )
+
+    @staticmethod
+    def _assert_auditor_fields_editable(compliance_assessment, *field_names) -> None:
+        if not all(
+            is_field_editable_by(compliance_assessment, field_name, "auditor")
+            for field_name in field_names
+        ):
+            raise PermissionDenied(
+                "One or more baseline target fields are not editable."
             )
 
     @staticmethod
@@ -14224,8 +16625,13 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
         )
 
     @action(detail=True, methods=["post"])
+    @transaction.atomic
     def update_requirement(self, request, pk):
-        compliance_assessment = self.get_object()
+        Folder._lock_folder_tree()
+        initial_compliance_assessment = self.get_object()
+        compliance_assessment = _lock_compliance_assessment_for_mutation(
+            initial_compliance_assessment.id
+        )
         if not has_full_view_compliance_assessment(request.user, compliance_assessment):
             raise PermissionDenied(
                 "Complete audit data is unavailable for this caller."
@@ -14287,7 +16693,7 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
 
             # Find the requirement assessment first so we can validate score
             # against the per-RA resolved scale (Node override > CA bounds).
-            requirement_assessment = RequirementAssessment.objects.filter(
+            observed_requirement_assessment = RequirementAssessment.objects.filter(
                 compliance_assessment=compliance_assessment,
                 compliance_assessment_id__in=(
                     get_full_view_compliance_assessment_ids(request.user)
@@ -14298,11 +16704,39 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
                 requirement__urn=urn,
             ).first()
 
-            if not requirement_assessment:
+            if not observed_requirement_assessment:
                 return Response(
                     {"error": f"Requirement with urn {urn} not found"},
                     status=status.HTTP_404_NOT_FOUND,
                 )
+            requirement_assessment = (
+                _lock_requirement_assessment_questionnaire_for_mutation(
+                    observed_requirement_assessment
+                )
+            )
+            if (
+                requirement_assessment.requirement.urn != urn
+                or requirement_assessment.folder_id != compliance_assessment.folder_id
+            ):
+                raise PermissionDenied(
+                    "The requirement assessment changed concurrently."
+                )
+            _assert_object_action_permission(
+                user=request.user,
+                instance=requirement_assessment,
+                action="change",
+            )
+            if not has_full_view_compliance_assessment(
+                request.user,
+                compliance_assessment,
+            ):
+                raise PermissionDenied(
+                    "Complete audit data is unavailable for this caller."
+                )
+            self._assert_complete_assessment_read_access(
+                request.user,
+                compliance_assessment,
+            )
 
             # Effective override state for this write.
             override_raw = request.data.get("is_score_overridden")
@@ -14396,15 +16830,15 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
                     requirement_assessment.score is not None
                 )
 
-            # Save and (on unpin) recompute must commit or roll back together.
-            with transaction.atomic():
-                requirement_assessment.save()
-                if (
-                    was_overridden
-                    and not score_overridden
-                    and requirement_assessment.requirement.questions.exists()
-                ):
-                    requirement_assessment.compute_score_and_result()
+            # The whole action is root/CA/RA/questionnaire locked, so save and
+            # an unpin recompute commit or roll back together.
+            requirement_assessment.save()
+            if (
+                was_overridden
+                and not score_overridden
+                and requirement_assessment.requirement.questions.exists()
+            ):
+                requirement_assessment.compute_score_and_result()
 
             response_data = {
                 "message": "Requirement updated successfully",
@@ -14445,6 +16879,8 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
             )
         except PermissionDenied:
             raise
+        except DatabaseError:
+            raise
         except Exception as e:
             logger.error("Unexpected error in update_requirement", error=e)
             return Response(
@@ -14465,35 +16901,181 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
 
         request = self.request
 
-        if baseline:
-            if not has_full_view_compliance_assessment(request.user, baseline):
-                raise PermissionDenied(
-                    "Complete audit data is unavailable for this caller."
-                )
-            self._assert_complete_assessment_read_access(request.user, baseline)
-
         with transaction.atomic():
-            instance: ComplianceAssessment = serializer.save()
-            same_framework_baseline = bool(
-                baseline and baseline.framework_id == instance.framework_id
+            # Serialize folder-tree mutations before resolving any target IAM.
+            Folder._lock_folder_tree()
+            requested_framework = serializer.validated_data.get("framework")
+            if requested_framework is None:
+                raise DRFValidationError({"framework": "This field is required."})
+            locked_framework = get_object_or_404(
+                Framework.objects.select_for_update(of=("self",)),
+                id=requested_framework.id,
             )
-            if same_framework_baseline:
-                self._assert_baseline_questionnaire_access(request.user, baseline)
-                baseline_copy_fields = (
-                    "result",
-                    "status",
-                    "score",
-                    "is_scored",
-                    "documentation_score",
-                    "observation",
-                    "applied_controls",
-                    "evidences",
+            if locked_framework.id not in set(
+                RoleAssignment.get_viewable_object_ids(request.user, Framework)
+            ):
+                raise PermissionDenied("The framework is unavailable.")
+            serializer.validated_data["framework"] = locked_framework
+
+            # Perimeter and campaign are authority-bearing owners, not opaque
+            # foreign keys. Resolve and authorize them again inside the same
+            # transaction that creates the audit and its requirement tree.
+            requested_perimeter = serializer.validated_data.get("perimeter")
+            requested_campaign = serializer.validated_data.get("campaign")
+            locked_perimeter = None
+            locked_campaign = None
+            owner_target_ids = defaultdict(set)
+            if requested_perimeter is not None:
+                owner_target_ids[Perimeter].add(requested_perimeter.id)
+            if requested_campaign is not None:
+                owner_target_ids[Campaign].add(requested_campaign.id)
+            locked_owners = lock_rows_in_global_model_order(owner_target_ids)
+            if requested_perimeter is not None:
+                locked_perimeter = locked_owners[Perimeter][requested_perimeter.id]
+                if locked_perimeter.id not in set(
+                    RoleAssignment.get_viewable_object_ids(request.user, Perimeter)
+                ):
+                    raise PermissionDenied("The perimeter is unavailable.")
+                serializer.validated_data["perimeter"] = locked_perimeter
+            if requested_campaign is not None:
+                locked_campaign = locked_owners[Campaign][requested_campaign.id]
+                if locked_campaign.id not in set(
+                    RoleAssignment.get_viewable_object_ids(request.user, Campaign)
+                ):
+                    raise PermissionDenied("The campaign is unavailable.")
+                serializer.validated_data["campaign"] = locked_campaign
+
+            requested_folder = serializer.validated_data.get("folder")
+            if locked_perimeter is not None and locked_perimeter.folder_id is not None:
+                if (
+                    requested_folder is not None
+                    and requested_folder.id != locked_perimeter.folder_id
+                ):
+                    raise DRFValidationError(
+                        {
+                            "folder": (
+                                "The audit folder must match its perimeter folder."
+                            )
+                        }
+                    )
+                requested_folder = locked_perimeter.folder
+                serializer.validated_data["folder"] = requested_folder
+
+            folder_ids = {
+                folder_id
+                for folder_id in (
+                    getattr(requested_folder, "id", None),
+                    getattr(locked_campaign, "folder_id", None),
                 )
-                for audit in (baseline, instance):
-                    self._assert_auditor_fields_visible(audit, *baseline_copy_fields)
-            instance.create_requirement_assessments(
-                baseline if same_framework_baseline else None
-            )
+                if folder_id is not None
+            }
+            locked_folders = {
+                folder.id: folder
+                for folder in Folder.objects.select_for_update(of=("self",))
+                .filter(id__in=folder_ids)
+                .order_by("id")
+            }
+            if set(locked_folders) != folder_ids:
+                raise PermissionDenied("One or more target folders are unavailable.")
+            if requested_folder is not None:
+                locked_folder = locked_folders[requested_folder.id]
+                _assert_folder_action_permission(
+                    user=request.user,
+                    model=ComplianceAssessment,
+                    folder=locked_folder,
+                    action="add",
+                )
+                serializer.validated_data["folder"] = locked_folder
+            if locked_campaign is not None and locked_campaign.folder_id is not None:
+                _assert_folder_action_permission(
+                    user=request.user,
+                    model=ComplianceAssessment,
+                    folder=locked_folders[locked_campaign.folder_id],
+                    action="add",
+                )
+
+            serializer._lock_and_authorize_create_m2m_links(request.user)
+            baseline_snapshot = None
+            expected_target_field_visibility = None
+            if baseline:
+                baseline, baseline_snapshot = _lock_baseline_copy_graph(
+                    baseline_id=baseline.id,
+                    target_framework=locked_framework,
+                )
+                if not has_full_view_compliance_assessment(request.user, baseline):
+                    raise PermissionDenied(
+                        "Complete audit data is unavailable for this caller."
+                    )
+                self._assert_complete_assessment_read_access(request.user, baseline)
+
+                if baseline_snapshot is not None:
+                    # The copy graph is now locked. Re-run every source proof
+                    # and derive the exact policy the unsaved target will
+                    # persist before any target audit/tree row is inserted.
+                    self._assert_baseline_questionnaire_access(request.user, baseline)
+                    from core.utils import build_initial_field_visibility
+
+                    expected_target_field_visibility = {
+                        **build_initial_field_visibility(locked_framework),
+                        **(serializer.validated_data.get("field_visibility") or {}),
+                    }
+                    candidate_target = ComplianceAssessment(
+                        framework=locked_framework,
+                        field_visibility=expected_target_field_visibility,
+                    )
+                    self._assert_auditor_fields_visible(
+                        baseline, *_SAME_FRAMEWORK_BASELINE_COPY_FIELDS
+                    )
+                    self._assert_auditor_fields_editable(
+                        candidate_target, *_SAME_FRAMEWORK_BASELINE_COPY_FIELDS
+                    )
+                    target_folder = serializer.validated_data.get("folder")
+                    for child_model in (RequirementAssessment, Answer):
+                        for child_action in ("add", "change"):
+                            _assert_folder_action_permission(
+                                user=request.user,
+                                model=child_model,
+                                folder=target_folder,
+                                action=child_action,
+                            )
+                    serializer.validated_data["field_visibility"] = (
+                        expected_target_field_visibility
+                    )
+                    serializer.validated_data.update(
+                        {
+                            "baseline_source_assessment_id_snapshot": baseline.id,
+                            "baseline_snapshot_sha256": (
+                                baseline_snapshot.snapshot_sha256
+                            ),
+                            "baseline_copied_by_id_snapshot": request.user.id,
+                            "baseline_copied_at": timezone.now(),
+                        }
+                    )
+
+            instance: ComplianceAssessment = serializer.save()
+            same_framework_baseline = baseline_snapshot is not None
+            if same_framework_baseline:
+                if instance.field_visibility != expected_target_field_visibility:
+                    raise PermissionDenied(
+                        "The target audit policy changed while it was created."
+                    )
+                self._assert_auditor_fields_editable(
+                    instance, *_SAME_FRAMEWORK_BASELINE_COPY_FIELDS
+                )
+                if (
+                    instance.baseline_source_assessment_id_snapshot != baseline.id
+                    or instance.baseline_snapshot_sha256
+                    != baseline_snapshot.snapshot_sha256
+                    or instance.baseline_copied_by_id_snapshot != request.user.id
+                    or instance.baseline_copied_at is None
+                ):
+                    raise PermissionDenied(
+                        "The baseline clone provenance was not persisted exactly."
+                    )
+                _validate_baseline_snapshot_for_target(instance, baseline_snapshot)
+            instance.create_requirement_assessments(baseline_snapshot=baseline_snapshot)
+            if same_framework_baseline:
+                _assert_baseline_questionnaire_scalars(instance, baseline_snapshot)
 
             if baseline and baseline.framework != instance.framework:
                 locked_audits = (
@@ -14669,14 +17251,19 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
                 result=RequirementAssessment.Result.NOT_APPLICABLE,
             )
             if instance.scoring_enabled:
-                assessable_ras.update(is_scored=True)
+                # A question-owned score becomes active only after deterministic
+                # recomputation (or an explicit valid override).  Do not turn an
+                # unanswered questionnaire into a scored requirement merely
+                # because the audit exposes the score field.
+                manual_ras = assessable_ras.exclude(
+                    requirement__questions__isnull=False
+                )
+                manual_ras.update(is_scored=True)
                 # Seed missing scores at the RA's resolved min (Node override
                 # if present, CA min otherwise) so overridden ranges like
                 # 2..5 don't start below their valid floor.
                 ras_to_init = list(
-                    assessable_ras.filter(score__isnull=True).select_related(
-                        "requirement"
-                    )
+                    manual_ras.filter(score__isnull=True).select_related("requirement")
                 )
                 ca_min = instance.min_score if instance.min_score is not None else 0
                 for ra in ras_to_init:
@@ -14689,6 +17276,14 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
                     RequirementAssessment.objects.bulk_update(ras_to_init, ["score"])
             else:
                 assessable_ras.update(is_scored=False)
+
+            # Dynamic IGs are answer-owned. Recompute them before suggested
+            # controls are selected because that selection filters requirements
+            # using the current implementation-group set.
+            if instance.framework and instance.framework.is_dynamic():
+                from core.utils import update_selected_implementation_groups
+
+                update_selected_implementation_groups(instance)
 
             # Handle applied controls creation
             if create_applied_controls:
@@ -14738,14 +17333,14 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
                         allowed_applied_control_ids=visible_control_ids,
                     )
 
-            # For dynamic frameworks, reconcile manual IGs with the answer-driven
-            # calc once RAs (and any baseline-copied answers) exist. Baseline copy
-            # uses bulk_create which bypasses Answer.save(), so the deferred IG
-            # hook never fires — run it explicitly here.
-            if instance.framework and instance.framework.is_dynamic():
-                from core.utils import update_selected_implementation_groups
+            # Baseline/fresh-tree bulk inserts bypass Answer/RA save hooks. CEL
+            # output and metrics must therefore be recomputed synchronously from
+            # the final questionnaire, IG and scoring state before this atomic
+            # create returns.
+            from core.cel_service import evaluate_outcomes
 
-                update_selected_implementation_groups(instance)
+            evaluate_outcomes(instance)
+            instance.upsert_daily_metrics()
 
     def perform_update(self, serializer):
         compliance_assessment = serializer.save()
@@ -15862,57 +18457,7 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
     def auditee_dashboard(self, request):
         """Returns per-assignment progress data for the auditee's dashboard."""
         user_actors = Actor.get_all_for_user(request.user)
-        visible_ra_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, RequirementAssessment
-        )
         visible_actor_ids = RoleAssignment.get_viewable_object_ids(request.user, Actor)
-        visible_requirement_node_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, RequirementNode
-        )
-        visible_question_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, Question
-        )
-        visible_choice_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, QuestionChoice
-        )
-        visible_answer_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, Answer
-        )
-        # Prefetch each assignment's assessable requirement assessments with
-        # everything get_visible_questions_counts() needs, so the per-assignment
-        # loop below reads from cache (no per-assignment queries).
-        assessable_ras = (
-            RequirementAssessment.objects.filter(
-                requirement__assessable=True,
-                id__in=visible_ra_ids,
-                requirement_id__in=visible_requirement_node_ids,
-            )
-            .select_related("requirement")
-            .prefetch_related(
-                Prefetch(
-                    "requirement__questions",
-                    queryset=Question.objects.filter(id__in=visible_question_ids),
-                ),
-                Prefetch(
-                    "answers",
-                    queryset=(
-                        Answer.objects.filter(
-                            id__in=visible_answer_ids,
-                            question_id__in=visible_question_ids,
-                        )
-                        .select_related("question")
-                        .prefetch_related(
-                            Prefetch(
-                                "selected_choices",
-                                queryset=QuestionChoice.objects.filter(
-                                    id__in=visible_choice_ids
-                                ),
-                            )
-                        )
-                    ),
-                ),
-            )
-        )
         assignments = (
             RequirementAssignment.objects.filter(actor__in=user_actors)
             .select_related(
@@ -15921,22 +18466,15 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
                 "compliance_assessment__folder",
             )
             .prefetch_related(
-                Prefetch("requirement_assessments", queryset=assessable_ras),
                 Prefetch(
                     "actor",
                     queryset=Actor.objects.filter(id__in=visible_actor_ids),
+                    to_attr="_visible_dashboard_actors",
                 ),
             )
             .distinct()
         )
         assignments = list(assignments)
-        dashboard_projection_completeness = get_authorized_compliance_progress_projections(
-            request.user,
-            {
-                assignment.compliance_assessment_id: assignment.compliance_assessment
-                for assignment in assignments
-            }.values(),
-        )
 
         from core.utils import resolve_visibility_from_overrides
 
@@ -15965,19 +18503,22 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
                 continue
 
             ca = assignment.compliance_assessment
-            # Prefetched above (filtered to assessable), so this hits the cache.
-            ras = list(assignment.requirement_assessments.all())
-            # Respect the audit's implementation-groups scope: out-of-scope
-            # requirements are hidden from the audit and must not weigh on
-            # the respondent's progress either.
-            if ca.selected_implementation_groups:
-                selected_groups = set(ca.selected_implementation_groups)
-                ras = [
-                    ra
-                    for ra in ras
-                    if selected_groups & set(ra.requirement.implementation_groups or [])
-                ]
+            try:
+                scope = capture_assignment_questionnaire_scope(
+                    user=request.user,
+                    assignment=assignment,
+                )
+            except PermissionDenied:
+                # Do not advertise a card whose exact target page must fail
+                # closed (for example a CEL-backed respondent assignment).
+                continue
+            ras = list(
+                RequirementAssessment.objects.filter(
+                    id__in=scope.mutable_requirement_assessment_ids
+                ).select_related("requirement")
+            )
             total = len(ras)
+            viewer_role = scope.viewer_role
 
             # Respondent-facing progress: track the respondent's own work, not
             # the audit-level progress mode (the status field may not even be
@@ -15998,37 +18539,46 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
                 ),
                 "respondent_alignment",
             )
-            alignment_in_use = alignment_pair.get("respondent", "edit") != "hidden"
-            answers_visible = is_field_visible_to(ca, "answers", "respondent")
-            result_visible = is_field_visible_to(ca, "result", "respondent")
+            alignment_in_use = alignment_pair.get(viewer_role, "edit") != "hidden"
+            answers_visible = is_field_visible_to(ca, "answers", viewer_role)
+            result_visible = is_field_visible_to(ca, "result", viewer_role)
 
             total_q = 0
             answered_q = 0
             done = 0
-            ca_projection = dashboard_projection_completeness.get(ca.id)
-            progress_complete = bool(
-                ca_projection
-                and ca_projection["complete"]
-                and (not answers_visible or ca_projection["answers_complete"])
-            )
+            progress_complete = True
             for ra in ras:
-                visible, answered = ra.get_visible_questions_counts()
-                if visible > 0:
-                    if answers_visible:
-                        total_q += visible
-                        answered_q += answered
-                        if answered >= visible:
-                            done += 1
+                if not answers_visible:
+                    # Do not let hidden answer values influence even the
+                    # choice of progress carrier through conditional question
+                    # visibility. Use one independently readable deterministic
+                    # field, or withhold the aggregate entirely.
+                    if alignment_in_use:
+                        total_q += 1
+                        unit_done = bool(ra.respondent_alignment)
                     elif result_visible:
                         total_q += 1
                         unit_done = (
                             ra.result != RequirementAssessment.Result.NOT_ASSESSED
                         )
-                        if unit_done:
-                            answered_q += 1
-                            done += 1
                     else:
                         progress_complete = False
+                        continue
+                    if unit_done:
+                        answered_q += 1
+                        done += 1
+                    continue
+
+                visible, answered = get_assignment_visible_question_counts(
+                    scope=scope,
+                    user=request.user,
+                    requirement_assessment=ra,
+                )
+                if visible > 0:
+                    total_q += visible
+                    answered_q += answered
+                    if answered >= visible:
+                        done += 1
                     continue
                 # No visible questions: use only an independently visible
                 # respondent-owned alignment or result carrier.  Returning a
@@ -16052,7 +18602,10 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
                 else (0 if progress_complete else None)
             )
 
-            actor_names = ", ".join(str(a) for a in assignment.actor.all())
+            actor_names = ", ".join(
+                str(actor)
+                for actor in getattr(assignment, "_visible_dashboard_actors", ())
+            )
 
             dashboard_data.append(
                 {
@@ -16071,7 +18624,7 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
                     ),
                     "status": (
                         ca.status
-                        if is_field_visible_to(ca, "status", "respondent")
+                        if is_field_visible_to(ca, "status", viewer_role)
                         else None
                     ),
                     "assignment_status": assignment.status,
@@ -16854,6 +19407,7 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
         target_audit, source_audit, _initial_authorization = resolved
 
         with transaction.atomic():
+            Folder._lock_folder_tree()
             locked_audits = (
                 ComplianceAssessment.objects.select_for_update()
                 .filter(id__in=(target_audit.id, source_audit.id))
@@ -17090,12 +19644,30 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
     @staticmethod
     @api_view(["GET", "POST"])
     @renderer_classes([JSONRenderer])
+    @transaction.atomic
     def create_suggested_applied_controls(request, pk):
+        dry_run = str(request.query_params.get("dry_run", "false")).lower() in {
+            "true",
+            "1",
+            "yes",
+        }
+        if request.method == "GET":
+            dry_run = True
+        if not dry_run:
+            Folder._lock_folder_tree()
         viewable_ca_ids = RoleAssignment.get_viewable_object_ids(
             request.user, ComplianceAssessment
         )
+        compliance_assessment_queryset = ComplianceAssessment.objects.filter(
+            id__in=viewable_ca_ids
+        )
+        if not dry_run:
+            compliance_assessment_queryset = (
+                compliance_assessment_queryset.select_for_update(of=("self",))
+            )
         compliance_assessment = get_object_or_404(
-            ComplianceAssessment.objects.filter(id__in=viewable_ca_ids), id=pk
+            compliance_assessment_queryset,
+            id=pk,
         )
         if not has_full_view_compliance_assessment(request.user, compliance_assessment):
             raise PermissionDenied(
@@ -17107,13 +19679,8 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
         ComplianceAssessmentViewSet._assert_auditor_fields_visible(
             compliance_assessment, "applied_controls"
         )
-        dry_run = str(request.query_params.get("dry_run", "false")).lower() in {
-            "true",
-            "1",
-            "yes",
-        }
-        if request.method == "GET":
-            dry_run = True
+        if not dry_run:
+            _assert_assessment_mutation_state(compliance_assessment)
         if not RoleAssignment.is_access_allowed(
             user=request.user,
             perm=Permission.objects.get(
@@ -17151,6 +19718,12 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
                         status=status.HTTP_400_BAD_REQUEST,
                     )
                 selected_reference_control_ids = raw
+        if compliance_assessment.requirement_assessments.exclude(
+            folder_id=compliance_assessment.folder_id
+        ).exists():
+            raise PermissionDenied(
+                "A requirement assessment has an inconsistent audit folder."
+            )
         if dry_run:
             preview = _preview_suggestions_for_compliance_assessment(
                 compliance_assessment,
@@ -17161,17 +19734,26 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
                 _serialize_suggestion_preview(preview),
                 status=status.HTTP_200_OK,
             )
-        visible_ra_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, RequirementAssessment
+        requirement_assessment_ids = set(
+            compliance_assessment.requirement_assessments.values_list("id", flat=True)
+        )
+        requirement_assessments, _respondent_scope = (
+            lock_requirement_assessment_relation_scope(
+                user=request.user,
+                requirement_assessment_ids=requirement_assessment_ids,
+                relation_field="applied_controls",
+                object_folder_id=compliance_assessment.folder_id,
+                allow_respondent=False,
+            )
+        )
+        ComplianceAssessmentViewSet._assert_complete_assessment_read_access(
+            request.user, compliance_assessment
         )
         visible_reference_control_ids = RoleAssignment.get_viewable_object_ids(
             request.user, ReferenceControl
         )
         visible_control_ids = RoleAssignment.get_viewable_object_ids(
             request.user, AppliedControl
-        )
-        requirement_assessments = compliance_assessment.requirement_assessments.filter(
-            id__in=visible_ra_ids
         )
         controls = []
         for requirement_assessment in requirement_assessments:
@@ -17197,11 +19779,29 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
         methods=["get", "post"],
         url_path="syncToActions",
     )
+    @transaction.atomic
     def sync_to_applied_controls(self, request, pk):
-        dry_run = request.query_params.get("dry_run", True)
-        if dry_run == "false":
-            dry_run = False
-        compliance_assessment = self.get_object()
+        # GET is always a preview.  Allowing a query parameter to turn a safe
+        # method into a write bypasses normal CSRF and intermediary semantics.
+        dry_run = request.method == "GET" or str(
+            request.query_params.get("dry_run", "true")
+        ).lower() not in {"false", "0", "no"}
+
+        Folder._lock_folder_tree()
+        visible_ca_ids = RoleAssignment.get_viewable_object_ids(
+            request.user, ComplianceAssessment
+        )
+        compliance_assessment = get_object_or_404(
+            ComplianceAssessment.objects.select_for_update(of=("self",)).filter(
+                id__in=visible_ca_ids
+            ),
+            id=pk,
+        )
+        if compliance_assessment.folder_id is not None:
+            compliance_assessment.folder = get_object_or_404(
+                Folder.objects.select_for_update(of=("self",)),
+                id=compliance_assessment.folder_id,
+            )
         if not has_full_view_compliance_assessment(request.user, compliance_assessment):
             raise PermissionDenied(
                 "Complete audit data is unavailable for this caller."
@@ -17222,6 +19822,9 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
                 "One or more fields are not editable for this caller."
             )
 
+        if not dry_run:
+            _assert_assessment_mutation_state(compliance_assessment)
+
         if not RoleAssignment.is_access_allowed(
             user=request.user,
             perm=Permission.objects.get(
@@ -17233,15 +19836,75 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
         ):
             return Response(status=status.HTTP_403_FORBIDDEN)
 
+        requirement_assessment_ids = set(
+            RequirementAssessment.objects.filter(
+                compliance_assessment_id=compliance_assessment.id
+            ).values_list("id", flat=True)
+        )
+        locked_requirement_assessments, _respondent_scope = (
+            lock_requirement_assessment_relation_scope(
+                user=request.user,
+                requirement_assessment_ids=requirement_assessment_ids,
+                relation_field=None,
+                object_folder_id=compliance_assessment.folder_id,
+                allow_respondent=False,
+                enforce_assessment_editable=not dry_run,
+            )
+        )
+        locked_requirement_assessment_ids = {
+            requirement_assessment.id
+            for requirement_assessment in locked_requirement_assessments
+        }
+        if locked_requirement_assessment_ids != requirement_assessment_ids:
+            raise PermissionDenied(
+                "One or more requirement assessments are unavailable."
+            )
+
+        through = RequirementAssessment.applied_controls.through
+        discovered_links = set(
+            through.objects.filter(
+                requirementassessment_id__in=requirement_assessment_ids
+            ).values_list("requirementassessment_id", "appliedcontrol_id")
+        )
+        applied_control_ids = {control_id for _ra_id, control_id in discovered_links}
+        locked_controls = list(
+            AppliedControl.objects.select_for_update(of=("self",))
+            .filter(id__in=applied_control_ids)
+            .order_by("id")
+        )
+        if {control.id for control in locked_controls} != applied_control_ids:
+            raise PermissionDenied("One or more applied controls are unavailable.")
+        list(
+            through.objects.select_for_update()
+            .filter(requirementassessment_id__in=requirement_assessment_ids)
+            .order_by("pk")
+        )
+        locked_links = set(
+            through.objects.filter(
+                requirementassessment_id__in=requirement_assessment_ids
+            ).values_list("requirementassessment_id", "appliedcontrol_id")
+        )
+        if locked_links != discovered_links:
+            raise PermissionDenied("Applied-control links changed concurrently; retry.")
+
+        # Reprove the complete projection only after every row that drives the
+        # inference is locked.  This also rejects independently hidden controls
+        # instead of silently calculating from a partial set.
+        self._assert_complete_assessment_read_access(
+            request.user, compliance_assessment
+        )
         changes = compliance_assessment.sync_to_applied_controls(
             dry_run=dry_run,
-            requirement_assessment_ids=RoleAssignment.get_viewable_object_ids(
-                request.user, RequirementAssessment
-            ),
-            applied_control_ids=RoleAssignment.get_viewable_object_ids(
-                request.user, AppliedControl
-            ),
+            requirement_assessment_ids=locked_requirement_assessment_ids,
+            applied_control_ids=applied_control_ids,
         )
+        final_links = set(
+            through.objects.filter(
+                requirementassessment_id__in=requirement_assessment_ids
+            ).values_list("requirementassessment_id", "appliedcontrol_id")
+        )
+        if final_links != locked_links:
+            raise PermissionDenied("Applied-control links changed concurrently; retry.")
         return Response({"changes": changes})
 
     @action(detail=True, methods=["get"], url_path="progress_ts")
@@ -18119,8 +20782,134 @@ class RequirementAssessmentViewSet(BaseModelViewSet):
             .distinct()
         )
 
+    @staticmethod
+    def _assert_auditor_mutation(user, requirement_assessment):
+        if not has_full_view_compliance_assessment(
+            user, requirement_assessment.compliance_assessment
+        ):
+            raise PermissionDenied(
+                "Respondent updates must use an exact requirement-assignment endpoint."
+            )
+
     def update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        self._assert_auditor_mutation(request.user, instance)
         return super().update(request, *args, **kwargs)
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        Folder._lock_folder_tree()
+        expected_answer_choice_ids = {
+            answer.id: {choice.id for choice in answer.selected_choices.all()}
+            for answer in serializer.instance.answers.all()
+        }
+        locked_instance = _lock_requirement_assessment_questionnaire_for_mutation(
+            serializer.instance
+        )
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=locked_instance,
+            action="change",
+        )
+        self._assert_auditor_mutation(self.request.user, locked_instance)
+        requested_folder = serializer.validated_data.get(
+            "folder",
+            locked_instance.folder,
+        )
+        if (
+            locked_instance.folder_id != locked_instance.compliance_assessment.folder_id
+            or requested_folder.id != locked_instance.folder_id
+        ):
+            raise PermissionDenied(
+                "The requirement assessment folder is immutable and must match its audit."
+            )
+        payload = serializer.initial_data.copy()
+        _preserve_requirement_assessment_m2m_links(
+            user=self.request.user,
+            instance=locked_instance,
+            payload=payload,
+            respondent_scope=False,
+        )
+        locked_serializer = self.get_serializer(
+            locked_instance,
+            data=payload,
+            partial=serializer.partial,
+        )
+        locked_serializer.context["expected_answer_choice_ids"] = (
+            expected_answer_choice_ids
+        )
+        locked_serializer.is_valid(raise_exception=True)
+        noneditable_fields = {
+            field_name
+            for field_name in locked_serializer.validated_data
+            if not is_field_editable_by(
+                locked_instance.compliance_assessment,
+                field_name,
+                "auditor",
+            )
+        }
+        if noneditable_fields:
+            raise PermissionDenied(
+                "One or more requirement fields became non-editable: "
+                + ", ".join(sorted(noneditable_fields))
+            )
+        result = super().perform_update(locked_serializer)
+        serializer.instance = locked_serializer.instance
+        return result
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        Folder._lock_folder_tree()
+        compliance_assessment = serializer.validated_data.get("compliance_assessment")
+        if compliance_assessment is None:
+            return super().perform_create(serializer)
+        locked_compliance_assessment = _lock_compliance_assessment_for_mutation(
+            compliance_assessment.id
+        )
+        if not has_full_view_compliance_assessment(
+            self.request.user, locked_compliance_assessment
+        ):
+            raise PermissionDenied(
+                "Respondents cannot create requirement assessments directly."
+            )
+        _assert_folder_action_permission(
+            user=self.request.user,
+            model=RequirementAssessment,
+            folder=locked_compliance_assessment.folder,
+            action="add",
+        )
+        requested_folder = serializer.validated_data.get("folder")
+        if (
+            requested_folder is not None
+            and requested_folder.id != locked_compliance_assessment.folder_id
+        ):
+            raise DRFValidationError(
+                {
+                    "folder": "The requirement assessment folder must match the compliance assessment folder."
+                }
+            )
+        serializer.validated_data["compliance_assessment"] = (
+            locked_compliance_assessment
+        )
+        serializer.validated_data["folder"] = locked_compliance_assessment.folder
+        return super().perform_create(serializer)
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        self._assert_auditor_mutation(request.user, instance)
+        return super().destroy(request, *args, **kwargs)
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        Folder._lock_folder_tree()
+        locked_instance = _lock_requirement_assessment_for_mutation(instance)
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=locked_instance,
+            action="delete",
+        )
+        self._assert_auditor_mutation(self.request.user, locked_instance)
+        return super().perform_destroy(locked_instance)
 
     @action(detail=False, name="Get updatable measures")
     def updatables(self, request):
@@ -18204,17 +20993,46 @@ class RequirementAssessmentViewSet(BaseModelViewSet):
     @staticmethod
     @api_view(["GET", "POST"])
     @renderer_classes([JSONRenderer])
+    @transaction.atomic
     def create_suggested_applied_controls(request, pk):
+        dry_run = str(request.query_params.get("dry_run", "false")).lower() in {
+            "true",
+            "1",
+            "yes",
+        }
+        if request.method == "GET":
+            dry_run = True
+        if not dry_run:
+            Folder._lock_folder_tree()
         visible_ra_ids = RoleAssignment.get_viewable_object_ids(
             request.user, RequirementAssessment
         )
-        requirement_assessment = get_object_or_404(
+        initial_requirement_assessment = get_object_or_404(
             RequirementAssessment.objects.select_related(
                 "compliance_assessment", "requirement", "folder"
             ).filter(id__in=visible_ra_ids),
             id=pk,
         )
-        compliance_assessment = requirement_assessment.compliance_assessment
+        if dry_run:
+            requirement_assessment = initial_requirement_assessment
+            compliance_assessment = requirement_assessment.compliance_assessment
+        else:
+            compliance_assessment = get_object_or_404(
+                ComplianceAssessment.objects.select_for_update(of=("self",)),
+                id=initial_requirement_assessment.compliance_assessment_id,
+            )
+            requirement_assessment = get_object_or_404(
+                RequirementAssessment.objects.select_for_update(of=("self",))
+                .select_related("requirement", "folder")
+                .filter(id__in=visible_ra_ids),
+                id=initial_requirement_assessment.id,
+                compliance_assessment_id=compliance_assessment.id,
+            )
+            requirement_assessment.compliance_assessment = compliance_assessment
+        if requirement_assessment.folder_id != compliance_assessment.folder_id:
+            raise PermissionDenied(
+                "The requirement assessment has an inconsistent audit folder."
+            )
         visible_ca_ids = RoleAssignment.get_viewable_object_ids(
             request.user, ComplianceAssessment
         )
@@ -18244,13 +21062,12 @@ class RequirementAssessmentViewSet(BaseModelViewSet):
         ):
             raise PermissionDenied("This field is not editable for this caller.")
 
-        dry_run = str(request.query_params.get("dry_run", "false")).lower() in {
-            "true",
-            "1",
-            "yes",
-        }
-        if request.method == "GET":
-            dry_run = True
+        if not is_full_viewer and not dry_run:
+            raise PermissionDenied(
+                "Respondent control mutations must use a reviewed auditor workflow."
+            )
+        if not dry_run:
+            _assert_assessment_mutation_state(compliance_assessment)
         if not RoleAssignment.is_access_allowed(
             user=request.user,
             perm=Permission.objects.get(
@@ -19067,12 +21884,15 @@ def export_mp_csv(request):
     return response
 
 
-class SecurityExceptionViewSet(ExportMixin, BaseModelViewSet):
+class SecurityExceptionViewSet(
+    RequirementAssessmentRelationGuardMixin, ExportMixin, BaseModelViewSet
+):
     """
     API endpoint that allows security exceptions to be viewed or edited.
     """
 
     model = SecurityException
+    requirement_relation_scope_field = "security_exceptions"
     filterset_fields = {
         "name": ["exact"],
         "requirement_assessments": ["exact"],
@@ -19550,10 +22370,10 @@ class FindingsAssessmentViewSet(BaseModelViewSet):
             md_content += "| Status | Count |\n"
             md_content += "|--------|-------|\n"
             status_choices = dict(Finding.Status.choices)
-            for status, count in metrics["status_distribution"].items():
+            for finding_status, count in metrics["status_distribution"].items():
                 if count > 0:
                     status_display = status_choices.get(
-                        status, status.replace("_", " ").title()
+                        finding_status, finding_status.replace("_", " ").title()
                     )
                     md_content += f"| {status_display} | {count} |\n"
             md_content += "\n"
@@ -19631,13 +22451,17 @@ class FindingsAssessmentViewSet(BaseModelViewSet):
         # Process status distribution with display names
         status_choices = dict(Finding.Status.choices)
         processed_status_distribution = []
-        for status, count in metrics["status_distribution"].items():
+        for finding_status, count in metrics["status_distribution"].items():
             if count > 0:
                 display_name = status_choices.get(
-                    status, status.replace("_", " ").title()
+                    finding_status, finding_status.replace("_", " ").title()
                 )
                 processed_status_distribution.append(
-                    {"status": status, "display_name": display_name, "count": count}
+                    {
+                        "status": finding_status,
+                        "display_name": display_name,
+                        "count": count,
+                    }
                 )
 
         context = {
@@ -20460,7 +23284,7 @@ class CommentViewSet(BaseModelViewSet):
     ordering = ["created_at"]
 
     def get_queryset(self):
-        return (
+        queryset = (
             super()
             .get_queryset()
             .select_related(
@@ -20472,22 +23296,136 @@ class CommentViewSet(BaseModelViewSet):
                 "finding",
             )
         )
+        user = self.request.user
+        visible_ca_ids = RoleAssignment.get_viewable_object_ids(
+            user, ComplianceAssessment
+        )
+        visible_ra_ids = RoleAssignment.get_viewable_object_ids(
+            user, RequirementAssessment
+        )
+        full_ca_ids = get_full_view_compliance_assessment_ids(user)
+        user_actor_ids = [actor.id for actor in Actor.get_all_for_user(user)]
+        assigned_ra_ids = RequirementAssignment.objects.filter(
+            actor__id__in=user_actor_ids
+        ).values_list("requirement_assessments__id", flat=True)
+        return queryset.filter(
+            Q(requirement_assessment__isnull=True)
+            | (
+                Q(requirement_assessment_id__in=visible_ra_ids)
+                & Q(
+                    requirement_assessment__compliance_assessment_id__in=(
+                        visible_ca_ids
+                    )
+                )
+                & (
+                    Q(
+                        requirement_assessment__compliance_assessment_id__in=(
+                            full_ca_ids
+                        )
+                    )
+                    | Q(requirement_assessment_id__in=assigned_ra_ids)
+                )
+                & Q(folder_id=F("requirement_assessment__folder_id"))
+            )
+        ).distinct()
 
+    def _lock_requirement_comment_parent(self, instance):
+        requirement_assessment_id = instance.requirement_assessment_id
+        if requirement_assessment_id is None:
+            return None
+        locked_rows, _respondent_scope = lock_requirement_assessment_relation_scope(
+            user=self.request.user,
+            requirement_assessment_ids={requirement_assessment_id},
+            relation_field=None,
+            object_folder_id=instance.folder_id,
+            allow_respondent=True,
+            require_change_permission=False,
+            enforce_assessment_editable=False,
+            respondent_assignment_statuses=tuple(RequirementAssignment.Status.values),
+            require_questionnaire_scope=False,
+        )
+        if len(locked_rows) != 1:
+            raise PermissionDenied("The requirement assessment changed concurrently.")
+        return locked_rows[0]
+
+    @transaction.atomic
     def perform_create(self, serializer):
+        Folder._lock_folder_tree()
+        requirement_assessment = serializer.validated_data.get("requirement_assessment")
+        if requirement_assessment is not None:
+            locked_rows, _respondent_scope = lock_requirement_assessment_relation_scope(
+                user=self.request.user,
+                requirement_assessment_ids={requirement_assessment.id},
+                relation_field=None,
+                object_folder_id=requirement_assessment.folder_id,
+                allow_respondent=True,
+                require_change_permission=False,
+                enforce_assessment_editable=False,
+                respondent_assignment_statuses=tuple(
+                    RequirementAssignment.Status.values
+                ),
+                require_questionnaire_scope=False,
+            )
+            if len(locked_rows) != 1:
+                raise PermissionDenied(
+                    "The requirement assessment changed concurrently."
+                )
+            serializer.validated_data["requirement_assessment"] = locked_rows[0]
         serializer.save(author=self.request.user)
 
+    @transaction.atomic
     def perform_update(self, serializer):
-        if serializer.instance.author_id != self.request.user.id:
+        Folder._lock_folder_tree()
+        source_instance = serializer.instance
+        locked_parent = self._lock_requirement_comment_parent(source_instance)
+        locked_instance = get_object_or_404(
+            Comment.objects.select_for_update(of=("self",)),
+            id=source_instance.id,
+        )
+        if (
+            locked_instance.requirement_assessment_id
+            != source_instance.requirement_assessment_id
+            or (
+                locked_parent is not None
+                and locked_instance.folder_id != locked_parent.folder_id
+            )
+        ):
+            raise PermissionDenied("The comment parent changed concurrently.")
+        if locked_instance.author_id != self.request.user.id:
             raise PermissionDenied({"error": "You can only edit your own comments."})
-        super().perform_update(serializer)
+        locked_serializer = self.get_serializer(
+            locked_instance,
+            data=serializer.initial_data,
+            partial=serializer.partial,
+        )
+        locked_serializer.is_valid(raise_exception=True)
+        result = super().perform_update(locked_serializer)
+        serializer.instance = locked_serializer.instance
+        return result
 
+    @transaction.atomic
     def perform_destroy(self, instance):
-        if instance.author_id != self.request.user.id:
+        Folder._lock_folder_tree()
+        locked_parent = self._lock_requirement_comment_parent(instance)
+        locked_instance = get_object_or_404(
+            Comment.objects.select_for_update(of=("self",)),
+            id=instance.id,
+        )
+        if (
+            locked_instance.requirement_assessment_id
+            != instance.requirement_assessment_id
+            or (
+                locked_parent is not None
+                and locked_instance.folder_id != locked_parent.folder_id
+            )
+        ):
+            raise PermissionDenied("The comment parent changed concurrently.")
+        if locked_instance.author_id != self.request.user.id:
             if not self.request.user.is_admin():
                 raise PermissionDenied(
                     {"error": "You can only delete your own comments."}
                 )
-        return super().perform_destroy(instance)
+        return super().perform_destroy(locked_instance)
 
 
 class TaskTemplateFilter(GenericFilterSet):
@@ -20516,10 +23454,23 @@ class TaskTemplateFilter(GenericFilterSet):
             "filtering_labels",
         ]
 
+    def _visible_task_node_ids(self):
+        user = getattr(getattr(self, "request", None), "user", None)
+        if user is None or not getattr(user, "is_authenticated", False):
+            return TaskNode.objects.none().values_list("id", flat=True)
+        try:
+            return RoleAssignment.get_viewable_object_ids(user, TaskNode)
+        except (NotImplementedError, Permission.DoesNotExist):
+            return TaskNode.objects.none().values_list("id", flat=True)
+
     def filter_last_occurrence_status(self, queryset, name, values):
         start = timezone.now().date()
         status_subquery = (
-            TaskNode.objects.filter(task_template=OuterRef("pk"), due_date__lt=start)
+            TaskNode.objects.filter(
+                task_template=OuterRef("pk"),
+                id__in=self._visible_task_node_ids(),
+                due_date__lt=start,
+            )
             .order_by("-due_date")
             .values("status")[:1]
         )
@@ -20531,7 +23482,11 @@ class TaskTemplateFilter(GenericFilterSet):
     def filter_next_occurrence_status(self, queryset, name, values):
         start = timezone.now().date()
         status_subquery = (
-            TaskNode.objects.filter(task_template=OuterRef("pk"), due_date__gte=start)
+            TaskNode.objects.filter(
+                task_template=OuterRef("pk"),
+                id__in=self._visible_task_node_ids(),
+                due_date__gte=start,
+            )
             .order_by("due_date")
             .values("status")[:1]
         )
@@ -20543,6 +23498,9 @@ class TaskTemplateFilter(GenericFilterSet):
 
 class TaskTemplateViewSet(ExportMixin, BaseModelViewSet):
     model = TaskTemplate
+    permission_overrides = {
+        "sync_task_nodes": "core.change_tasktemplate",
+    }
     filterset_fields = [
         "assigned_to",
         "is_recurrent",
@@ -20633,12 +23591,12 @@ class TaskTemplateViewSet(ExportMixin, BaseModelViewSet):
                 "format": lambda s: s.get("overdue_behavior", "") if s else "",
             },
             "next_occurrence": {
-                "source": "get_next_occurrence",
+                "source": "next_occurrence",
                 "label": "next_occurrence",
                 "format": lambda x: x.strftime("%Y-%m-%d") if x else "",
             },
             "next_occurrence_status": {
-                "source": "get_next_occurrence_status",
+                "source": "next_occurrence_status",
                 "label": "next_occurrence_status",
             },
             "enabled": {
@@ -20811,287 +23769,574 @@ class TaskTemplateViewSet(ExportMixin, BaseModelViewSet):
         },
     }
 
-    def get_queryset(self):
-        qs = super().get_queryset().prefetch_related("filtering_labels__folder")
-        ordering = self.request.query_params.get("ordering", "")
+    def _annotate_visible_task_node_summary(self, queryset):
+        """Annotate ordering/export fields from independently visible nodes."""
 
+        visible_node_ids = self._visible_task_node_ids(self.request.user)
+        today = timezone.localdate()
+        visible_nodes = TaskNode.objects.filter(id__in=visible_node_ids)
+        return queryset.annotate(
+            next_occurrence=Case(
+                When(
+                    is_recurrent=False,
+                    then=Min(
+                        "tasknode__due_date",
+                        filter=Q(tasknode__id__in=visible_node_ids),
+                    ),
+                ),
+                When(
+                    is_recurrent=True,
+                    then=Min(
+                        "tasknode__due_date",
+                        filter=Q(
+                            tasknode__id__in=visible_node_ids,
+                            tasknode__due_date__gte=today,
+                        ),
+                    ),
+                ),
+                default=Value(None),
+                output_field=models.DateField(),
+            ),
+            last_occurrence_status=Subquery(
+                visible_nodes.filter(task_template=OuterRef("pk"), due_date__lt=today)
+                .order_by("-due_date", "id")
+                .values("status")[:1]
+            ),
+            next_occurrence_status=Case(
+                When(
+                    is_recurrent=False,
+                    then=Subquery(
+                        visible_nodes.filter(task_template=OuterRef("pk"))
+                        .order_by("due_date", "id")
+                        .values("status")[:1]
+                    ),
+                ),
+                When(
+                    is_recurrent=True,
+                    then=Subquery(
+                        visible_nodes.filter(
+                            task_template=OuterRef("pk"),
+                            due_date__gte=today,
+                        )
+                        .order_by("due_date", "id")
+                        .values("status")[:1]
+                    ),
+                ),
+                default=Value(None),
+                output_field=models.CharField(),
+            ),
+        )
+
+    def get_queryset(self):
+        queryset = super().get_queryset().prefetch_related("filtering_labels__folder")
+        ordering = self.request.query_params.get("ordering", "")
         if any(
-            f in ordering
-            for f in (
+            field_name in ordering
+            for field_name in (
                 "next_occurrence",
                 "last_occurrence_status",
                 "next_occurrence_status",
             )
         ):
-            today = timezone.localdate()
-            qs = qs.annotate(
-                next_occurrence=Case(
-                    When(is_recurrent=False, then=Min("tasknode__due_date")),
-                    When(
-                        is_recurrent=True,
-                        then=Min(
-                            "tasknode__due_date",
-                            filter=Q(tasknode__due_date__gte=today),
-                        ),
-                    ),
-                    default=Value(None),
-                    output_field=models.DateField(),
-                ),
-                last_occurrence_status=Subquery(
-                    TaskNode.objects.filter(
-                        task_template=OuterRef("pk"), due_date__lt=today
-                    )
-                    .order_by("-due_date")
-                    .values("status")[:1]
-                ),
-                next_occurrence_status=Case(
-                    When(
-                        is_recurrent=False,
-                        then=Subquery(
-                            TaskNode.objects.filter(task_template=OuterRef("pk"))
-                            .order_by("due_date")
-                            .values("status")[:1]
-                        ),
-                    ),
-                    When(
-                        is_recurrent=True,
-                        then=Subquery(
-                            TaskNode.objects.filter(
-                                task_template=OuterRef("pk"),
-                                due_date__gte=today,
-                            )
-                            .order_by("due_date")
-                            .values("status")[:1]
-                        ),
-                    ),
-                    default=Value(None),
-                    output_field=models.CharField(),
-                ),
-            )
+            queryset = self._annotate_visible_task_node_summary(queryset)
+        return queryset
 
-        return qs
+    def _get_export_queryset(self):
+        # Annotate before filter/order backends run: an export ordered by one
+        # of these virtual fields must not fall back to hidden TaskNode rows.
+        viewable_ids = RoleAssignment.get_viewable_object_ids(
+            self.request.user, self.model
+        )
+        queryset = self.model.objects.filter(id__in=viewable_ids)
+        if self.export_config.get("select_related"):
+            queryset = queryset.select_related(*self.export_config["select_related"])
+        if self.export_config.get("prefetch_related"):
+            queryset = queryset.prefetch_related(
+                *self.export_config["prefetch_related"]
+            )
+        queryset = self._annotate_visible_task_node_summary(queryset)
+        return self.filter_queryset(queryset)
+
+    def _calendar_node_data(self, node):
+        """Serialize one independently viewable node and mask related objects."""
+
+        serializer = TaskNodeReadSerializer(
+            node,
+            context=self.get_serializer_context(),
+        )
+        data = serializer.data
+        field_models = {
+            "task_template": TaskTemplate,
+            "folder": Folder,
+            "assigned_to": Actor,
+            "evidences": Evidence,
+            "expected_evidence": Evidence,
+            "applied_controls": AppliedControl,
+            "compliance_assessments": ComplianceAssessment,
+            "assets": Asset,
+            "risk_assessments": RiskAssessment,
+            "findings_assessment": FindingsAssessment,
+        }
+        allowed_ids = self._get_accessible_ids_map(
+            set(field_models.values()) | {EvidenceRevision}
+        )
+        data = self._filter_related_fields(data, field_models, allowed_ids)
+
+        visible_evidences = allowed_ids.get(Evidence)
+        if visible_evidences is not None:
+            data["evidence_reviewed"] = [
+                evidence_id
+                for evidence_id in data.get("evidence_reviewed", [])
+                if str(evidence_id) in visible_evidences
+            ]
+        visible_revisions = allowed_ids.get(EvidenceRevision)
+        if visible_evidences is not None or visible_revisions is not None:
+            data["evidence_revisions_map"] = {
+                evidence_id: revision_id
+                for evidence_id, revision_id in data.get(
+                    "evidence_revisions_map", {}
+                ).items()
+                if (visible_evidences is None or str(evidence_id) in visible_evidences)
+                and (visible_revisions is None or str(revision_id) in visible_revisions)
+            }
+        return data
 
     def task_calendar(self, task_templates, start=None, end=None):
-        """Generate calendar of tasks for the given templates."""
+        """Return a calendar projection without mutating ``TaskNode`` rows."""
+
         today = timezone.localdate()
         task_templates = list(task_templates)
-        task_templates_by_id = {
-            str(template.id): template for template in task_templates
-        }
         tasks_list = []
+        nodes_by_scheduled_slot = {}
+        nodes_by_due_slot = {}
+        materialized_node_ids = set()
+        try:
+            visible_node_ids = RoleAssignment.get_viewable_object_ids(
+                self.request.user, TaskNode
+            )
+        except (NotImplementedError, Permission.DoesNotExist):
+            visible_node_ids = TaskNode.objects.none().values_list("id", flat=True)
+
         for template in task_templates:
             if not template.is_recurrent:
                 if not template.task_date:
                     continue
-                tasks_list.append(_create_task_dict(template, template.task_date))
-                continue
+                tasks = [_create_task_dict(template, template.task_date)]
+                start_date = end_date = template.task_date
+            else:
+                start_date_param = start or template.task_date or today
+                end_date_param = end or (template.schedule or {}).get("end_date")
+                if not end_date_param:
+                    parsed_start = date.fromisoformat(str(start_date_param))
+                    end_date_param = parsed_start + rd.relativedelta(months=1)
+                try:
+                    start_date = date.fromisoformat(str(start_date_param))
+                    end_date = date.fromisoformat(str(end_date_param))
+                except ValueError:
+                    return {"error": "Invalid date format. Use YYYY-MM-DD"}
+                tasks = _generate_occurrences(template, start_date, end_date)
 
-            start_date_param = start or template.task_date or today
-            end_date_param = end or template.schedule.get("end_date")
-
-            if not end_date_param:
-                start_date = datetime.strptime(str(start_date_param), "%Y-%m-%d").date()
-                end_date_param = (start_date + rd.relativedelta(months=1)).strftime(
-                    "%Y-%m-%d"
-                )
-
-            try:
-                start_date = datetime.strptime(str(start_date_param), "%Y-%m-%d").date()
-                end_date = datetime.strptime(str(end_date_param), "%Y-%m-%d").date()
-            except ValueError:
-                return {"error": "Invalid date format. Use YYYY-MM-DD"}
-
-            tasks = _generate_occurrences(template, start_date, end_date)
             tasks_list.extend(tasks)
-
-            # Preserve TaskNodes manually rescheduled by the user
-            # (due_date != scheduled_date)
-            # Unmodified nodes (due_date == scheduled_date)
-            # can be safely garbage-collected on schedule changes.
-            existing_nodes = TaskNode.objects.filter(
-                task_template=template,
-            ).filter(
-                Q(
-                    scheduled_date__gte=start_date,
-                    scheduled_date__lte=end_date,
+            generated_scheduled_dates = {task["due_date"] for task in tasks}
+            existing_nodes = list(
+                TaskNode.objects.filter(
+                    task_template=template,
+                    id__in=visible_node_ids,
                 )
-                | (
-                    Q(due_date__gte=start_date, due_date__lte=end_date)
-                    & (
-                        Q(scheduled_date__isnull=True)
-                        | ~Q(due_date=F("scheduled_date"))
+                .filter(
+                    Q(
+                        scheduled_date__gte=start_date,
+                        scheduled_date__lte=end_date,
                     )
+                    | Q(due_date__gte=start_date, due_date__lte=end_date)
                 )
+                .select_related("task_template", "folder")
+                .order_by("id")
             )
-            generated_scheduled_dates = {t["due_date"] for t in tasks}
             for node in existing_nodes:
+                template_id = str(template.id)
+                if node.scheduled_date is not None:
+                    nodes_by_scheduled_slot.setdefault(
+                        (template_id, node.scheduled_date), node
+                    )
+                if node.due_date is not None:
+                    nodes_by_due_slot.setdefault((template_id, node.due_date), node)
+
                 if node.due_date != node.scheduled_date:
-                    # Always preserve user-rescheduled nodes
-                    node.to_delete = False
-                    node.save(update_fields=["to_delete"])
                     if node.due_date and start_date <= node.due_date <= end_date:
-                        tasks_list.append(TaskNodeReadSerializer(node).data)
+                        tasks_list.append(self._calendar_node_data(node))
+                        materialized_node_ids.add(str(node.id))
                 elif node.scheduled_date not in generated_scheduled_dates:
                     effective_date = node.due_date or node.scheduled_date
                     if effective_date and effective_date < today:
-                        # Preserve past nodes whose slot was removed
-                        node.to_delete = False
-                        node.save(update_fields=["to_delete"])
-                        tasks_list.append(TaskNodeReadSerializer(node).data)
+                        tasks_list.append(self._calendar_node_data(node))
+                        materialized_node_ids.add(str(node.id))
 
-        def _parse_due_date(val):
-            """Normalize due_date to a date object"""
-            if isinstance(val, str):
-                return datetime.strptime(val, "%Y-%m-%d").date()
-            return val
+        for index, task in enumerate(tasks_list):
+            if not task or not task.get("virtual") or not task.get("due_date"):
+                continue
+            task_date = task["due_date"]
+            if isinstance(task_date, str):
+                task_date = date.fromisoformat(task_date)
+            template_id = str(task["task_template"])
+            scheduled_node = nodes_by_scheduled_slot.get((template_id, task_date))
+            if scheduled_node and scheduled_node.due_date != task_date:
+                # A named human moved this occurrence; return it only at its
+                # independently visible due date, never at the old slot.
+                tasks_list[index] = None
+                continue
+            node = scheduled_node or nodes_by_due_slot.get((template_id, task_date))
+            if node is None:
+                continue
+            if str(node.id) in materialized_node_ids:
+                tasks_list[index] = None
+                continue
+            materialized_node_ids.add(str(node.id))
+            tasks_list[index] = self._calendar_node_data(node)
 
-        # Sort tasks by due date, skip entries without a due_date
-        sorted_tasks = sorted(
-            [t for t in tasks_list if t.get("due_date")],
-            key=lambda x: _parse_due_date(x["due_date"]),
+        def parse_due_date(value):
+            if isinstance(value, str):
+                return date.fromisoformat(value)
+            return value
+
+        return sorted(
+            [task for task in tasks_list if task and task.get("due_date")],
+            key=lambda task: parse_due_date(task["due_date"]),
         )
 
-        # Build a set of (template_id, date) identifiers for virtual tasks to materialize.
-        # Every virtual task in the calendar range gets a DB record so it is
-        # clickable/editable in the UI.
-        # NOTE: All virtual tasks in the range are materialized. Currently the
-        # calendar UI fetches one month at a time; if that changes, consider
-        # adding an upper bound here.
-        tasks_to_process_ids = set()
-        for task in sorted_tasks:
-            if not task.get("virtual"):
-                continue
-            template_id = task.get("task_template")
-            task_date = task.get("due_date")
-            if template_id and task_date:
-                tasks_to_process_ids.add((template_id, task_date))
+    @staticmethod
+    def _assert_task_scope_permission(*, user, model, folder, action):
+        try:
+            permission = Permission.objects.get(
+                content_type__app_label=model._meta.app_label,
+                content_type__model=model._meta.model_name,
+                codename=f"{action}_{model._meta.model_name}",
+            )
+        except Permission.DoesNotExist as exc:
+            raise PermissionDenied(
+                "The requested task operation is unavailable."
+            ) from exc
+        if not RoleAssignment.is_access_allowed(
+            user=user,
+            perm=permission,
+            folder=folder,
+        ):
+            raise PermissionDenied("The requested task operation is unavailable.")
 
-        processed_tasks_identifiers = set()
-        materialized_node_ids = {
-            str(task["id"])
-            for task in tasks_list
-            if task and not task.get("virtual") and task.get("id")
+    @staticmethod
+    def _task_sync_window(task_template):
+        today = timezone.localdate()
+        start_date = task_template.task_date or today
+        frequency = (task_template.schedule or {}).get("frequency")
+        deltas = {
+            "DAILY": rd.relativedelta(months=3),
+            "WEEKLY": rd.relativedelta(weeks=52),
+            "MONTHLY": rd.relativedelta(years=2),
+            "YEARLY": rd.relativedelta(years=5),
+        }
+        if frequency not in deltas:
+            raise DRFValidationError(
+                {"schedule": "A recurrent task requires a supported frequency."}
+            )
+        minimum_end = today + deltas[frequency]
+        configured_end = (task_template.schedule or {}).get("end_date")
+        end_date = date.fromisoformat(configured_end) if configured_end else minimum_end
+        return start_date, max(end_date, minimum_end)
+
+    def _recurrent_task_node_sync_plan(self, task_template, locked_nodes):
+        start_date, end_date = self._task_sync_window(task_template)
+        desired_dates = sorted(
+            {
+                task["due_date"]
+                for task in _generate_occurrences(
+                    task_template,
+                    start_date,
+                    end_date,
+                )
+                if task.get("due_date")
+            }
+        )
+        nodes_by_scheduled_date = {}
+        nodes_by_due_date = {}
+        for node in locked_nodes:
+            if node.scheduled_date is not None:
+                nodes_by_scheduled_date.setdefault(node.scheduled_date, node)
+            if node.due_date is not None:
+                nodes_by_due_date.setdefault(node.due_date, node)
+
+        retained_node_ids = set()
+        create_nodes = []
+        for task_date in desired_dates:
+            scheduled_node = nodes_by_scheduled_date.get(task_date)
+            if scheduled_node is not None:
+                # A rescheduled occurrence owns its original slot and must not
+                # be silently duplicated at the old date.
+                retained_node_ids.add(scheduled_node.id)
+                continue
+            due_node = nodes_by_due_date.get(task_date)
+            if due_node is not None:
+                retained_node_ids.add(due_node.id)
+                continue
+            create_nodes.append(
+                {
+                    "task_template": task_template,
+                    "due_date": task_date,
+                    "scheduled_date": task_date,
+                    "status": "pending",
+                    "folder": task_template.folder,
+                }
+            )
+
+        today = timezone.localdate()
+        delete_nodes = []
+        for node in locked_nodes:
+            is_future = (
+                node.scheduled_date is not None and node.scheduled_date >= today
+            ) or (
+                node.scheduled_date is None
+                and node.due_date is not None
+                and node.due_date >= today
+            )
+            is_pristine = (
+                node.status == "pending"
+                and node.due_date is not None
+                and node.due_date == node.scheduled_date
+                and node.observation in (None, "")
+                and not node.evidences.exists()
+                and not node.evidence_revisions.exists()
+            )
+            if node.id not in retained_node_ids and is_future and is_pristine:
+                delete_nodes.append(node)
+
+        deleted_ids = {node.id for node in delete_nodes}
+        update_nodes = [
+            (node, {"to_delete": False})
+            for node in locked_nodes
+            if node.id not in deleted_ids and node.to_delete
+        ]
+        return create_nodes, update_nodes, delete_nodes
+
+    @staticmethod
+    def _nonrecurrent_task_node_sync_plan(
+        task_template,
+        locked_nodes,
+        *,
+        tasknode_data=None,
+        force_replace=False,
+    ):
+        """Build the exact one-node reconciliation plan without writing rows."""
+
+        tasknode_data = tasknode_data or {}
+        create_values = {
+            "task_template": task_template,
+            "due_date": task_template.task_date,
+            "scheduled_date": task_template.task_date,
+            "folder": task_template.folder,
+            **tasknode_data,
+        }
+        if force_replace or len(locked_nodes) != 1:
+            return [create_values], [], list(locked_nodes)
+
+        node = locked_nodes[0]
+        desired_values = {
+            "due_date": task_template.task_date,
+            "scheduled_date": task_template.task_date,
+            "folder": task_template.folder,
+            "to_delete": False,
+            **tasknode_data,
+        }
+        changes = {}
+        for field_name, value in desired_values.items():
+            if field_name == "folder":
+                if node.folder_id != value.id:
+                    changes[field_name] = value
+            elif getattr(node, field_name) != value:
+                changes[field_name] = value
+        return [], [(node, changes)] if changes else [], []
+
+    @staticmethod
+    def _tasknode_input_data(serializer):
+        """Capture pseudo-fields before the template-only serializer pops them."""
+
+        return {
+            field_name: serializer.validated_data[field_name]
+            for field_name in ("status", "observation")
+            if field_name in serializer.validated_data
+            and serializer.validated_data[field_name] is not None
         }
 
-        for i in range(len(tasks_list)):
-            task = tasks_list[i]
-            task_date = task.get("due_date")
-            if not task_date:
-                continue
+    @staticmethod
+    def _visible_task_node_ids(user):
+        if user is None or not getattr(user, "is_authenticated", False):
+            return set()
+        try:
+            return set(RoleAssignment.get_viewable_object_ids(user, TaskNode))
+        except (NotImplementedError, Permission.DoesNotExist):
+            return set()
 
-            # Already-serialized TaskNodes from the DB don't need processing
-            if not task.get("virtual"):
-                continue
-
-            task_template_id = task["task_template"]
-            task_identifier = (task_template_id, task_date)
-
-            if task_identifier in processed_tasks_identifiers:
-                continue
-
-            if task_identifier in tasks_to_process_ids:
-                processed_tasks_identifiers.add(task_identifier)
-
-                task_template = task_templates_by_id[str(task_template_id)]
-
-                # Check if a node already exists for this recurrence slot
-                rescheduled_node = TaskNode.objects.filter(
-                    task_template=task_template,
-                    scheduled_date=task_date,
-                ).first()
-                if rescheduled_node:
-                    if rescheduled_node.due_date != task_date:
-                        # Node was rescheduled — already preserved in
-                        # the existing_nodes loop, drop the virtual entry.
-                        tasks_list[i] = None
-                        continue
-                    task_node = rescheduled_node
-                else:
-                    try:
-                        task_node, created = TaskNode.objects.get_or_create(
-                            task_template=task_template,
-                            due_date=task_date,
-                            defaults={
-                                "scheduled_date": task_date,
-                                "status": "pending",
-                                "folder": task_template.folder,
-                            },
-                        )
-                    except IntegrityError:
-                        existing_node = TaskNode.objects.filter(
-                            task_template=task_template,
-                            due_date=task_date,
-                        ).first()
-                        if not existing_node:
-                            tasks_list[i] = None
-                            continue
-                        task_node = existing_node
-                if str(task_node.id) in materialized_node_ids:
-                    tasks_list[i] = None
-                    continue
-                materialized_node_ids.add(str(task_node.id))
-                task_node.to_delete = False
-                task_node.save(update_fields=["to_delete"])
-                tasks_list[i] = TaskNodeReadSerializer(task_node).data
-
-        return [task for task in tasks_list if task is not None]
-
-    def _sync_task_nodes(self, task_template: TaskTemplate):
+    def _visible_task_node(self, *, user, task_template):
         if task_template.is_recurrent:
-            with transaction.atomic():
-                today = timezone.localdate()
-                # Soft-delete future TaskNode instances for re-evaluation.
-                TaskNode.objects.filter(task_template=task_template).filter(
-                    Q(scheduled_date__gte=today)
-                    | Q(scheduled_date__isnull=True, due_date__gte=today)
-                ).update(to_delete=True)
-                # Determine the end date based on the frequency
-                start_date = task_template.task_date
-                if task_template.is_recurrent:
-                    if task_template.schedule["frequency"] == "DAILY":
-                        delta = rd.relativedelta(months=3)
-                    elif task_template.schedule["frequency"] == "WEEKLY":
-                        delta = rd.relativedelta(weeks=52)
-                    elif task_template.schedule["frequency"] == "MONTHLY":
-                        delta = rd.relativedelta(years=2)
-                    elif task_template.schedule["frequency"] == "YEARLY":
-                        delta = rd.relativedelta(years=5)
+            return None
+        visible_ids = self._visible_task_node_ids(user)
+        return (
+            TaskNode.objects.filter(
+                task_template=task_template,
+                id__in=visible_ids,
+            )
+            .order_by("due_date", "id")
+            .first()
+        )
 
-                    end_date_param = task_template.schedule.get("end_date")
-                    if end_date_param:
-                        end_date = datetime.strptime(end_date_param, "%Y-%m-%d").date()
-                    else:
-                        end_date = today + delta
-                    # Ensure end_date is not before the calculated delta
-                    min_end_date = today + delta
-                    if end_date < min_end_date:
-                        end_date = min_end_date
-                else:
-                    end_date = start_date
-                # Generate the task nodes
-                self.task_calendar(
-                    task_templates=self.get_queryset().filter(id=task_template.id),
-                    start=start_date,
-                    end=end_date,
+    @staticmethod
+    def _assert_task_node_owner_coherence(task_template, locked_nodes):
+        if any(node.folder_id != task_template.folder_id for node in locked_nodes):
+            raise PermissionDenied("The requested task operation is unavailable.")
+
+    def _lock_task_template_graph(self, expected_template):
+        """Lock in canonical root -> template -> TaskNode order."""
+
+        locked_template = get_object_or_404(
+            TaskTemplate.objects.select_for_update(of=("self",)).select_related(
+                "folder"
+            ),
+            id=expected_template.id,
+        )
+        if (
+            locked_template.folder_id != expected_template.folder_id
+            or locked_template.updated_at != expected_template.updated_at
+        ):
+            raise PermissionDenied("The task template changed concurrently.")
+        locked_nodes = list(
+            TaskNode.objects.select_for_update(of=("self",))
+            .select_related("folder")
+            .filter(task_template=locked_template)
+            .order_by("id")
+        )
+        self._assert_task_node_owner_coherence(locked_template, locked_nodes)
+        return locked_template, locked_nodes
+
+    def _assert_task_node_plan_authority(
+        self,
+        *,
+        user,
+        locked_nodes,
+        create_nodes,
+        update_nodes,
+        delete_nodes,
+        require_complete_visibility=False,
+    ):
+        has_node_mutation = bool(create_nodes or update_nodes or delete_nodes)
+        if require_complete_visibility or has_node_mutation:
+            visible_node_ids = self._visible_task_node_ids(user)
+            if not {node.id for node in locked_nodes}.issubset(visible_node_ids):
+                raise PermissionDenied("The requested task operation is unavailable.")
+
+        required_scopes = {}
+        for values in create_nodes:
+            for action_name in ("view", "add"):
+                required_scopes[(action_name, values["folder"].id)] = values["folder"]
+        for node, changes in update_nodes:
+            required_scopes[("change", node.folder_id)] = node.folder
+            target_folder = changes.get("folder")
+            if target_folder is not None and target_folder.id != node.folder_id:
+                for action_name in ("view", "add"):
+                    required_scopes[(action_name, target_folder.id)] = target_folder
+
+        for node in delete_nodes:
+            required_scopes[("delete", node.folder_id)] = node.folder
+
+        for (action_name, _folder_id), folder in sorted(
+            required_scopes.items(),
+            key=lambda item: (item[0][0], str(item[0][1])),
+        ):
+            self._assert_task_scope_permission(
+                user=user,
+                model=TaskNode,
+                folder=folder,
+                action=action_name,
+            )
+
+    @staticmethod
+    def _apply_task_node_plan(
+        *,
+        task_template,
+        locked_nodes,
+        create_nodes,
+        update_nodes,
+        delete_nodes,
+    ):
+        expected_node_ids = {node.id for node in locked_nodes}
+        current_node_ids = set(
+            TaskNode.objects.filter(task_template=task_template).values_list(
+                "id", flat=True
+            )
+        )
+        if expected_node_ids != current_node_ids:
+            raise PermissionDenied("The task nodes changed concurrently.")
+
+        for node in delete_nodes:
+            node.delete()
+
+        created_nodes = [TaskNode.objects.create(**values) for values in create_nodes]
+
+        for node, changes in update_nodes:
+            for field_name, value in changes.items():
+                setattr(node, field_name, value)
+            node.save(update_fields=[*changes, "updated_at"])
+
+        return (
+            {
+                "created": len(created_nodes),
+                "updated": len(update_nodes),
+                "deleted": len(delete_nodes),
+            },
+            created_nodes,
+        )
+
+    @transaction.atomic
+    def _sync_task_nodes(self, task_template: TaskTemplate, *, user):
+        """Synchronize one template under a stable owner and exact node diff."""
+
+        Folder._lock_folder_tree()
+        locked_template, locked_nodes = self._lock_task_template_graph(task_template)
+
+        self._assert_task_scope_permission(
+            user=user,
+            model=TaskTemplate,
+            folder=locked_template.folder,
+            action="change",
+        )
+        if locked_template.is_recurrent:
+            create_nodes, update_nodes, delete_nodes = (
+                self._recurrent_task_node_sync_plan(
+                    locked_template,
+                    locked_nodes,
                 )
+            )
+        else:
+            create_nodes, update_nodes, delete_nodes = (
+                self._nonrecurrent_task_node_sync_plan(
+                    locked_template,
+                    locked_nodes,
+                )
+            )
 
-                # garbage-collect — only delete untouched nodes
-                TaskNode.objects.filter(
-                    to_delete=True,
-                    task_template=task_template,
-                    status="pending",
-                    due_date=F("scheduled_date"),
-                ).filter(
-                    Q(observation__isnull=True) | Q(observation=""),
-                ).exclude(
-                    evidences__isnull=False,
-                ).exclude(
-                    evidence_revisions__isnull=False,
-                ).delete()
-                # Clear to_delete on surviving nodes
-                TaskNode.objects.filter(
-                    to_delete=True, task_template=task_template
-                ).update(to_delete=False)
+        self._assert_task_node_plan_authority(
+            user=user,
+            locked_nodes=locked_nodes,
+            create_nodes=create_nodes,
+            update_nodes=update_nodes,
+            delete_nodes=delete_nodes,
+            require_complete_visibility=True,
+        )
+        result, _created_nodes = self._apply_task_node_plan(
+            task_template=locked_template,
+            locked_nodes=locked_nodes,
+            create_nodes=create_nodes,
+            update_nodes=update_nodes,
+            delete_nodes=delete_nodes,
+        )
+        return result
 
     @action(
         detail=False,
@@ -21116,9 +24361,15 @@ class TaskTemplateViewSet(ExportMixin, BaseModelViewSet):
             )
         )
 
-    def perform_update(self, serializer):
-        task_template = serializer.save()
-        self._sync_task_nodes(task_template)
+    @action(
+        detail=True,
+        methods=["post"],
+        name="Synchronize task nodes",
+        url_path="sync-task-nodes",
+    )
+    def sync_task_nodes(self, request, pk=None):
+        task_template = self.get_object()
+        return Response(self._sync_task_nodes(task_template, user=request.user))
 
     @action(detail=False, name="Export Tasks with Nodes as Multi-Sheet XLSX")
     def export_xlsx(self, request):
@@ -21131,6 +24382,7 @@ class TaskTemplateViewSet(ExportMixin, BaseModelViewSet):
             )
 
         queryset = self._get_export_queryset()
+        visible_node_ids = self._visible_task_node_ids(request.user)
 
         wb = Workbook()
         wb.remove(wb.active)
@@ -21158,7 +24410,11 @@ class TaskTemplateViewSet(ExportMixin, BaseModelViewSet):
             today = timezone.localdate()
 
             task_nodes = (
-                TaskNode.objects.filter(task_template=obj, due_date__lte=today)
+                TaskNode.objects.filter(
+                    task_template=obj,
+                    id__in=visible_node_ids,
+                    due_date__lte=today,
+                )
                 .select_related("task_template", "task_template__folder")
                 .prefetch_related(
                     "evidences",
@@ -21247,17 +24503,152 @@ class TaskTemplateViewSet(ExportMixin, BaseModelViewSet):
         response["Content-Disposition"] = f'attachment; filename="{filename}"'
         return response
 
+    @transaction.atomic
     def perform_create(self, serializer):
-        super().perform_create(serializer)
-        self._sync_task_nodes(serializer.instance)
+        Folder._lock_folder_tree()
+        tasknode_data = self._tasknode_input_data(serializer)
+
+        instance = serializer.save()
+        locked_template, locked_nodes = self._lock_task_template_graph(instance)
+        serializer.instance = locked_template
+        self._assert_task_scope_permission(
+            user=self.request.user,
+            model=TaskTemplate,
+            folder=locked_template.folder,
+            action="add",
+        )
+
+        if locked_template.is_recurrent:
+            create_nodes, update_nodes, delete_nodes = [], [], []
+        else:
+            create_nodes, update_nodes, delete_nodes = (
+                self._nonrecurrent_task_node_sync_plan(
+                    locked_template,
+                    locked_nodes,
+                    tasknode_data=tasknode_data,
+                )
+            )
+        self._assert_task_node_plan_authority(
+            user=self.request.user,
+            locked_nodes=locked_nodes,
+            create_nodes=create_nodes,
+            update_nodes=update_nodes,
+            delete_nodes=delete_nodes,
+        )
+        self._apply_task_node_plan(
+            task_template=locked_template,
+            locked_nodes=locked_nodes,
+            create_nodes=create_nodes,
+            update_nodes=update_nodes,
+            delete_nodes=delete_nodes,
+        )
+        serializer.context["task_node"] = self._visible_task_node(
+            user=self.request.user,
+            task_template=locked_template,
+        )
+        dispatch_webhook_event(locked_template, "created", serializer=serializer)
+        return locked_template
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        Folder._lock_folder_tree()
+        expected_template = serializer.instance
+        locked_template, locked_nodes = self._lock_task_template_graph(
+            expected_template
+        )
+        original_folder = locked_template.folder
+        was_recurrent = locked_template.is_recurrent
+        tasknode_data = self._tasknode_input_data(serializer)
+
+        self._assert_task_scope_permission(
+            user=self.request.user,
+            model=TaskTemplate,
+            folder=original_folder,
+            action="change",
+        )
+        requested_folder = serializer.validated_data.get("folder", original_folder)
+        target_folder = get_object_or_404(Folder.objects.all(), id=requested_folder.id)
+        if target_folder.id != original_folder.id:
+            self._assert_task_scope_permission(
+                user=self.request.user,
+                model=TaskTemplate,
+                folder=target_folder,
+                action="add",
+            )
+            serializer.validated_data["folder"] = target_folder
+
+        serializer.instance = locked_template
+        updated_template = serializer.save()
+        if updated_template.folder_id != target_folder.id:
+            raise PermissionDenied("The task template owner changed concurrently.")
+
+        if not updated_template.is_recurrent:
+            create_nodes, update_nodes, delete_nodes = (
+                self._nonrecurrent_task_node_sync_plan(
+                    updated_template,
+                    locked_nodes,
+                    tasknode_data=tasknode_data,
+                    force_replace=was_recurrent,
+                )
+            )
+        elif updated_template.folder_id != original_folder.id:
+            create_nodes, delete_nodes = [], []
+            update_nodes = [
+                (node, {"folder": target_folder})
+                for node in locked_nodes
+                if node.folder_id != target_folder.id
+            ]
+        else:
+            create_nodes, update_nodes, delete_nodes = [], [], []
+
+        self._assert_task_node_plan_authority(
+            user=self.request.user,
+            locked_nodes=locked_nodes,
+            create_nodes=create_nodes,
+            update_nodes=update_nodes,
+            delete_nodes=delete_nodes,
+            require_complete_visibility=not updated_template.is_recurrent,
+        )
+        if create_nodes or update_nodes or delete_nodes:
+            self._apply_task_node_plan(
+                task_template=updated_template,
+                locked_nodes=locked_nodes,
+                create_nodes=create_nodes,
+                update_nodes=update_nodes,
+                delete_nodes=delete_nodes,
+            )
+            if (
+                TaskNode.objects.filter(task_template=updated_template)
+                .exclude(folder=updated_template.folder)
+                .exists()
+            ):
+                raise PermissionDenied("The requested task operation is unavailable.")
+
+        serializer.context["task_node"] = self._visible_task_node(
+            user=self.request.user,
+            task_template=updated_template,
+        )
+        dispatch_webhook_event(updated_template, "updated", serializer=serializer)
+        return updated_template
 
     @action(detail=True, name="Get write data")
     def object(self, request, pk):
         serializer_class = self.get_serializer_class(action="update")
-        self._sync_task_nodes(
-            self.get_object()
-        )  # Synchronize task nodes when fetching a task template
-        return Response(serializer_class(super().get_object()).data)
+        task_template = self.get_object()
+        task_node = self._visible_task_node(
+            user=request.user,
+            task_template=task_template,
+        )
+        context = self.get_serializer_context()
+        context["task_node"] = task_node
+        serializer = serializer_class(
+            task_template,
+            context=context,
+        )
+        data = serializer.data
+        if isinstance(serializer, BaseModelSerializer):
+            data = serializer._filter_writable_related_representation(data)
+        return Response(data)
 
     @action(detail=False, name="Get all task template assigned_to actors")
     def assigned_to(self, request):
@@ -21423,11 +24814,15 @@ class TaskTemplateViewSet(ExportMixin, BaseModelViewSet):
             queryset = queryset.filter(
                 applied_controls__id=applied_controls_filter
             ).distinct()
+        queryset = self._annotate_visible_task_node_summary(queryset)
 
         # Prefetch task nodes for the date range (fixes N+1)
+        visible_node_ids = self._visible_task_node_ids(request.user)
         filtered_nodes_qs = TaskNode.objects.filter(
-            due_date__gte=year_start, due_date__lte=year_end
-        ).order_by("due_date")
+            id__in=visible_node_ids,
+            due_date__gte=year_start,
+            due_date__lte=year_end,
+        ).order_by("due_date", "id")
 
         task_templates = queryset.select_related("folder").prefetch_related(
             "assigned_to",
@@ -21445,7 +24840,21 @@ class TaskTemplateViewSet(ExportMixin, BaseModelViewSet):
             tpl_folder_id = str(template.folder.id)
             tpl_folder_name = str(template.folder)
 
-            template_data = TaskTemplateReadSerializer(template).data
+            serializer_context = self.get_serializer_context()
+            serializer_context["authorized_task_node_summary"] = True
+            template_serializer = TaskTemplateReadSerializer(
+                template,
+                context=serializer_context,
+            )
+            template_data = template_serializer.data
+            field_models = self._get_fieldsrelated_map(template_serializer)
+            if field_models:
+                allowed_ids = self._get_accessible_ids_map(set(field_models.values()))
+                template_data = self._filter_related_fields(
+                    template_data,
+                    field_models,
+                    allowed_ids,
+                )
             template_data["schedule"] = template.schedule
 
             # Group prefetched nodes by bucket
@@ -21650,6 +25059,7 @@ class RequirementAssignmentViewSet(BaseModelViewSet):
     permission_overrides = {
         "set_status": "transition_requirementassignment",
         "requirements_list": "view_requirementassignment",
+        "update_requirement_assessment": "core.change_requirementassessment",
     }
 
     model = RequirementAssignment
@@ -21685,7 +25095,10 @@ class RequirementAssignmentViewSet(BaseModelViewSet):
         full_view_ca_ids = get_full_view_compliance_assessment_ids(self.request.user)
         user_actors = Actor.get_all_for_user(self.request.user)
         return (
-            qs.filter(compliance_assessment_id__in=viewable_ca_ids)
+            qs.filter(
+                compliance_assessment_id__in=viewable_ca_ids,
+                folder_id=F("compliance_assessment__folder_id"),
+            )
             .filter(
                 Q(compliance_assessment_id__in=full_view_ca_ids)
                 | Q(actor__in=user_actors)
@@ -21694,6 +25107,291 @@ class RequirementAssignmentViewSet(BaseModelViewSet):
         )
 
     EDITABLE_STATUSES = ("draft", "in_progress")
+    RESPONDENT_EDITABLE_STATUSES = ("in_progress", "changes_requested")
+
+    @staticmethod
+    def _lock_assignment_requirements(
+        compliance_assessment,
+        requirement_assessments,
+        *,
+        assignment_id=None,
+    ):
+        requested_ids = {item.id for item in requirement_assessments}
+        if not requested_ids:
+            return []
+        locked_requirement_assessments = list(
+            RequirementAssessment.objects.select_for_update(of=("self",))
+            .filter(
+                id__in=requested_ids,
+                compliance_assessment_id=compliance_assessment.id,
+                folder_id=compliance_assessment.folder_id,
+            )
+            .order_by("id")
+        )
+        if {item.id for item in locked_requirement_assessments} != requested_ids:
+            raise DRFValidationError(
+                {
+                    "requirement_assessments": "Every requirement assessment must belong to the assignment's compliance assessment."
+                }
+            )
+        conflicting_assignments = RequirementAssignment.objects.filter(
+            compliance_assessment_id=compliance_assessment.id,
+            requirement_assessments__id__in=requested_ids,
+        )
+        if assignment_id is not None:
+            conflicting_assignments = conflicting_assignments.exclude(id=assignment_id)
+        if conflicting_assignments.exists():
+            raise DRFValidationError(
+                {
+                    "requirement_assessments": "Some requirement assessments are already assigned to another assignment."
+                }
+            )
+        return locked_requirement_assessments
+
+    @staticmethod
+    def _lock_assignment_actor_targets(*, user, actors):
+        """Lock and re-authorize every Actor target before assignment save."""
+
+        requested_ids = [actor.id for actor in actors]
+        requested_id_set = set(requested_ids)
+        locked_actors = lock_rows_in_global_model_order({Actor: requested_id_set})[
+            Actor
+        ]
+        visible_ids = set(RoleAssignment.get_viewable_object_ids(user, Actor))
+        if not requested_id_set.issubset(visible_ids):
+            raise PermissionDenied(
+                {"actor": "One or more assignment actors are unavailable."}
+            )
+        return [locked_actors[actor_id] for actor_id in requested_ids]
+
+    @staticmethod
+    def _replace_payload_relation(payload, field_name, related_ids):
+        """Replace one M2M form/JSON value without mutating request.data."""
+
+        values = [str(related_id) for related_id in related_ids]
+        if hasattr(payload, "setlist"):
+            payload.setlist(field_name, values)
+        else:
+            payload[field_name] = values
+
+    @classmethod
+    def _lock_and_preserve_assignment_relations(
+        cls,
+        *,
+        user,
+        assignment,
+        payload,
+        preliminary_data,
+        expected_actor_ids,
+        expected_requirement_assessment_ids,
+    ):
+        """Lock assignment M2M state and retain links hidden from the caller.
+
+        The detail projection deliberately omits independently unauthorized
+        actors and requirement assessments.  A full-form round trip therefore
+        must not interpret their absence as an instruction to revoke an actor
+        or shrink the assigned requirement scope.
+        """
+
+        if "actor" in preliminary_data:
+            actor_through = RequirementAssignment.actor.through
+            discovered_current_ids = set(
+                actor_through.objects.filter(requirementassignment_id=assignment.id)
+                .order_by("actor_id")
+                .values_list("actor_id", flat=True)
+            )
+            requested_actors = list(preliminary_data["actor"])
+            requested_ids = [actor.id for actor in requested_actors]
+            target_ids = discovered_current_ids | set(requested_ids)
+            lock_rows_in_global_model_order({Actor: target_ids})
+            locked_current_ids = set(
+                actor_through.objects.select_for_update()
+                .filter(requirementassignment_id=assignment.id)
+                .order_by("pk")
+                .values_list("actor_id", flat=True)
+            )
+            if locked_current_ids != discovered_current_ids:
+                raise PermissionDenied(
+                    {"actor": "The assignment actors changed concurrently; retry."}
+                )
+            if locked_current_ids != expected_actor_ids:
+                raise PermissionDenied(
+                    {"actor": "The assignment actors changed concurrently; retry."}
+                )
+
+            visible_ids = set(RoleAssignment.get_viewable_object_ids(user, Actor))
+            if (set(requested_ids) - locked_current_ids) - visible_ids:
+                raise PermissionDenied(
+                    {"actor": "One or more assignment actors are unavailable."}
+                )
+            protected_ids = locked_current_ids - visible_ids
+            final_ids = [
+                *dict.fromkeys(requested_ids),
+                *sorted(protected_ids - set(requested_ids), key=str),
+            ]
+            cls._replace_payload_relation(payload, "actor", final_ids)
+
+        if "requirement_assessments" in preliminary_data:
+            requirement_through = RequirementAssignment.requirement_assessments.through
+            discovered_current_ids = set(
+                requirement_through.objects.filter(
+                    requirementassignment_id=assignment.id
+                )
+                .order_by("requirementassessment_id")
+                .values_list("requirementassessment_id", flat=True)
+            )
+            requested_rows = list(preliminary_data["requirement_assessments"])
+            requested_ids = [row.id for row in requested_rows]
+            locked_current_ids = set(
+                requirement_through.objects.select_for_update()
+                .filter(requirementassignment_id=assignment.id)
+                .order_by("pk")
+                .values_list("requirementassessment_id", flat=True)
+            )
+            if locked_current_ids != discovered_current_ids:
+                raise PermissionDenied(
+                    {
+                        "requirement_assessments": (
+                            "The assigned requirements changed concurrently; retry."
+                        )
+                    }
+                )
+            if locked_current_ids != expected_requirement_assessment_ids:
+                raise PermissionDenied(
+                    {
+                        "requirement_assessments": (
+                            "The assigned requirements changed concurrently; retry."
+                        )
+                    }
+                )
+
+            target_ids = locked_current_ids | set(requested_ids)
+            locked_target_ids = set(
+                RequirementAssessment.objects.select_for_update(of=("self",))
+                .filter(id__in=target_ids)
+                .order_by("id")
+                .values_list("id", flat=True)
+            )
+            if locked_target_ids != target_ids:
+                raise PermissionDenied(
+                    {
+                        "requirement_assessments": (
+                            "One or more assigned requirements are unavailable."
+                        )
+                    }
+                )
+            visible_ids = set(
+                RoleAssignment.get_viewable_object_ids(user, RequirementAssessment)
+            )
+            if (set(requested_ids) - locked_current_ids) - visible_ids:
+                raise PermissionDenied(
+                    {
+                        "requirement_assessments": (
+                            "One or more assigned requirements are unavailable."
+                        )
+                    }
+                )
+            protected_ids = locked_current_ids - visible_ids
+            final_ids = [
+                *dict.fromkeys(requested_ids),
+                *sorted(protected_ids - set(requested_ids), key=str),
+            ]
+            cls._replace_payload_relation(
+                payload,
+                "requirement_assessments",
+                final_ids,
+            )
+
+        return payload
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        Folder._lock_folder_tree()
+        requested_assessment = serializer.validated_data["compliance_assessment"]
+        compliance_assessment = get_object_or_404(
+            ComplianceAssessment.objects.select_for_update(of=("self",)),
+            id=requested_assessment.id,
+        )
+        _assert_assessment_mutation_state(compliance_assessment)
+        if not has_full_view_compliance_assessment(
+            self.request.user,
+            compliance_assessment,
+        ):
+            raise PermissionDenied(
+                "You do not have permission to create assignments for this audit."
+            )
+        _assert_folder_action_permission(
+            user=self.request.user,
+            model=RequirementAssignment,
+            folder=compliance_assessment.folder,
+            action="add",
+        )
+
+        locked_actors = self._lock_assignment_actor_targets(
+            user=self.request.user,
+            actors=serializer.validated_data.get("actor", []),
+        )
+        locked_serializer = self.get_serializer(data=serializer.initial_data)
+        locked_serializer.is_valid(raise_exception=True)
+        requested_assessment = locked_serializer.validated_data.get(
+            "compliance_assessment"
+        )
+        if (
+            requested_assessment is None
+            or requested_assessment.id != compliance_assessment.id
+        ):
+            raise PermissionDenied(
+                "The assignment's compliance assessment changed concurrently."
+            )
+
+        requested_folder = locked_serializer.validated_data.get("folder")
+        if (
+            requested_folder is None
+            or requested_folder.id != compliance_assessment.folder_id
+        ):
+            raise DRFValidationError(
+                {
+                    "folder": "The assignment folder must match the compliance assessment folder."
+                }
+            )
+        locked_requirement_assessments = self._lock_assignment_requirements(
+            compliance_assessment,
+            locked_serializer.validated_data.get("requirement_assessments", []),
+        )
+
+        locked_serializer.validated_data["compliance_assessment"] = (
+            compliance_assessment
+        )
+        if "actor" in locked_serializer.validated_data:
+            locked_serializer.validated_data["actor"] = locked_actors
+        if "requirement_assessments" in locked_serializer.validated_data:
+            locked_serializer.validated_data["requirement_assessments"] = (
+                locked_requirement_assessments
+            )
+        result = super().perform_create(locked_serializer)
+        serializer.instance = locked_serializer.instance
+        return result
+
+    @classmethod
+    def _assert_locked_assignment_scope(cls, user, assignment) -> None:
+        """Reprove full-view or actor membership after waiting on the row lock."""
+
+        assert_assignment_folder_owner(assignment)
+        if has_full_view_compliance_assessment(user, assignment.compliance_assessment):
+            return
+        lock_assignment_actor_authority(user=user, assignment=assignment)
+
+    @staticmethod
+    def _assert_assignment_manager(user, assignment) -> None:
+        """Reserve assignment lifecycle/scope changes for full-audit managers."""
+
+        assert_assignment_folder_owner(assignment)
+        if not has_full_view_compliance_assessment(
+            user, assignment.compliance_assessment
+        ):
+            raise PermissionDenied(
+                "Only a full-audit reviewer may change an assignment's scope."
+            )
 
     def update(self, request, *args, **kwargs):
         assignment = self.get_object()
@@ -21713,6 +25411,95 @@ class RequirementAssignmentViewSet(BaseModelViewSet):
             )
         return super().partial_update(request, *args, **kwargs)
 
+    @transaction.atomic
+    def perform_update(self, serializer):
+        Folder._lock_folder_tree()
+        # Capture the exact relation snapshot used by the lock-before DRF
+        # validation.  If a writer changes either set while this request waits
+        # for the authority locks, fail closed instead of applying a stale
+        # full-form replacement to the writer's committed state.
+        expected_actor_ids = {actor.id for actor in serializer.instance.actor.all()}
+        expected_requirement_assessment_ids = {
+            row.id for row in serializer.instance.requirement_assessments.all()
+        }
+        compliance_assessment = get_object_or_404(
+            ComplianceAssessment.objects.select_for_update(of=("self",)),
+            id=serializer.instance.compliance_assessment_id,
+        )
+        _assert_assessment_mutation_state(compliance_assessment)
+        assignment = get_object_or_404(
+            RequirementAssignment.objects.select_for_update(
+                of=("self",)
+            ).select_related("compliance_assessment"),
+            id=serializer.instance.id,
+            compliance_assessment_id=compliance_assessment.id,
+        )
+        assignment.compliance_assessment = compliance_assessment
+        self._assert_assignment_manager(self.request.user, assignment)
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=assignment,
+            action="change",
+        )
+
+        payload = serializer.initial_data.copy()
+        self._lock_and_preserve_assignment_relations(
+            user=self.request.user,
+            assignment=assignment,
+            payload=payload,
+            preliminary_data=serializer.validated_data,
+            expected_actor_ids=expected_actor_ids,
+            expected_requirement_assessment_ids=(expected_requirement_assessment_ids),
+        )
+        locked_serializer = self.get_serializer(
+            assignment,
+            data=payload,
+            partial=serializer.partial,
+        )
+        locked_serializer.is_valid(raise_exception=True)
+        if assignment.status not in self.EDITABLE_STATUSES:
+            raise PermissionDenied(
+                f"Cannot edit an assignment in '{assignment.status}' status."
+            )
+        requested_status = locked_serializer.validated_data.get(
+            "status", assignment.status
+        )
+        if requested_status != assignment.status:
+            raise PermissionDenied(
+                "Assignment status changes must use the reviewed transition endpoint."
+            )
+        requested_assessment = locked_serializer.validated_data.get(
+            "compliance_assessment",
+            compliance_assessment,
+        )
+        requested_folder = locked_serializer.validated_data.get(
+            "folder", assignment.folder
+        )
+        if requested_assessment.id != compliance_assessment.id:
+            raise PermissionDenied(
+                "The assignment's compliance assessment is immutable."
+            )
+        if (
+            assignment.folder_id != compliance_assessment.folder_id
+            or requested_folder.id != assignment.folder_id
+        ):
+            raise PermissionDenied("The assignment's folder is immutable.")
+        if "requirement_assessments" in locked_serializer.validated_data:
+            locked_serializer.validated_data["requirement_assessments"] = (
+                self._lock_assignment_requirements(
+                    compliance_assessment,
+                    locked_serializer.validated_data["requirement_assessments"],
+                    assignment_id=assignment.id,
+                )
+            )
+        if "compliance_assessment" in locked_serializer.validated_data:
+            locked_serializer.validated_data["compliance_assessment"] = (
+                compliance_assessment
+            )
+        result = super().perform_update(locked_serializer)
+        serializer.instance = locked_serializer.instance
+        return result
+
     def destroy(self, request, *args, **kwargs):
         assignment = self.get_object()
         if assignment.status not in self.EDITABLE_STATUSES:
@@ -21721,6 +25508,34 @@ class RequirementAssignmentViewSet(BaseModelViewSet):
                 status=status.HTTP_403_FORBIDDEN,
             )
         return super().destroy(request, *args, **kwargs)
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        Folder._lock_folder_tree()
+        compliance_assessment = get_object_or_404(
+            ComplianceAssessment.objects.select_for_update(of=("self",)),
+            id=instance.compliance_assessment_id,
+        )
+        _assert_assessment_mutation_state(compliance_assessment)
+        locked_instance = get_object_or_404(
+            RequirementAssignment.objects.select_for_update(
+                of=("self",)
+            ).select_related("compliance_assessment"),
+            id=instance.id,
+            compliance_assessment_id=compliance_assessment.id,
+        )
+        locked_instance.compliance_assessment = compliance_assessment
+        self._assert_assignment_manager(self.request.user, locked_instance)
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=locked_instance,
+            action="delete",
+        )
+        if locked_instance.status not in self.EDITABLE_STATUSES:
+            raise PermissionDenied(
+                f"Cannot delete an assignment in '{locked_instance.status}' status."
+            )
+        return super().perform_destroy(locked_instance)
 
     # Valid transitions: (from_status, to_status) → config
     # reviewer_only: respondents are forbidden
@@ -21752,13 +25567,28 @@ class RequirementAssignmentViewSet(BaseModelViewSet):
     }
 
     @action(detail=True, methods=["post"], url_path="set_status")
+    @transaction.atomic
     def set_status(self, request, pk=None):
         """Transition assignment to a new status.
 
         Accepts {"status": "<target_status>", "reviewer_observation": "..."}.
         Valid transitions and their constraints are defined in TRANSITIONS.
         """
-        assignment = self.get_object()
+        Folder._lock_folder_tree()
+        initial_assignment = self.get_object()
+        compliance_assessment = get_object_or_404(
+            ComplianceAssessment.objects.select_for_update(of=("self",)),
+            id=initial_assignment.compliance_assessment_id,
+        )
+        _assert_assessment_mutation_state(compliance_assessment)
+        assignment = get_object_or_404(
+            RequirementAssignment.objects.select_for_update(of=("self",)),
+            id=initial_assignment.id,
+            compliance_assessment_id=compliance_assessment.id,
+        )
+        assignment.compliance_assessment = compliance_assessment
+        assert_assignment_folder_owner(assignment)
+        self.check_object_permissions(request, assignment)
         target = request.data.get("status")
         if not target:
             return Response(
@@ -21787,8 +25617,12 @@ class RequirementAssignmentViewSet(BaseModelViewSet):
 
         # Actor-only check: user must be an assigned actor
         if config.get("actor_only"):
-            user_actors = Actor.get_all_for_user(request.user)
-            if not assignment.actor.filter(id__in=[a.id for a in user_actors]).exists():
+            try:
+                lock_assignment_actor_authority(
+                    user=request.user,
+                    assignment=assignment,
+                )
+            except PermissionDenied:
                 return Response(
                     {"error": "You are not assigned to this assignment."},
                     status=status.HTTP_403_FORBIDDEN,
@@ -21816,16 +25650,23 @@ class RequirementAssignmentViewSet(BaseModelViewSet):
             folder=assignment.folder,
         )
 
-        # Send notification
-        try:
-            self._send_transition_notification(assignment, key, observation or "")
-        except Exception:
-            logger.error(
-                "Failed to send assignment notification",
-                assignment_id=str(assignment.id),
-                transition=f"{key[0]} -> {key[1]}",
-                exc_info=True,
-            )
+        # A rolled-back transition must never emit a state notification.
+        def send_transition_notification_after_commit():
+            try:
+                self._send_transition_notification(
+                    assignment,
+                    key,
+                    observation or "",
+                )
+            except Exception:
+                logger.error(
+                    "Failed to send assignment notification",
+                    assignment_id=str(assignment.id),
+                    transition=f"{key[0]} -> {key[1]}",
+                    exc_info=True,
+                )
+
+        transaction.on_commit(send_transition_notification_after_commit)
 
         return Response({"status": target})
 
@@ -21838,70 +25679,20 @@ class RequirementAssignmentViewSet(BaseModelViewSet):
         """
         assignment = self.get_object()
         compliance_assessment = assignment.compliance_assessment
-        if compliance_assessment.framework_id not in set(
-            RoleAssignment.get_viewable_object_ids(request.user, Framework)
-        ):
-            raise PermissionDenied(
-                "Complete audit data is unavailable for this caller."
-            )
+        scope = self._capture_questionnaire_scope(request.user, assignment)
+        viewer_role = scope.viewer_role
 
-        is_respondent = not has_full_view_compliance_assessment(
-            request.user, compliance_assessment
-        )
-        viewer_role = "respondent" if is_respondent else "auditor"
-        visible_requirement_node_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, RequirementNode
-        )
-
-        assigned_ra_ids = set(
-            assignment.requirement_assessments.values_list("id", flat=True)
-        )
-
-        authorized_ra_ids = get_authorized_requirement_assessment_ids(
-            request.user,
-            compliance_assessment,
-            respondent_scope=is_respondent,
-        )
         requirement_assessments_objects = list(
             compliance_assessment.get_requirement_assessments(
                 include_non_assessable=True,
                 skip_ig_filter=True,
-            )
-            .filter(id__in=assigned_ra_ids)
-            .filter(id__in=authorized_ra_ids)
-            .filter(requirement_id__in=visible_requirement_node_ids)
+            ).filter(id__in=scope.readable_requirement_assessment_ids)
         )
-        if compliance_assessment.selected_implementation_groups:
-            selected_groups = set(compliance_assessment.selected_implementation_groups)
-            requirement_assessments_objects = [
-                ra
-                for ra in requirement_assessments_objects
-                if selected_groups & set(ra.requirement.implementation_groups or [])
-            ]
-
-        # CEL visibility filtering: exclude requirements hidden by visibility_expression
-        from core.cel_service import build_cel_context
-
-        has_cel_visibility = (
-            ComplianceAssessmentViewSet._assert_complete_cel_visibility_access(
-                request.user, compliance_assessment
-            )
-        )
-        if has_cel_visibility:
-            _ctx, hidden_urns = build_cel_context(compliance_assessment)
-        else:
-            hidden_urns = set()
-        if hidden_urns:
-            requirement_assessments_objects = [
-                ra
-                for ra in requirement_assessments_objects
-                if ra.requirement.urn not in hidden_urns
-            ]
 
         requirements_objects = list(
             RequirementNode.objects.filter(
-                framework=compliance_assessment.framework,
-                id__in=visible_requirement_node_ids,
+                id__in=scope.structural_requirement_node_ids,
+                framework_id=scope.framework_id,
             )
             .select_related("framework")
             .prefetch_related(
@@ -21909,12 +25700,6 @@ class RequirementAssignmentViewSet(BaseModelViewSet):
             )
             .order_by(F("order_id").asc(nulls_last=True))
         )
-
-        # Also filter the requirements tree to exclude hidden nodes
-        if hidden_urns:
-            requirements_objects = [
-                n for n in requirements_objects if n.urn not in hidden_urns
-            ]
 
         nodes_by_urn = {node.urn: node for node in requirements_objects}
         for node in requirements_objects:
@@ -21928,27 +25713,48 @@ class RequirementAssignmentViewSet(BaseModelViewSet):
                 if parent:
                     req._parent_requirement_obj = parent
 
+        projection_context = {
+            "viewer_role": viewer_role,
+            "request": request,
+            "requirement_assignment_scope": scope,
+        }
+
         requirement_assessments = RequirementAssessmentReadSerializer(
             requirement_assessments_objects,
             many=True,
-            context={"viewer_role": viewer_role, "request": request},
+            context=projection_context,
         ).data
         requirements = RequirementNodeReadSerializer(
-            requirements_objects, many=True, context={"request": request}
+            requirements_objects, many=True, context=projection_context
         ).data
 
-        # Compute per-RA question counts for question-based progress
+        # Answer-derived aggregates are themselves answer projections.  Only
+        # expose them when field visibility allows answers; object IAM is then
+        # applied by the same scoped counter, so hidden rows neither contribute
+        # nor reveal that a different aggregate exists.
+        project_answer_counts = is_field_visible_to(
+            compliance_assessment,
+            "answers",
+            viewer_role,
+        )
+
+        # Compute per-RA question counts for question-based progress.
         question_counts = {}
-        total_visible_questions = 0
-        total_answered_questions = 0
-        for ra in requirement_assessments_objects:
-            visible, answered = ra.get_visible_questions_counts(user=request.user)
-            question_counts[str(ra.id)] = {
-                "visible_questions": visible,
-                "answered_questions": answered,
-            }
-            total_visible_questions += visible
-            total_answered_questions += answered
+        total_visible_questions = 0 if project_answer_counts else None
+        total_answered_questions = 0 if project_answer_counts else None
+        if project_answer_counts:
+            for ra in requirement_assessments_objects:
+                visible, answered = get_assignment_visible_question_counts(
+                    scope=scope,
+                    user=request.user,
+                    requirement_assessment=ra,
+                )
+                question_counts[str(ra.id)] = {
+                    "visible_questions": visible,
+                    "answered_questions": answered,
+                }
+                total_visible_questions += visible
+                total_answered_questions += answered
 
         for ra_data in requirement_assessments:
             ra_id = str(ra_data["id"])
@@ -21959,6 +25765,9 @@ class RequirementAssignmentViewSet(BaseModelViewSet):
                 ra_data["answered_questions"] = question_counts[ra_id][
                     "answered_questions"
                 ]
+            else:
+                ra_data["visible_questions"] = None
+                ra_data["answered_questions"] = None
 
         return Response(
             {
@@ -21970,6 +25779,184 @@ class RequirementAssignmentViewSet(BaseModelViewSet):
             },
             status=status.HTTP_200_OK,
         )
+
+    @staticmethod
+    def _capture_questionnaire_scope(
+        user,
+        assignment,
+        *,
+        lock_questionnaire_bindings=False,
+        actor_proof=None,
+    ):
+        """Capture the assignment's exact capability, including CEL proof."""
+
+        return capture_assignment_questionnaire_scope(
+            user=user,
+            assignment=assignment,
+            lock_questionnaire_bindings=lock_questionnaire_bindings,
+            actor_proof=actor_proof,
+        )
+
+    @staticmethod
+    def _lock_m2m_links(instance, field_name, *, target_ids=None):
+        """Lock relationship rows without a DISTINCT or nullable outer join."""
+        return _lock_m2m_links(instance, field_name, target_ids=target_ids)
+
+    @classmethod
+    def _preserve_hidden_m2m_links(cls, *, user, instance, payload, respondent_scope):
+        """Keep hidden existing relations while validating requested links."""
+        _preserve_requirement_assessment_m2m_links(
+            user=user,
+            instance=instance,
+            payload=payload,
+            respondent_scope=respondent_scope,
+        )
+
+    @action(
+        detail=True,
+        methods=["patch"],
+        url_path=r"requirement-assessments/(?P<requirement_assessment_id>[^/.]+)",
+    )
+    @transaction.atomic
+    def update_requirement_assessment(
+        self, request, pk=None, requirement_assessment_id=None
+    ):
+        """Update one row through its exact RequirementAssignment capability."""
+
+        Folder._lock_folder_tree()
+        initial_assignment = self.get_object()
+        assignment_id = initial_assignment.id
+        compliance_assessment = get_object_or_404(
+            ComplianceAssessment.objects.select_for_update(of=("self",)),
+            id=initial_assignment.compliance_assessment_id,
+        )
+        assignment = get_object_or_404(
+            RequirementAssignment.objects.select_for_update(of=("self",)),
+            id=assignment_id,
+            compliance_assessment_id=compliance_assessment.id,
+        )
+        assignment.compliance_assessment = compliance_assessment
+        self.check_object_permissions(request, assignment)
+        is_respondent = not has_full_view_compliance_assessment(
+            request.user, compliance_assessment
+        )
+        if is_respondent and assignment.status not in self.RESPONDENT_EDITABLE_STATUSES:
+            raise PermissionDenied(
+                f"Cannot edit an assignment in '{assignment.status}' status."
+            )
+
+        try:
+            requirement_assessment_uuid = UUID(str(requirement_assessment_id))
+        except (TypeError, ValueError) as exc:
+            raise NotFound() from exc
+
+        actor_proof = None
+        if is_respondent:
+            try:
+                actor_proof = lock_assignment_actor_authority(
+                    user=request.user,
+                    assignment=assignment,
+                )
+            except PermissionDenied:
+                raise NotFound()
+        requirement_link_ids = list(
+            self._lock_m2m_links(
+                assignment,
+                "requirement_assessments",
+                target_ids={requirement_assessment_uuid},
+            ).values_list("pk", flat=True)
+        )
+        if not requirement_link_ids:
+            raise NotFound()
+
+        locked_requirement_assessment = get_object_or_404(
+            RequirementAssessment.objects.select_for_update(of=("self",)),
+            id=requirement_assessment_uuid,
+            compliance_assessment_id=compliance_assessment.id,
+        )
+        scope = self._capture_questionnaire_scope(
+            request.user,
+            assignment,
+            lock_questionnaire_bindings=True,
+            actor_proof=actor_proof,
+        )
+        list(
+            Answer.objects.select_for_update(of=("self",)).filter(
+                requirement_assessment_id=locked_requirement_assessment.id
+            )
+        )
+        requirement_assessment = get_object_or_404(
+            RequirementAssessment.objects.select_related(
+                "folder",
+                "compliance_assessment",
+                "compliance_assessment__framework",
+                "compliance_assessment__perimeter",
+                "requirement",
+            ).prefetch_related(
+                "evidences",
+                "applied_controls",
+                "security_exceptions",
+                "answers",
+                "answers__question",
+                "answers__selected_choices",
+                "requirement__questions",
+                "requirement__questions__choices",
+            ),
+            id=locked_requirement_assessment.id,
+            compliance_assessment_id=compliance_assessment.id,
+        )
+        if not scope.allows_requirement_assessment(
+            requirement_assessment, mutable=True
+        ):
+            raise NotFound()
+
+        serializer_context = {
+            "request": request,
+            "viewer_role": scope.viewer_role,
+            "requirement_assignment_scope": scope,
+            "expected_answer_choice_ids": {
+                answer.id: {choice.id for choice in answer.selected_choices.all()}
+                for answer in requirement_assessment.answers.all()
+            },
+        }
+        if not isinstance(request.data, dict):
+            raise DRFValidationError(
+                "The assignment update payload must be a JSON object."
+            )
+        payload = {
+            field_name: value
+            for field_name, value in request.data.items()
+            if field_name in scope.mutable_fields
+        }
+        unsupported_fields = set(request.data) - scope.mutable_fields
+        if unsupported_fields:
+            raise DRFValidationError(
+                {
+                    "fields": (
+                        "The assignment update contains unsupported or "
+                        "non-editable fields: " + ", ".join(sorted(unsupported_fields))
+                    )
+                }
+            )
+        if not payload:
+            raise DRFValidationError(
+                "The assignment update contains no mutable requirement fields."
+            )
+        self._preserve_hidden_m2m_links(
+            user=request.user,
+            instance=requirement_assessment,
+            payload=payload,
+            respondent_scope=is_respondent,
+        )
+        serializer = RequirementAssessmentWriteSerializer(
+            requirement_assessment,
+            data=payload,
+            partial=True,
+            context=serializer_context,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_200_OK)
 
     @staticmethod
     def _send_transition_notification(assignment, transition_key, observation=""):
@@ -22012,11 +25999,70 @@ class QuestionViewSet(BaseModelViewSet):
             .select_related("requirement_node", "requirement_node__framework", "folder")
             .prefetch_related("choices")
         )
+        qs = qs.filter(
+            requirement_node_id__in=RoleAssignment.get_viewable_object_ids(
+                self.request.user,
+                RequirementNode,
+            )
+        )
         # Allow filtering by framework
         framework_id = self.request.query_params.get("framework")
         if framework_id:
             qs = qs.filter(requirement_node__framework_id=framework_id)
         return qs
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        Folder._lock_folder_tree()
+        requested_node = serializer.validated_data.get("requirement_node")
+        if requested_node is None:
+            raise DRFValidationError({"requirement_node": "This field is required."})
+        graph = lock_questionnaire_owner_graph(
+            user=self.request.user,
+            requirement_node_ids={requested_node.id},
+        )
+        locked_node = graph["nodes"][requested_node.id]
+        _assert_folder_action_permission(
+            user=self.request.user,
+            model=Question,
+            folder=locked_node.folder,
+            action="add",
+        )
+        serializer.validated_data["requirement_node"] = locked_node
+        serializer.validated_data["folder"] = locked_node.folder
+        return super().perform_create(serializer)
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        Folder._lock_folder_tree()
+        graph = lock_questionnaire_owner_graph(
+            user=self.request.user,
+            question_ids={instance.id},
+        )
+        locked_question = graph["questions"][instance.id]
+        locked_node = graph["nodes"][locked_question.requirement_node_id]
+        _assert_folder_action_permission(
+            user=self.request.user,
+            model=Question,
+            folder=locked_node.folder,
+            action="delete",
+        )
+        locked_choice_ids = list(
+            QuestionChoice.objects.select_for_update(of=("self",))
+            .filter(question_id=locked_question.id)
+            .order_by("id")
+            .values_list("id", flat=True)
+        )
+        if (
+            Answer.objects.filter(question_id=locked_question.id).exists()
+            or Answer.selected_choices.through.objects.filter(
+                questionchoice_id__in=locked_choice_ids
+            ).exists()
+        ):
+            raise PermissionDenied(
+                "A question used by an assessment cannot be deleted."
+            )
+        return super().perform_destroy(locked_question)
 
 
 class QuestionChoiceViewSet(BaseModelViewSet):
@@ -22030,7 +26076,69 @@ class QuestionChoiceViewSet(BaseModelViewSet):
     ]
 
     def get_queryset(self):
-        return super().get_queryset().select_related("question", "folder")
+        return (
+            super()
+            .get_queryset()
+            .filter(
+                question_id__in=RoleAssignment.get_viewable_object_ids(
+                    self.request.user,
+                    Question,
+                ),
+                question__requirement_node_id__in=(
+                    RoleAssignment.get_viewable_object_ids(
+                        self.request.user,
+                        RequirementNode,
+                    )
+                ),
+            )
+            .select_related("question", "folder")
+        )
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        Folder._lock_folder_tree()
+        requested_question = serializer.validated_data.get("question")
+        if requested_question is None:
+            raise DRFValidationError({"question": "This field is required."})
+        graph = lock_questionnaire_owner_graph(
+            user=self.request.user,
+            question_ids={requested_question.id},
+        )
+        locked_question = graph["questions"][requested_question.id]
+        _assert_folder_action_permission(
+            user=self.request.user,
+            model=QuestionChoice,
+            folder=locked_question.folder,
+            action="add",
+        )
+        serializer.validated_data["question"] = locked_question
+        serializer.validated_data["folder"] = locked_question.folder
+        return super().perform_create(serializer)
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        Folder._lock_folder_tree()
+        graph = lock_questionnaire_owner_graph(
+            user=self.request.user,
+            choice_ids={instance.id},
+        )
+        locked_choice = graph["choices"][instance.id]
+        locked_question = graph["questions"][locked_choice.question_id]
+        _assert_folder_action_permission(
+            user=self.request.user,
+            model=QuestionChoice,
+            folder=locked_question.folder,
+            action="delete",
+        )
+        selected_links = Answer.selected_choices.through.objects.select_for_update()
+        if (
+            Answer.objects.filter(question_id=locked_question.id).exists()
+            or selected_links.filter(questionchoice_id=locked_choice.id).exists()
+        ):
+            raise PermissionDenied(
+                "A choice on a question used by an assessment cannot be deleted."
+            )
+        return super().perform_destroy(locked_choice)
 
 
 class AnswerViewSet(BaseModelViewSet):
@@ -22084,6 +26192,177 @@ class AnswerViewSet(BaseModelViewSet):
             )
             .distinct()
         )
+
+    @staticmethod
+    def _assert_auditor_mutation(user, answer):
+        compliance_assessment = answer.requirement_assessment.compliance_assessment
+        if not has_full_view_compliance_assessment(user, compliance_assessment):
+            raise PermissionDenied(
+                "Respondent answer updates must use an exact requirement-assignment endpoint."
+            )
+        if not is_field_editable_by(compliance_assessment, "answers", "auditor"):
+            raise PermissionDenied("Answers are not editable for this audit.")
+
+    def update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        self._assert_auditor_mutation(request.user, instance)
+        return super().update(request, *args, **kwargs)
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        Folder._lock_folder_tree()
+        source_instance = serializer.instance
+        expected_selected_choice_ids = {
+            choice.id for choice in source_instance.selected_choices.all()
+        }
+        (
+            _locked_requirement_assessment,
+            _locked_question,
+            locked_instance,
+        ) = _lock_answer_questionnaire_for_mutation(
+            source_instance.requirement_assessment,
+            question_id=source_instance.question_id,
+            answer=source_instance,
+        )
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=locked_instance,
+            action="change",
+        )
+        self._assert_auditor_mutation(self.request.user, locked_instance)
+        locked_serializer = self.get_serializer(
+            locked_instance,
+            data=serializer.initial_data,
+            partial=serializer.partial,
+        )
+        locked_serializer.is_valid(raise_exception=True)
+
+        # A writer-first selected-choice change must not be overwritten by a
+        # stale form.  The helper above has already locked the exact question,
+        # all of its choices, the Answer, and its through rows.
+        locked_current_choice_ids = set(
+            Answer.selected_choices.through.objects.filter(
+                answer_id=locked_instance.id
+            ).values_list("questionchoice_id", flat=True)
+        )
+        if locked_current_choice_ids != expected_selected_choice_ids:
+            raise PermissionDenied(
+                "The answer's selected choices changed concurrently; retry."
+            )
+
+        requested_choices = locked_serializer.validated_data.get("_m2m_choices")
+        if requested_choices is not None:
+            visible_choice_ids = set(
+                RoleAssignment.get_viewable_object_ids(
+                    self.request.user, QuestionChoice
+                )
+            )
+            hidden_current_ids = locked_current_choice_ids - visible_choice_ids
+            requested_ids = {choice.id for choice in requested_choices}
+            current_visible_ids = locked_current_choice_ids & visible_choice_ids
+            if (
+                hidden_current_ids
+                and locked_instance.question.type == Question.Type.UNIQUE_CHOICE
+                and requested_ids != current_visible_ids
+            ):
+                raise PermissionDenied(
+                    "A hidden existing choice prevents replacing this unique-choice answer."
+                )
+            final_choice_ids = requested_ids | hidden_current_ids
+            locked_choice_map = {
+                choice.id: choice
+                for choice in QuestionChoice.objects.filter(
+                    id__in=final_choice_ids,
+                    question_id=locked_instance.question_id,
+                ).order_by("id")
+            }
+            if set(locked_choice_map) != final_choice_ids:
+                raise PermissionDenied("One or more selected choices are unavailable.")
+            locked_serializer.validated_data["_m2m_choices"] = [
+                locked_choice_map[choice_id]
+                for choice_id in sorted(final_choice_ids, key=str)
+            ]
+        result = super().perform_update(locked_serializer)
+        serializer.instance = locked_serializer.instance
+        return result
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        Folder._lock_folder_tree()
+        requirement_assessment = serializer.validated_data.get("requirement_assessment")
+        if requirement_assessment is None:
+            return super().perform_create(serializer)
+        question = serializer.validated_data.get("question")
+        if question is None:
+            return super().perform_create(serializer)
+        (
+            locked_requirement_assessment,
+            locked_question,
+            _locked_answer,
+        ) = _lock_answer_questionnaire_for_mutation(
+            requirement_assessment,
+            question_id=question.id,
+        )
+        if not has_full_view_compliance_assessment(
+            self.request.user,
+            locked_requirement_assessment.compliance_assessment,
+        ):
+            raise PermissionDenied(
+                "Respondent answers must use an exact requirement-assignment endpoint."
+            )
+        if not is_field_editable_by(
+            locked_requirement_assessment.compliance_assessment,
+            "answers",
+            "auditor",
+        ):
+            raise PermissionDenied("Answers are not editable for this audit.")
+        _assert_folder_action_permission(
+            user=self.request.user,
+            model=Answer,
+            folder=locked_requirement_assessment.folder,
+            action="add",
+        )
+        locked_serializer = self.get_serializer(data=serializer.initial_data)
+        locked_serializer.is_valid(raise_exception=True)
+        locked_serializer.validated_data["requirement_assessment"] = (
+            locked_requirement_assessment
+        )
+        locked_serializer.validated_data["question"] = locked_question
+        locked_serializer.validated_data["folder"] = (
+            locked_requirement_assessment.folder
+        )
+        result = super().perform_create(locked_serializer)
+        serializer.instance = locked_serializer.instance
+        return result
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        self._assert_auditor_mutation(request.user, instance)
+        return super().destroy(request, *args, **kwargs)
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        Folder._lock_folder_tree()
+        (
+            _locked_requirement_assessment,
+            _locked_question,
+            locked_instance,
+        ) = _lock_answer_questionnaire_for_mutation(
+            instance.requirement_assessment,
+            question_id=instance.question_id,
+            answer=instance,
+        )
+        if locked_instance.question_id not in set(
+            RoleAssignment.get_viewable_object_ids(self.request.user, Question)
+        ):
+            raise PermissionDenied("You do not have permission to access this answer.")
+        _assert_object_action_permission(
+            user=self.request.user,
+            instance=locked_instance,
+            action="delete",
+        )
+        self._assert_auditor_mutation(self.request.user, locked_instance)
+        return super().perform_destroy(locked_instance)
 
 
 # ---------------------------------------------------------------------------

@@ -1174,6 +1174,10 @@ def task_template_per_status(user: User):
     }
     object_ids_view = RoleAssignment.get_viewable_object_ids(user, TaskTemplate)
     viewable_task_templates = TaskTemplate.objects.filter(id__in=object_ids_view)
+    try:
+        visible_task_node_ids = RoleAssignment.get_viewable_object_ids(user, TaskNode)
+    except (NotImplementedError, Permission.DoesNotExist):
+        visible_task_node_ids = TaskNode.objects.none().values_list("id", flat=True)
 
     # Count statuses based on the logic:
     # - If not recurrent: get the status of the node
@@ -1186,7 +1190,11 @@ def task_template_per_status(user: User):
 
     # For recurrent templates, get last occurrence status (most recent past)
     last_occurrence_subq = (
-        TaskNode.objects.filter(task_template=OuterRef("pk"), due_date__lt=today)
+        TaskNode.objects.filter(
+            task_template=OuterRef("pk"),
+            id__in=visible_task_node_ids,
+            due_date__lt=today,
+        )
         .order_by("-due_date")
         .values("status")[:1]
     )
@@ -1199,7 +1207,10 @@ def task_template_per_status(user: User):
 
     # For non-recurrent templates, get the single node's status
     single_node_subq = (
-        TaskNode.objects.filter(task_template=OuterRef("pk"))
+        TaskNode.objects.filter(
+            task_template=OuterRef("pk"),
+            id__in=visible_task_node_ids,
+        )
         .order_by("-due_date")
         .values("status")[:1]
     )

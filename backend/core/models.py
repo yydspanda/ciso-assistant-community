@@ -2,6 +2,9 @@ import json
 import os
 import re
 import hashlib
+import uuid
+from copy import deepcopy
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Self, Union, List, Optional, Literal, Tuple, Final, Iterable
@@ -77,6 +80,45 @@ from . import dora
 from collections import defaultdict, deque
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class BaselineRequirementAssessmentRow:
+    """Immutable scalar and relation values copied from one locked source RA."""
+
+    requirement_id: object
+    result: str
+    status: str
+    score: int | None
+    documentation_score: int | None
+    is_scored: bool
+    is_score_overridden: bool
+    observation: str | None
+    evidence_ids: tuple[object, ...]
+    applied_control_ids: tuple[object, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class BaselineAnswerRow:
+    """Immutable value and selected choices copied from one locked Answer."""
+
+    requirement_id: object
+    question_id: object
+    value: object
+    selected_choice_ids: tuple[object, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ComplianceAssessmentBaselineSnapshot:
+    """Authority-proved, transaction-scoped input to a same-framework clone."""
+
+    baseline_id: object
+    framework_id: object
+    requirements: tuple[object, ...]
+    questions: tuple[object, ...]
+    requirement_assessments: tuple[BaselineRequirementAssessmentRow, ...]
+    answers: tuple[BaselineAnswerRow, ...]
+    snapshot_sha256: str
 
 
 def _truncate_one_decimal(value: float) -> float:
@@ -4453,10 +4495,18 @@ class Asset(
         # ``skip_sync`` lets the inbound pull path write without re-triggering a
         # push (set by the orchestrator's _update_local_object).
         skip_sync = kwargs.pop("skip_sync", False)
-        self.full_clean()
-        super().save(*args, **kwargs)
-        if not skip_sync:
-            self._trigger_sync(is_new=is_new, changed_fields=changed_fields)
+        lock_sync_graph = not skip_sync and self._has_existing_sync_mapping()
+        # The local mutation and its durable integration outbox intent are one
+        # atomic unit.  ``persist_outbound_sync_jobs`` deliberately refuses
+        # autocommit callers so a process crash can never commit the Asset
+        # while losing the corresponding outbound work.
+        with transaction.atomic():
+            if lock_sync_graph:
+                Folder._lock_folder_tree()
+            self.full_clean()
+            super().save(*args, **kwargs)
+            if not skip_sync:
+                self._trigger_sync(is_new=is_new, changed_fields=changed_fields)
 
     def get_security_objectives_comparison(
         self, security_objectives=None, security_capabilities=None
@@ -5831,14 +5881,19 @@ class AppliedControl(
         # at instantiation, so pk is never None even for unsaved rows.
         is_new = self._state.adding
         skip_sync = kwargs.pop("skip_sync", False)
-        super(AppliedControl, self).save(*args, **kwargs)
+        lock_sync_graph = not skip_sync and self._has_existing_sync_mapping()
+        # Persist the business row and the durable integration outbox intent in
+        # the same transaction.  Queue delivery remains an on-commit concern.
+        with transaction.atomic():
+            if lock_sync_graph:
+                Folder._lock_folder_tree()
+            super(AppliedControl, self).save(*args, **kwargs)
 
-        # Then trigger sync (async, non-blocking)
-        if not skip_sync:
-            logger.info(
-                "Triggering sync for AppliedControl", applied_control_id=self.pk
-            )
-            self._trigger_sync(is_new=is_new, changed_fields=changed_fields)
+            if not skip_sync:
+                logger.info(
+                    "Triggering sync for AppliedControl", applied_control_id=self.pk
+                )
+                self._trigger_sync(is_new=is_new, changed_fields=changed_fields)
 
         # Update folder metrics
         from metrology.models import BuiltinMetricSample
@@ -7353,7 +7408,36 @@ class ComplianceAssessment(Assessment):
     scores_definition = models.JSONField(
         blank=True, null=True, verbose_name=_("Score definition")
     )
-    computed_outcome = models.JSONField(null=True, blank=True)
+    # Outcome rules are evaluated by ``core.cel_service``.  This is a derived
+    # carrier, never caller-authored assessment state.
+    computed_outcome = models.JSONField(null=True, blank=True, editable=False)
+
+    # Write-once provenance for a same-framework baseline clone.  UUID
+    # snapshots deliberately survive deletion of the source assessment or the
+    # requesting user; the digest binds the complete locked source graph
+    # without duplicating answer/evidence content into another audit table.
+    baseline_source_assessment_id_snapshot = models.UUIDField(
+        null=True,
+        blank=True,
+        editable=False,
+        db_index=True,
+    )
+    baseline_snapshot_sha256 = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        editable=False,
+    )
+    baseline_copied_by_id_snapshot = models.UUIDField(
+        null=True,
+        blank=True,
+        editable=False,
+    )
+    baseline_copied_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        editable=False,
+    )
 
     assets = models.ManyToManyField(
         Asset,
@@ -7424,6 +7508,62 @@ class ComplianceAssessment(Assessment):
                 "Can view the full auditor view of a compliance assessment (all rows and fields)",
             ),
         ]
+
+    _BASELINE_PROVENANCE_FIELDS = (
+        "baseline_source_assessment_id_snapshot",
+        "baseline_snapshot_sha256",
+        "baseline_copied_by_id_snapshot",
+        "baseline_copied_at",
+    )
+
+    def clean(self):
+        """Keep baseline provenance complete and write-once.
+
+        The public serializer also exposes these fields as read-only.  The
+        model guard protects trusted/internal ``save()`` callers and makes a
+        partially populated provenance tuple invalid rather than ambiguous.
+        Bulk SQL updates remain a privileged maintenance operation and must be
+        governed separately, as with the rest of this model's audit fields.
+        """
+
+        super().clean()
+        provenance = {
+            field_name: getattr(self, field_name)
+            for field_name in self._BASELINE_PROVENANCE_FIELDS
+        }
+        populated = {name for name, value in provenance.items() if value is not None}
+        if populated and populated != set(self._BASELINE_PROVENANCE_FIELDS):
+            raise ValidationError(
+                {"baseline_snapshot_sha256": _("Baseline provenance is incomplete.")}
+            )
+        digest = provenance["baseline_snapshot_sha256"]
+        if digest is not None and not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValidationError(
+                {
+                    "baseline_snapshot_sha256": _(
+                        "Baseline snapshot digest must be a lowercase SHA-256 value."
+                    )
+                }
+            )
+
+        if not self._state.adding and self.pk:
+            stored = (
+                type(self)
+                .objects.filter(pk=self.pk)
+                .values(*self._BASELINE_PROVENANCE_FIELDS)
+                .first()
+            )
+            if stored is not None and any(
+                stored[field_name] != provenance[field_name]
+                for field_name in self._BASELINE_PROVENANCE_FIELDS
+            ):
+                raise ValidationError(
+                    {
+                        "baseline_snapshot_sha256": _(
+                            "Baseline clone provenance is immutable."
+                        )
+                    }
+                )
 
     # --- Visibility-derived booleans ---
     # These mirror legacy boolean fields. Storage is `field_visibility` keyed by
@@ -7551,17 +7691,57 @@ class ComplianceAssessment(Assessment):
         self.upsert_daily_metrics()
 
     def create_requirement_assessments(
-        self, baseline: Self | None = None
+        self,
+        baseline: Self | None = None,
+        *,
+        baseline_snapshot: ComplianceAssessmentBaselineSnapshot | None = None,
     ) -> list["RequirementAssessment"]:
-        # Fetch all requirements in a single query
-        requirements = RequirementNode.objects.filter(
-            framework=self.framework
-        ).select_related()
+        """Create the owned assessment tree, optionally from a baseline.
+
+        Public mutation paths pass ``baseline_snapshot``: its rows and related
+        targets were locked and authority-proved before the target audit was
+        inserted.  The legacy ``baseline`` argument remains for trusted model
+        callers, preserving the upstream API without pretending an unlocked
+        model call has request-user authority.
+        """
+
+        if baseline is not None and baseline_snapshot is not None:
+            raise ValueError("Pass either baseline or baseline_snapshot, not both.")
+        if baseline_snapshot is not None:
+            if not transaction.get_connection().in_atomic_block:
+                raise RuntimeError(
+                    "A baseline snapshot is valid only in its locking transaction."
+                )
+            if baseline_snapshot.framework_id != self.framework_id:
+                raise ValueError("The baseline snapshot belongs to another framework.")
+            requirements = list(baseline_snapshot.requirements)
+            questions = list(baseline_snapshot.questions)
+        else:
+            # Fetch all requirements in a single query
+            requirements = list(
+                RequirementNode.objects.filter(
+                    framework=self.framework
+                ).select_related()
+            )
+            questions = list(
+                Question.objects.filter(
+                    requirement_node__framework=self.framework
+                ).select_related("requirement_node")
+            )
 
         # If there's a baseline, prefetch all related baseline assessments and answers in one query
         baseline_assessments = {}
         baseline_answers = {}
-        if baseline and baseline.framework == self.framework:
+        if baseline_snapshot is not None:
+            baseline_assessments = {
+                row.requirement_id: row
+                for row in baseline_snapshot.requirement_assessments
+            }
+            baseline_answers = {
+                (row.requirement_id, row.question_id): row
+                for row in baseline_snapshot.answers
+            }
+        elif baseline and baseline.framework == self.framework:
             baseline_assessments = {
                 ra.requirement_id: ra
                 for ra in RequirementAssessment.objects.filter(
@@ -7597,10 +7777,6 @@ class ComplianceAssessment(Assessment):
         answers_to_create = []
         # Build a mapping from requirement_id to created assessment
         ra_by_req = {ra.requirement_id: ra for ra in created_assessments}
-        # Prefetch all questions for requirements in this framework
-        questions = Question.objects.filter(
-            requirement_node__framework=self.framework
-        ).select_related("requirement_node")
         for question in questions:
             ra = ra_by_req.get(question.requirement_node_id)
             if ra:
@@ -7610,7 +7786,7 @@ class ComplianceAssessment(Assessment):
                         requirement_assessment=ra,
                         question=question,
                         folder_id=self.folder.id,
-                        value=baseline_ans.value if baseline_ans else None,
+                        value=deepcopy(baseline_ans.value) if baseline_ans else None,
                     )
                 )
         if answers_to_create:
@@ -7626,10 +7802,18 @@ class ComplianceAssessment(Assessment):
                         (ans.requirement_assessment.requirement_id, ans.question_id)
                     )
                     if baseline_ans:
-                        for choice in baseline_ans.selected_choices.all():
+                        choice_ids = (
+                            baseline_ans.selected_choice_ids
+                            if baseline_snapshot is not None
+                            else baseline_ans.selected_choices.values_list(
+                                "id", flat=True
+                            )
+                        )
+                        for choice_id in choice_ids:
                             through_objects.append(
                                 Answer.selected_choices.through(
-                                    answer_id=ans.id, questionchoice_id=choice.id
+                                    answer_id=ans.id,
+                                    questionchoice_id=choice_id,
                                 )
                             )
                 if through_objects:
@@ -7665,8 +7849,16 @@ class ComplianceAssessment(Assessment):
                     m2m_operations.append(
                         (
                             assessment,
-                            baseline_assessment.evidences.all(),
-                            baseline_assessment.applied_controls.all(),
+                            (
+                                baseline_assessment.evidence_ids
+                                if baseline_snapshot is not None
+                                else baseline_assessment.evidences.all()
+                            ),
+                            (
+                                baseline_assessment.applied_control_ids
+                                if baseline_snapshot is not None
+                                else baseline_assessment.applied_controls.all()
+                            ),
                         )
                     )
 
@@ -9197,6 +9389,12 @@ class RequirementAssessment(AbstractBaseModel, FolderMixin, ETADueDateMixin):
     class Meta:
         verbose_name = _("Requirement assessment")
         verbose_name_plural = _("Requirement assessments")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["compliance_assessment", "requirement"],
+                name="uniq_ra_assessment_requirement",
+            )
+        ]
 
     def has_evidence(self) -> bool:
         """
@@ -9709,6 +9907,8 @@ class RequirementAssignmentMailOutbox(AbstractBaseModel, FolderMixin):
         SENDING = "sending", _("Sending")
         DELIVERED = "delivered", _("Delivered")
         FAILED = "failed", _("Failed")
+        UNCERTAIN = "uncertain", _("Uncertain")
+        REVIEW_REQUIRED = "review_required", _("Review required")
 
     assignment = models.ForeignKey(
         RequirementAssignment,
@@ -9743,6 +9943,12 @@ class RequirementAssignmentMailOutbox(AbstractBaseModel, FolderMixin):
 
     class Meta:
         ordering = ["created_at"]
+        permissions = [
+            (
+                "resolve_requirementassignmentmailoutbox",
+                "Can resolve uncertain requirement assignment mail",
+            ),
+        ]
         constraints = [
             models.UniqueConstraint(
                 fields=["assignment", "recipient_actor"],
@@ -9750,7 +9956,14 @@ class RequirementAssignmentMailOutbox(AbstractBaseModel, FolderMixin):
             ),
             models.CheckConstraint(
                 condition=models.Q(
-                    status__in=("queued", "sending", "delivered", "failed")
+                    status__in=(
+                        "queued",
+                        "sending",
+                        "delivered",
+                        "failed",
+                        "uncertain",
+                        "review_required",
+                    )
                 ),
                 name="core_ra_mail_status_valid",
             ),
@@ -9770,6 +9983,94 @@ class RequirementAssignmentMailOutbox(AbstractBaseModel, FolderMixin):
 
     def __str__(self) -> str:
         return f"{self.assignment_id} - {self.status}"
+
+
+class _AppendOnlyRequirementAssignmentMailEvidenceQuerySet(models.QuerySet):
+    """Reject application-level rewrites of retained mail evidence."""
+
+    def update(self, **kwargs):
+        raise ValidationError("Assignment mail evidence cannot be updated.")
+
+    def delete(self):
+        raise ValidationError("Assignment mail evidence cannot be deleted.")
+
+    def bulk_update(self, objs, fields, batch_size=None):
+        raise ValidationError("Assignment mail evidence cannot be updated.")
+
+
+class RequirementAssignmentMailEvidence(models.Model):
+    """Append-only, non-FK snapshots of mail delivery and human decisions.
+
+    The source outbox intentionally still belongs to the assignment lifecycle,
+    but these records do not cascade when an assessment, assignment, folder,
+    actor, or user is removed.  They contain hashes and UUID snapshots only;
+    recipient addresses, rendered bodies, SMTP credentials, and transport
+    errors are deliberately excluded.
+    """
+
+    class Source(models.TextChoices):
+        SYSTEM = "system", _("System")
+        HUMAN = "human", _("Human")
+
+    class Action(models.TextChoices):
+        CONFIRM_DELIVERED = "confirm_delivered", _("Confirm delivered")
+        CONFIRM_NOT_DELIVERED = "confirm_not_delivered", _("Confirm not delivered")
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    outbox_id_snapshot = models.UUIDField(db_index=True, editable=False)
+    assignment_id_snapshot = models.UUIDField(db_index=True, editable=False)
+    folder_id_snapshot = models.UUIDField(editable=False)
+    recipient_actor_id_snapshot = models.UUIDField(
+        null=True, blank=True, editable=False
+    )
+    requested_by_id_snapshot = models.UUIDField(null=True, blank=True, editable=False)
+    recorded_by_id_snapshot = models.UUIDField(null=True, blank=True, editable=False)
+    source = models.CharField(max_length=8, choices=Source.choices, editable=False)
+    prior_status = models.CharField(max_length=16, blank=True, editable=False)
+    status = models.CharField(
+        max_length=16,
+        choices=RequirementAssignmentMailOutbox.Status.choices,
+        editable=False,
+    )
+    action = models.CharField(
+        max_length=32,
+        choices=Action.choices,
+        blank=True,
+        editable=False,
+    )
+    attempts = models.PositiveIntegerField(editable=False)
+    payload_digest = models.CharField(max_length=64, editable=False)
+    recipient_address_hash = models.CharField(max_length=64, editable=False)
+    failure_code = models.CharField(max_length=64, blank=True, editable=False)
+    reason = models.TextField(blank=True, editable=False)
+    evidence_reference = models.CharField(max_length=2048, blank=True, editable=False)
+    record_digest = models.CharField(max_length=64, db_index=True, editable=False)
+    recorded_at = models.DateTimeField(default=timezone.now, editable=False)
+
+    objects = models.Manager.from_queryset(
+        _AppendOnlyRequirementAssignmentMailEvidenceQuerySet
+    )()
+
+    class Meta:
+        ordering = ["recorded_at", "id"]
+        indexes = [
+            models.Index(
+                fields=["assignment_id_snapshot", "recorded_at"],
+                name="core_ra_mail_ev_assignment_idx",
+            ),
+        ]
+        verbose_name = _("Requirement assignment mail evidence")
+        verbose_name_plural = _("Requirement assignment mail evidence")
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError(
+                "Assignment mail evidence is append-only; create a new record."
+            )
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("Assignment mail evidence cannot be deleted.")
 
 
 class Answer(AbstractBaseModel, FolderMixin):
@@ -10381,33 +10682,15 @@ class TaskTemplate(NameDescriptionMixin, FolderMixin, FilteringLabelMixin):
         verbose_name_plural = "Task templates"
 
     def save(self, *args, **kwargs):
-        update_fields = kwargs.get("update_fields")
-        schedule_persisted = update_fields is None or "schedule" in set(update_fields)
-
         if self.schedule and "days_of_week" in self.schedule:
             # Only modify values that are not already in range 0-6
             self.schedule["days_of_week"] = [
                 day % 7 if day > 6 else day for day in self.schedule["days_of_week"]
             ]
-
-        with transaction.atomic():
-            super().save(*args, **kwargs)
-            # Prune untouched pending TaskNodes beyond the end date
-            if schedule_persisted and self.schedule and self.schedule.get("end_date"):
-                end_date = self.schedule["end_date"]
-                end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
-                TaskNode.objects.filter(
-                    task_template=self,
-                    scheduled_date__gt=end_date,
-                    status="pending",
-                    due_date=F("scheduled_date"),
-                ).filter(
-                    Q(observation__isnull=True) | Q(observation=""),
-                ).exclude(
-                    evidences__isnull=False,
-                ).exclude(
-                    evidence_revisions__isnull=False,
-                ).delete()
+        # TaskNode reconciliation is an authority-bearing operation.  It is
+        # deliberately owned by the explicit, permission-checked view action;
+        # model saves (including background/import callers) remain template-only.
+        super().save(*args, **kwargs)
 
 
 class TaskNode(AbstractBaseModel, FolderMixin):

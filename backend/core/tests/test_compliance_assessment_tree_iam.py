@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 from django.contrib.auth.models import Permission
 from django.core.files.base import ContentFile
-from rest_framework.test import APIClient
+from rest_framework.test import APIClient, APIRequestFactory
 
 from core.audit_inheritance import AuditTreeAggregationStrategy
 from core.helpers import annotate_tree_with_coverage
@@ -1397,13 +1397,13 @@ def test_mapping_inference_is_removed_for_respondent_and_canonical_for_auditor(
         {"mapping_inference": forged_update},
         format="json",
     )
-    assert update.status_code == 200, update.content
-    assert "mapping_inference" not in update.json()
+    assert update.status_code == 403, update.content
+    assert b"exact requirement-assignment endpoint" in update.content
     target_ra.refresh_from_db()
     assert target_ra.mapping_inference == raw_inference
 
 
-def test_assignment_requirements_list_uses_exact_full_view_and_crosses_ra_iam(
+def test_assignment_requirements_list_rejects_inconsistent_assessment_owner(
     audit_iam_world,
 ):
     world = audit_iam_world
@@ -1416,11 +1416,8 @@ def test_assignment_requirements_list_uses_exact_full_view_and_crosses_ra_iam(
     respondent_client = _client(world["respondent"])
     url = f"/api/requirement-assignments/{assignment.id}/requirements_list/"
     response = respondent_client.get(url)
-    assert response.status_code == 200, response.content
-    assert response.json()["viewer_role"] == "respondent"
-    assert {item["id"] for item in response.json()["requirement_assessments"]} == {
-        str(world["assigned_ra"].id)
-    }
+    assert response.status_code == 403, response.content
+    assert "inconsistent requirement assessment" in response.json()["detail"]
 
     unrelated = User.objects.create_user("unrelated-assignee@tree-iam.tests")
     unrelated_assignment = RequirementAssignment.objects.create(
@@ -1437,11 +1434,8 @@ def test_assignment_requirements_list_uses_exact_full_view_and_crosses_ra_iam(
     )
 
     auditor_response = _client(world["auditor"]).get(url)
-    assert auditor_response.status_code == 200, auditor_response.content
-    assert auditor_response.json()["viewer_role"] == "auditor"
-    assert {
-        item["id"] for item in auditor_response.json()["requirement_assessments"]
-    } == {str(world["assigned_ra"].id)}
+    assert auditor_response.status_code == 403, auditor_response.content
+    assert "inconsistent requirement assessment" in auditor_response.json()["detail"]
 
 
 def test_framework_report_limits_respondent_to_assigned_rows_and_visible_counts(
@@ -1517,7 +1511,7 @@ def test_global_score_and_donut_apply_independent_field_visibility(
     assert recap.json() == []
 
 
-def test_plain_tree_and_requirement_lists_require_independent_framework_iam(
+def test_plain_tree_requires_framework_iam_but_assignment_uses_exact_capability(
     audit_iam_world,
 ):
     world = audit_iam_world
@@ -1535,11 +1529,17 @@ def test_plain_tree_and_requirement_lists_require_independent_framework_iam(
         ).status_code
         == 403
     )
-    assert (
-        client.get(
-            f"/api/requirement-assignments/{world['assignment'].id}/requirements_list/"
-        ).status_code
-        == 403
+    assignment_response = client.get(
+        f"/api/requirement-assignments/{world['assignment'].id}/requirements_list/"
+    )
+    assert assignment_response.status_code == 200, assignment_response.content
+    assignment_body = assignment_response.json()
+    assert assignment_body["requirement_assessments"]
+    assert all(node["framework"] is None for node in assignment_body["requirements"])
+    assert all(node["folder"] is None for node in assignment_body["requirements"])
+    assert all(
+        row["compliance_assessment"]["framework"] is None
+        for row in assignment_body["requirement_assessments"]
     )
 
     # Hidden scoring does not resolve framework fallback labels, so the
@@ -1700,7 +1700,7 @@ def test_requirement_assessment_and_assignment_list_filter_questionnaire_iam(
         if item["id"] == str(world["assigned_ra"].id)
     )
 
-    def assert_filtered_projection(requirement_data: dict, answers: dict) -> None:
+    def assert_filtered_projection(requirement_data: dict) -> None:
         questions = requirement_data["questions"]
         assert questionnaire["visible_choice_question"].urn in questions
         assert questionnaire["hidden_question"].urn not in questions
@@ -1713,21 +1713,117 @@ def test_requirement_assessment_and_assignment_list_filter_questionnaire_iam(
             choice["urn"] for choice in visible_question["choices"]
         }
 
-        assert answers == {
-            questionnaire["visible_choice_question"].urn: [
-                questionnaire["visible_choice"].urn
-            ]
-        }
-
-    assert_filtered_projection(detail.json()["requirement"], detail.json()["answers"])
-    assert_filtered_projection(listed_requirement, listed_ra["answers"])
-    # Aggregate progress must use the same authorized projection: four of the
-    # five questions are readable, and only the visible choice Answer is both
-    # non-empty and readable. Hidden rows must not leak through counts.
+    assert_filtered_projection(detail.json()["requirement"])
+    assert_filtered_projection(listed_requirement)
+    assert detail.json()["answers"] == {
+        questionnaire["visible_choice_question"].urn: [
+            questionnaire["visible_choice"].urn
+        ]
+    }
+    # The assignment capability does not reinterpret a mixed visible/hidden
+    # selection as a different visible-only answer. It fails that stored answer
+    # closed, and the progress counter consumes the same strict snapshot.
+    assert listed_ra["answers"] == {}
     assert listed_ra["visible_questions"] == 4
-    assert listed_ra["answered_questions"] == 1
+    assert listed_ra["answered_questions"] == 0
     assert assignment_body["total_visible_questions"] == 4
-    assert assignment_body["total_answered_questions"] == 1
+    assert assignment_body["total_answered_questions"] == 0
+
+
+def test_requirement_assessment_answer_projection_batches_iam_and_keeps_detail_fallback(
+    audit_iam_world, monkeypatch
+):
+    from core.serializers import RequirementAssessmentReadSerializer
+
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+
+    request = APIRequestFactory().get("/")
+    request.user = world["respondent"]
+    questionnaire_visibility = (
+        {
+            questionnaire["visible_choice_question"].urn,
+            questionnaire["hidden_answer_question"].urn,
+            questionnaire["unanswered_question"].urn,
+            questionnaire["hidden_choice_write_question"].urn,
+        },
+        {
+            questionnaire["visible_choice_question"].urn: {
+                questionnaire["visible_choice"].urn
+            }
+        },
+    )
+
+    original_get_viewable_object_ids = RoleAssignment.get_viewable_object_ids
+    calls = []
+
+    def counted_get_viewable_object_ids(user, model, folder=None):
+        if model in {Answer, Question, QuestionChoice}:
+            calls.append(model)
+        return original_get_viewable_object_ids(user, model, folder)
+
+    monkeypatch.setattr(
+        RoleAssignment,
+        "get_viewable_object_ids",
+        staticmethod(counted_get_viewable_object_ids),
+    )
+
+    instances = list(
+        RequirementAssessment.objects.filter(
+            id__in=[world["assigned_ra"].id, world["unassigned_ra"].id]
+        ).select_related(
+            "requirement",
+            "compliance_assessment",
+            "compliance_assessment__framework",
+            "compliance_assessment__perimeter",
+        )
+    )
+    rows = RequirementAssessmentReadSerializer(
+        instances,
+        many=True,
+        context={
+            "request": request,
+            "viewer_role": "respondent",
+            "_questionnaire_visibility": questionnaire_visibility,
+        },
+    ).data
+
+    assert len(calls) == 3
+    assert set(calls) == {Answer, Question, QuestionChoice}
+    assert all(
+        hasattr(instance, "_permission_filtered_answers") for instance in instances
+    )
+    assigned_row = next(
+        row for row in rows if row["id"] == str(world["assigned_ra"].id)
+    )
+    assert assigned_row["answers"] == {
+        questionnaire["visible_choice_question"].urn: [
+            questionnaire["visible_choice"].urn
+        ]
+    }
+
+    calls.clear()
+    detail_instance = RequirementAssessment.objects.get(id=world["assigned_ra"].id)
+    detail = RequirementAssessmentReadSerializer(
+        detail_instance,
+        context={
+            "request": request,
+            "viewer_role": "respondent",
+            "_questionnaire_visibility": questionnaire_visibility,
+        },
+    ).data
+    assert len(calls) == 3
+    assert set(calls) == {Answer, Question, QuestionChoice}
+    assert detail["answers"] == assigned_row["answers"]
+
+    calls.clear()
+    requestless_detail = RequirementAssessmentReadSerializer(
+        detail_instance,
+        context={"viewer_role": "respondent"},
+    ).data
+    assert requestless_detail["answers"] == {}
+    assert calls == []
 
 
 def test_answer_api_hides_answer_whose_question_is_not_viewable(audit_iam_world):
@@ -1760,7 +1856,7 @@ def test_answer_api_hides_answer_whose_question_is_not_viewable(audit_iam_world)
     assert hidden_question_detail.status_code == 404
 
 
-def test_legacy_ra_answers_patch_fails_closed_on_hidden_question_choice_and_answer(
+def test_legacy_ra_answers_patch_requires_exact_assignment_endpoint(
     audit_iam_world,
 ):
     world = audit_iam_world
@@ -1774,7 +1870,8 @@ def test_legacy_ra_answers_patch_fails_closed_on_hidden_question_choice_and_answ
         {"answers": {questionnaire["hidden_question"].urn: "forbidden"}},
         format="json",
     )
-    assert hidden_question.status_code == 400, hidden_question.content
+    assert hidden_question.status_code == 403, hidden_question.content
+    assert b"exact requirement-assignment endpoint" in hidden_question.content
 
     hidden_answer = client.patch(
         url,
@@ -1782,8 +1879,9 @@ def test_legacy_ra_answers_patch_fails_closed_on_hidden_question_choice_and_answ
         format="json",
     )
     assert hidden_answer.status_code == 403, hidden_answer.content
+    assert b"exact requirement-assignment endpoint" in hidden_answer.content
 
-    # Reach choice validation without weakening the separate change path.
+    # An ambient add-Answer grant cannot reopen the legacy generic path.
     _grant(
         world["respondent"],
         f"Questionnaire answer creator {uuid.uuid4().hex}",
@@ -1801,14 +1899,15 @@ def test_legacy_ra_answers_patch_fails_closed_on_hidden_question_choice_and_answ
         },
         format="json",
     )
-    assert hidden_choice.status_code == 400, hidden_choice.content
+    assert hidden_choice.status_code == 403, hidden_choice.content
+    assert b"exact requirement-assignment endpoint" in hidden_choice.content
     assert not Answer.objects.filter(
         requirement_assessment=world["assigned_ra"],
         question=questionnaire["hidden_choice_write_question"],
     ).exists()
 
 
-def test_legacy_ra_answers_patch_requires_add_and_change_answer_permissions(
+def test_legacy_ra_answers_patch_cannot_substitute_for_answer_permissions(
     audit_iam_world,
 ):
     world = audit_iam_world
@@ -1823,6 +1922,7 @@ def test_legacy_ra_answers_patch_requires_add_and_change_answer_permissions(
         format="json",
     )
     assert missing_add.status_code == 403, missing_add.content
+    assert b"exact requirement-assignment endpoint" in missing_add.content
     assert not Answer.objects.filter(
         requirement_assessment=world["assigned_ra"],
         question=questionnaire["unanswered_question"],
@@ -1843,6 +1943,7 @@ def test_legacy_ra_answers_patch_requires_add_and_change_answer_permissions(
         format="json",
     )
     assert missing_change.status_code == 403, missing_change.content
+    assert b"exact requirement-assignment endpoint" in missing_change.content
     assert (
         set(
             questionnaire["visible_answer"].selected_choices.values_list(
@@ -1969,12 +2070,37 @@ def test_requirement_suggestions_filter_hidden_reference_and_applied_controls(
         },
         format="json",
     )
-    assert apply_response.status_code == 200, apply_response.content
+    assert apply_response.status_code == 403, apply_response.content
     linked_controls = world["assigned_ra"].applied_controls.all()
     assert hidden_existing_control not in linked_controls
-    assert set(linked_controls.values_list("reference_control_id", flat=True)) == {
-        visible_reference.id
+    assert not linked_controls.exists()
+
+
+def test_requirement_suggestion_mutation_respects_audit_state(audit_iam_world):
+    world = audit_iam_world
+    target = world["target"]
+    target.field_visibility = {
+        **target.field_visibility,
+        "applied_controls": {"auditor": "edit", "respondent": "edit"},
     }
+    target.is_locked = True
+    target.save(update_fields=["field_visibility", "is_locked"])
+    url = (
+        f"/api/requirement-assessments/{world['assigned_ra'].id}/"
+        "suggestions/applied-controls/"
+    )
+    client = _client(world["auditor"])
+
+    locked = client.post(url, {}, format="json")
+    assert locked.status_code == 403, locked.content
+    assert b"audit is locked" in locked.content
+
+    target.is_locked = False
+    target.status = ComplianceAssessment.Status.IN_REVIEW
+    target.save(update_fields=["is_locked", "status"])
+    in_review = client.post(url, {}, format="json")
+    assert in_review.status_code == 403, in_review.content
+    assert b"audit is in review" in in_review.content
 
 
 def test_quality_check_requires_full_view_and_emits_minimal_subjects(

@@ -10,15 +10,21 @@ import uuid
 import pytest
 from django.contrib.auth.models import Permission
 from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import connection
 from django.utils import timezone
+from rest_framework.exceptions import PermissionDenied
 from structlog.testing import capture_logs
 
-from core.assignment_mailing import build_assignment_mail_payload_digest
+from core.assignment_mailing import (
+    build_assignment_mail_payload_digest,
+    resolve_requirement_assignment_mail_outbox,
+)
 from core.models import (
     Actor,
     RequirementAssignment,
     RequirementAssignmentEvent,
+    RequirementAssignmentMailEvidence,
     RequirementAssignmentMailOutbox,
     Team,
 )
@@ -181,7 +187,7 @@ def test_two_author_delivery_failures_are_independent_of_committed_transition(
         for outbox in outboxes
     ]
 
-    assert sorted(results) == ["delivered", "failed"]
+    assert sorted(results) == ["delivered", "uncertain"]
     mailing_world["assignment"].refresh_from_db()
     assert (
         mailing_world["assignment"].status == RequirementAssignment.Status.IN_PROGRESS
@@ -198,12 +204,12 @@ def test_two_author_delivery_failures_are_independent_of_committed_transition(
     )
     assert statuses == {
         RequirementAssignmentMailOutbox.Status.DELIVERED,
-        RequirementAssignmentMailOutbox.Status.FAILED,
+        RequirementAssignmentMailOutbox.Status.UNCERTAIN,
     }
-    failed = RequirementAssignmentMailOutbox.objects.get(
-        status=RequirementAssignmentMailOutbox.Status.FAILED
+    uncertain = RequirementAssignmentMailOutbox.objects.get(
+        status=RequirementAssignmentMailOutbox.Status.UNCERTAIN
     )
-    assert failed.failure_code == "delivery_error"
+    assert uncertain.failure_code == "smtp_outcome_unknown"
     assert calls == [outbox.recipient_actor.user_id for outbox in outboxes]
     assert second_author.id in calls
 
@@ -352,7 +358,7 @@ def test_ambiguous_smtp_failure_is_terminal_and_never_swept_for_retry(
         raise RuntimeError("SMTP acceptance outcome is unknown")
 
     monkeypatch.setattr(User, "mailing", ambiguous_failure)
-    assert deliver_requirement_assignment_mail.call_local(str(outbox.id)) == "failed"
+    assert deliver_requirement_assignment_mail.call_local(str(outbox.id)) == "uncertain"
     assert deliver_requirement_assignment_mail.call_local(str(outbox.id)) == "noop"
 
     swept = []
@@ -364,8 +370,8 @@ def test_ambiguous_smtp_failure_is_terminal_and_never_swept_for_retry(
     outbox.refresh_from_db()
     assert smtp_calls == [mailing_world["author"].id]
     assert swept == []
-    assert outbox.status == RequirementAssignmentMailOutbox.Status.FAILED
-    assert outbox.failure_code == "delivery_error"
+    assert outbox.status == RequirementAssignmentMailOutbox.Status.UNCERTAIN
+    assert outbox.failure_code == "smtp_outcome_unknown"
 
 
 @pytest.mark.parametrize("primary_outcome", ["exception", "rejected"])
@@ -409,12 +415,26 @@ def test_worker_never_falls_back_to_rescue_after_primary_smtp_failure(
     )
     monkeypatch.setattr("iam.models.get_connection", get_connection_once)
 
-    assert deliver_requirement_assignment_mail.call_local(str(outbox.id)) == "failed"
+    expected_result = "uncertain" if primary_outcome == "exception" else "failed"
+    expected_status = (
+        RequirementAssignmentMailOutbox.Status.UNCERTAIN
+        if primary_outcome == "exception"
+        else RequirementAssignmentMailOutbox.Status.FAILED
+    )
+    expected_code = (
+        "smtp_outcome_unknown"
+        if primary_outcome == "exception"
+        else "delivery_not_confirmed"
+    )
+    assert (
+        deliver_requirement_assignment_mail.call_local(str(outbox.id))
+        == expected_result
+    )
     outbox.refresh_from_db()
     assert len(connection_attempts) == 1
     assert "host" not in connection_attempts[0]
-    assert outbox.status == RequirementAssignmentMailOutbox.Status.FAILED
-    assert outbox.failure_code == "delivery_error"
+    assert outbox.status == expected_status
+    assert outbox.failure_code == expected_code
 
 
 def test_worker_redacts_recipient_and_transport_details_from_logs(
@@ -462,7 +482,7 @@ def test_worker_redacts_recipient_and_transport_details_from_logs(
     with capture_logs() as logs:
         result = deliver_requirement_assignment_mail.call_local(str(outbox.id))
 
-    assert result == "failed"
+    assert result == "uncertain"
     serialized_logs = json.dumps(logs, default=str)
     for private_value in (
         mailing_world["author"].email,
@@ -494,7 +514,7 @@ def test_worker_redacts_recipient_and_transport_details_from_logs(
         for item in logs
         if item.get("event") == "requirement_assignment_mail_delivery_failed"
     )
-    assert outbox_failure["failure_code"] == "delivery_error"
+    assert outbox_failure["failure_code"] == "smtp_outcome_unknown"
     assert outbox_failure["error_type"] == "RuntimeError"
 
 
@@ -744,7 +764,7 @@ def test_periodic_sweeper_fails_stale_claim_without_automatic_redelivery(
 
     assert sweep_requirement_assignment_mail_outbox.call_local() == 0
     outbox.refresh_from_db()
-    assert outbox.status == RequirementAssignmentMailOutbox.Status.FAILED
+    assert outbox.status == RequirementAssignmentMailOutbox.Status.REVIEW_REQUIRED
     assert outbox.failure_code == "claim_timeout"
     assert outbox.failed_at is not None
     assert enqueued == []
@@ -817,6 +837,65 @@ def test_changed_recipient_rejects_stale_unique_intent_instead_of_silent_noop(
     assert not RequirementAssignmentEvent.objects.filter(
         assignment=mailing_world["assignment"]
     ).exists()
+
+
+def test_queue_rejects_existing_intent_outside_the_assignment_folder(
+    mailing_world, monkeypatch
+):
+    recipient = mailing_world["author"].email.strip().casefold()
+    recipient_hash = hashlib.sha256(recipient.encode("utf-8")).hexdigest()
+    digest = build_assignment_mail_payload_digest(
+        compliance_assessment_id=mailing_world["target"].id,
+        assignment_id=mailing_world["assignment"].id,
+        recipient_actor_id=mailing_world["author_actor"].id,
+        recipient_address_hash=recipient_hash,
+    )
+    outbox = RequirementAssignmentMailOutbox.objects.create(
+        assignment=mailing_world["assignment"],
+        recipient_actor=mailing_world["author_actor"],
+        requested_by=mailing_world["auditor"],
+        folder=mailing_world["hidden_folder"],
+        payload_digest=digest,
+        recipient_address_hash=recipient_hash,
+    )
+    monkeypatch.setattr(
+        "core.assignment_mailing.enqueue_requirement_assignment_mail_jobs",
+        lambda ids: pytest.fail("tainted intent was enqueued"),
+    )
+
+    response = _client(mailing_world["auditor"]).post(
+        _mail_url(mailing_world), {}, format="json"
+    )
+
+    assert response.status_code == 400, response.content
+    mailing_world["assignment"].refresh_from_db()
+    outbox.refresh_from_db()
+    assert mailing_world["assignment"].status == RequirementAssignment.Status.DRAFT
+    assert outbox.status == RequirementAssignmentMailOutbox.Status.QUEUED
+    assert not RequirementAssignmentEvent.objects.filter(
+        assignment=mailing_world["assignment"]
+    ).exists()
+
+
+def test_worker_fails_closed_when_outbox_folder_drifted(
+    mailing_world, monkeypatch, django_capture_on_commit_callbacks
+):
+    response, _ = _queue(mailing_world, monkeypatch, django_capture_on_commit_callbacks)
+    assert response.status_code == 200, response.content
+    outbox = RequirementAssignmentMailOutbox.objects.get()
+    RequirementAssignmentMailOutbox.objects.filter(id=outbox.id).update(
+        folder=mailing_world["hidden_folder"]
+    )
+    monkeypatch.setattr(
+        User,
+        "mailing",
+        lambda *args, **kwargs: pytest.fail("tainted outbox reached SMTP"),
+    )
+
+    assert deliver_requirement_assignment_mail.call_local(str(outbox.id)) == "failed"
+    outbox.refresh_from_db()
+    assert outbox.status == RequirementAssignmentMailOutbox.Status.FAILED
+    assert outbox.failure_code == "outbox_folder_mismatch"
 
 
 def test_user_mailing_returns_false_for_an_intentionally_disabled_template(
