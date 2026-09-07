@@ -1,7 +1,7 @@
 # China Financial GRC Delivery Roadmap / 中国金融 GRC 交付路线
 
 > Status: **Authoritative / 权威阶段顺序**
-> Updated: **2026-08-26**
+> Updated: **2026-09-07**
 
 This document owns product outcomes, phase order, dependencies, and entry/exit
 gates. `documentation/china-financial-grc/` owns target design and regulatory
@@ -105,6 +105,7 @@ scope or change the phase gates.
 | `CFGRC-GOV-LEDGER` | `CFGRC-P1` | Cross-cutting delivery governance | Keep one current pointer, a bounded active ledger, and canonical monthly archives. |
 | `CFGRC-GOV-UPSTREAM` | `CFGRC-P1` | Cross-cutting fork governance | Measure freshly fetched upstream divergence and surface warning/failure thresholds without changing upstream source. |
 | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | `CFGRC-P1` | Cross-cutting fork governance | Reconcile a measured upstream warning in a dedicated clean change with proportional regression evidence. |
+| `CFGRC-GOV-PLATFORM-AUTHORITY` | `CFGRC-P1` | Cross-cutting platform governance | Preserve and harden existing IAM, aggregate-deletion, external-effect, audit-lineage, and frontend/API authority boundaries without creating parallel platform owners. |
 
 ## Phase 0 — foundation
 

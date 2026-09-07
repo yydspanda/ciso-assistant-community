@@ -1,8 +1,8 @@
 # China Financial GRC Progress Ledger / 中国金融 GRC 进度台账
 
 > Status: **Authoritative current execution record / 权威当前执行记录**
-> Updated: **2026-08-28**
-> Branch: `agent/cfgrc-upstream-reconciliation-20260827`
+> Updated: **2026-09-07**
+> Branch: `agent/cfgrc-platform-authority-preservation-20260907`
 
 This file is the bounded current dashboard: one stage pointer, one active task,
 current facts, risks, one next action, and recent links. The roadmap owns stable
@@ -12,7 +12,7 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 ## Current pointer
 
 - Current Stage: `CFGRC-P1` — one-entity regulatory register
-- In Progress Task: `CFGRC-GOV-UPSTREAM-RECONCILIATION` — reconcile the measured upstream warning in a dedicated clean change
+- In Progress Task: `CFGRC-GOV-PLATFORM-AUTHORITY` — preserve and replay platform authority boundaries without replacing upstream owners
 - Roadmap: [`delivery-roadmap.md`](delivery-roadmap.md)
 
 ## Current status
@@ -26,8 +26,9 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | Regulatory content | The public source seed remains metadata-only and legally unreviewed; no real institution profile or reviewed pilot source set exists. |
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
 | Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
+| Platform authority preservation | Six ordered commits preserve shared core, IAM/SCIM/service-account, TPRM deletion, integration reconciliation, frontend, and old-base migration work on an isolated branch. The snapshot is locally tested but is not a release candidate until it is replayed against the reconciled upstream tree. |
 | Production acceptance | Legal, privacy, security, records, audit, operations, and production acceptance have not been performed. |
-| Hosted project governance | PRs #1-#3 landed through protected `main`; PR #4 is the active upstream-reconciliation candidate. Its first complete updated-head matrix exposed bounded API-contract and frontend-locator defects; the local remediation is committed and awaiting an exact-head rerun. The active no-bypass ruleset has no bypass actors, requires the GitHub-Actions-sourced `validate-project-governance` check, and keeps the weekly read-only upstream monitor explicitly enabled. |
+| Hosted project governance | PRs #1-#3 landed through protected `main`. PR #4 remains open at exact head `122e5d6963235a47a823bca90aa65c8b78ae7cf0`; its last observed matrix has 165 successful and nine failed checks and is `UNSTABLE`. The separate preservation branch is not attached to that PR. The no-bypass ruleset and weekly read-only upstream monitor remain the merge authority. |
 
 ## Current verification summary
 
@@ -35,6 +36,23 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   [`progress-archive/2026-08.md`](progress-archive/2026-08.md), including exact
   commands, test counts, residual gates, PostgreSQL fingerprints, and evidence
   digests.
+- The 2026-09 preservation checkpoint is recorded in
+  [`progress-archive/2026-09.md`](progress-archive/2026-09.md). The frozen code
+  head is `b4a40155de251060bfc67be851109144aff95d9c`; focused deletion tests passed
+  68 tests plus 31 subtests, and the complete scoped SCIM/service-account run
+  passed 97 tests after two independent reviews drove the final fixes.
+- Frontend validation for the preserved contracts passed 25 test files and 305
+  tests. The full Svelte check remained nonzero at the historical project
+  baseline scale (2387 errors, 821 warnings, 507 files), while improving by nine
+  errors and one file from the previously recorded baseline; it is not claimed
+  as a green type gate. No live Playwright/browser run was performed.
+- A fresh canonical fetch on 2026-09-07 resolved upstream to
+  `e3b3105df6bd4989e2af170813f80c51627ce3e1`. The frozen preservation code head
+  is 34 commits ahead and 41 behind. A merge-tree of the pre-preservation base
+  against that upstream found nine conflicted paths (four backend and five
+  frontend), in addition to material TPRM shared-enclave, SCIM/JIT, and
+  migration-lineage conflicts. The old-base changes therefore require
+  contract-level replay rather than a wholesale merge or cherry-pick.
 - The latest local PostgreSQL slice passed the isolated PostgreSQL 16.11 harness,
   80 regulatory tests, migration/drift/rollback checks, bounded role probes,
   synthetic backup/restore equality, and a restored successor write. This is
@@ -45,11 +63,11 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   tests, an 8 GB production build, zero scoped type diagnostics, and two focused
   backend invalid-recorded-time API tests. The 320 px browser reflow gate is
   authored but was not executed against a live stack.
-- Before hosted activation, the project-governance validator passed with six
-  stages, 20 roadmap tasks, one matching active task, ten recent links, and 12
-  archived records; all 49 governance mutation tests and all nine upstream-
-  checker tests passed locally. The archive now contains 14 completed records
-  and must pass the same gate after this update.
+- The current project-governance gate passes with six stages, 22 roadmap tasks,
+  one matching active task, ten recent links, 15 archived records, zero
+  experiments, and 286 progress lines. Governance/upstream tests passed 58
+  tests plus 55 subtests; artifact validation and its 25 tests plus 12 subtests
+  also pass.
 - Earlier hosted PR #1 runs passed `validate-project-governance`, the PostgreSQL
   synthetic technical acceptance, backend Ruff, frontend unit/coverage/lint,
   migration, startup, and multiple functional checks. The default-branch manual
@@ -162,13 +180,11 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 9. **Only local synthetic PostgreSQL evidence exists.** Representative plans,
    complete upstream-table privileges, production topology, monitoring,
    encryption/key custody, PITR/RPO/RTO, and operations approval remain open.
-10. **The local drift gate is restored; hosted merge authority remains.** The
-    mandatory pre-push fetch on 2026-08-28 resolved canonical upstream to
-    `b38b72d8f` and fork `main` to `d1ff1e461`. Pure merge `76f96a844` makes the
-    current code tree 27 ahead / 0 behind; this factual ledger commit makes the
-    updated PR candidate 28 ahead / 0 behind. The task remains active until that
-    exact branch passes the full protected-PR matrix and lands without bypass.
-    The weekly monitor must keep measuring a freshly fetched remote after merge.
+10. **Fresh upstream divergence is above the failure threshold.** The explicit
+    2026-09-07 fetch resolved canonical upstream to `e3b3105df6bd4989e2af170813f80c51627ce3e1`.
+    The frozen preservation code head is 34 ahead / 41 behind, so the 20-behind
+    gate correctly fails. No source rewrite or hidden merge was used to make the
+    count green; weekly monitoring must continue from freshly fetched refs.
 11. **Inherited workflow activation still needs an owner policy.** Opening PR #1
     registered inherited validation workflows as well as the three fork jobs.
     The write-scoped CLA and OIDC/security-events Plumber workflows were
@@ -198,25 +214,32 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
     required ruleset check and must not be made green by fabricating an upstream
     version file. A separate CI-owner change should retire or correctly scope it;
     the exact updated reconciliation head still requires every job it triggers.
+16. **The preservation branch is deliberately old-base and non-releasable.**
+    Upstream now shares one TPRM enclave across assessment revisions and adds
+    SCIM/JIT changes and conflicting migration leaves. The preserved tree fails
+    closed for non-exclusive enclaves but does not implement surviving-revision
+    IAM union semantics. Core and IAM migration drafts are quarantined and must
+    be renumbered/rebuilt after reconciliation; PostgreSQL concurrency, live
+    workers/SMTP, external connectors, and browser acceptance remain unrun.
 
 ## Current next action
 
-Complete the upstream-reconciliation task without bypassing the protected-main
-gate: commit and push this factual validation update, then monitor every job
-triggered for the exact updated PR #4 head. Investigate and remediate any
-candidate failure; merge only when the required governance check and the
-complete current-head matrix pass under the no-bypass ruleset. Re-fetch and
-remeasure canonical upstream before merge if it advances. Do not mix target-
-environment work or new product features into this reconciliation. After
-protected merge, add the canonical completed record and return the product
-pointer to `CFGRC-P1-TARGET-ACCEPTANCE`; that charter remains blocked on named
-operations, security, privacy, records, legal, and audit owners.
+Resume PR #4 from its exact clean branch and remediate the nine hosted failures
+without importing the preservation commits. Re-fetch canonical upstream,
+prepare compatibility fixes until an independent merge-tree is clean, then use
+a pure two-parent upstream merge and protected CI. Only after that merge lands,
+replay the six preservation commits contract-by-contract in this order: shared
+core; IAM/SCIM/service identity; upstream shared-enclave TPRM; integrations;
+frontend; regenerated migrations. Do not cherry-pick the old TPRM or quarantined
+migration commits wholesale, and do not mix target-environment or new regulatory
+scope into the reconciliation.
 
 ## Active task board
 
 | Task ID | Priority | Slice | Dependency | State |
 | --- | --- | --- | --- | --- |
-| `CFGRC-GOV-UPSTREAM-RECONCILIATION` | P0 | Dedicated reconciliation of the fresh-fetch 22-behind failure | Clean branch after PR #3, fresh canonical fetch, conflict review, proportional regression, protected-main PR | In Progress |
+| `CFGRC-GOV-PLATFORM-AUTHORITY` | P0 | Preserve and replay platform IAM, aggregate, external-effect, audit-lineage, and frontend/API authority contracts | Clean upstream reconciliation, shared-enclave/JIT composition, regenerated migrations, proportional regression | In Progress |
+| `CFGRC-GOV-UPSTREAM-RECONCILIATION` | P0 | Dedicated reconciliation of the fresh-fetch 41-behind failure | Exact clean PR #4 branch, compatibility fixes, pure merge, protected-main CI | Pending clean resume |
 | `CFGRC-P1-TARGET-ACCEPTANCE` | P0 | Versioned target-environment charter, representative plans, PITR/RPO/RTO, role integration, retention, and audit-export acceptance | Named operations/security/privacy/records/legal owners | Pending external owners |
 | `CFGRC-P1-SUPERSESSION` | P0 | Source/legal-version supersession | Reviewed source evidence and legal lifecycle contract | Pending |
 | `CFGRC-P1-PILOT-CHARTER` | P0 | Real-pilot ownership charter | Accountable business/legal/content-rights/privacy/security/product owners | Blocked on external ownership |
@@ -232,6 +255,7 @@ the ten most recent records and does not duplicate their evidence.
 
 | Completed | Record | Task IDs | Result |
 | --- | --- | --- | --- |
+| 2026-09-07 | [CFGRC-REC-20260907-01](progress-archive/2026-09.md#cfgrc-rec-20260907-01) | `CFGRC-GOV-PLATFORM-AUTHORITY` | Old-base authority work preserved in six isolated commits with explicit replay gates. |
 | 2026-08-27 | [CFGRC-REC-20260827-01](progress-archive/2026-08.md#cfgrc-rec-20260827-01) | `CFGRC-P1-READ-REVIEW` | Regulatory audit events isolated from generic workflows without weakening auditlog. |
 | 2026-08-26 | [CFGRC-REC-20260826-04](progress-archive/2026-08.md#cfgrc-rec-20260826-04) | `CFGRC-GOV-LEDGER`, `CFGRC-GOV-UPSTREAM` | Protected-main ruleset and hosted governance/upstream checks activated with retained run evidence. |
 | 2026-08-26 | [CFGRC-REC-20260826-03](progress-archive/2026-08.md#cfgrc-rec-20260826-03) | `CFGRC-P1-READ-REVIEW` | Read-only regulatory register/viewer implemented with fail-closed temporal, metadata, IAM, and non-binding presentation contracts. |
@@ -241,7 +265,6 @@ the ten most recent records and does not duplicate their evidence.
 | 2026-08-24 | [CFGRC-REC-20260824-04](progress-archive/2026-08.md#cfgrc-rec-20260824-04) | `CFGRC-P1-REVIEW-DISPOSITION` | Bounded applicability review disposition implemented. |
 | 2026-08-24 | [CFGRC-REC-20260824-03](progress-archive/2026-08.md#cfgrc-rec-20260824-03) | `CFGRC-P1-REVIEW-DISPOSITION-DESIGN` | Review-disposition architecture accepted. |
 | 2026-08-24 | [CFGRC-REC-20260824-02](progress-archive/2026-08.md#cfgrc-rec-20260824-02) | `CFGRC-P1-APPLICABILITY` | Bounded synthetic applicability persistence verified. |
-| 2026-08-24 | [CFGRC-REC-20260824-01](progress-archive/2026-08.md#cfgrc-rec-20260824-01) | `CFGRC-P1-TEMPORAL-CORRECTION` | Controlled recorded-time correction and historical reads verified. |
 
 ## Ledger update rules
 
