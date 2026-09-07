@@ -7,6 +7,8 @@ assert that Jira's AppliedControl defaults do NOT leak into other models.
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from integrations.itsm.jira.integration import JiraOrchestrator
 from integrations.itsm.jira.mapper import JiraFieldMapper
 from integrations.itsm.servicenow.client import ServiceNowClient
@@ -16,6 +18,7 @@ from integrations.itsm.servicenow.mapper import ServiceNowFieldMapper
 def _config(settings):
     cfg = MagicMock()
     cfg.settings = settings
+    cfg.provider.name = "servicenow"
     return cfg
 
 
@@ -54,6 +57,75 @@ def test_servicenow_asset_to_local_reverses_value_map():
     local = mapper.to_local({"fields": {"u_name": "DB-1", "u_type": "primary"}})
     assert local["name"] == "DB-1"
     assert local["type"] == "PR"
+
+
+def test_servicenow_mapper_rejects_non_public_local_field():
+    settings = {
+        "models": {
+            "asset": {
+                "table_name": "cmdb_ci",
+                "field_map": {"folder_id": "u_internal_owner"},
+            }
+        }
+    }
+    mapper = ServiceNowFieldMapper(_config(settings), "asset")
+
+    with pytest.raises(ValueError, match="governed schema"):
+        mapper.to_remote(_asset(folder_id="internal-folder"))
+
+
+def test_mapper_rejects_ambiguous_duplicate_remote_targets():
+    settings = {
+        "models": {
+            "asset": {
+                "table_name": "cmdb_ci",
+                "field_map": {"name": "u_value", "description": "u_value"},
+            }
+        }
+    }
+    mapper = ServiceNowFieldMapper(_config(settings), "asset")
+
+    with pytest.raises(ValueError, match="governed schema"):
+        mapper.to_local({"fields": {"u_value": "ambiguous"}})
+
+
+def test_remote_snapshot_is_minimized_and_bound_to_identity_and_version():
+    orchestrator = JiraOrchestrator(
+        _config(
+            {
+                "models": {
+                    "asset": {
+                        "table_name": "PROJ:Asset",
+                        "field_map": {"name": "summary"},
+                    }
+                }
+            }
+        )
+    )
+    orchestrator.configuration.provider.name = "jira"
+    remote_data = {
+        "key": "PROJ-1",
+        "updated": "2026-09-07T00:00:00Z",
+        "fields": {"summary": "DB-1", "private_customer_data": "drop-me"},
+    }
+
+    assert orchestrator.validate_remote_snapshot(
+        model_key="asset", remote_id="PROJ-1", remote_data=remote_data
+    ) == {
+        "key": "PROJ-1",
+        "updated": "2026-09-07T00:00:00Z",
+        "fields": {"summary": "DB-1"},
+    }
+    with pytest.raises(ValueError, match="different object"):
+        orchestrator.validate_remote_snapshot(
+            model_key="asset", remote_id="PROJ-2", remote_data=remote_data
+        )
+    with pytest.raises(ValueError, match="valid version"):
+        orchestrator.validate_remote_snapshot(
+            model_key="asset",
+            remote_id="PROJ-1",
+            remote_data={**remote_data, "updated": None},
+        )
 
 
 def test_jira_asset_to_remote_uses_value_map():

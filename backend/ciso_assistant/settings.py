@@ -9,17 +9,19 @@ else it is sqlite, and no env variable is required
 
 """
 
-from pathlib import Path
-import os
-from dotenv import load_dotenv
-from datetime import timedelta
+import json
 import logging.config
+import os
+import ssl
+from datetime import timedelta
+from pathlib import Path
+
 import structlog
 from django.core.exceptions import ImproperlyConfigured
 from django.core.management.utils import get_random_secret_key
-import ssl
-from . import meta
+from dotenv import load_dotenv
 
+from . import meta
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(os.getenv("DJANGO_BASE_DIR", Path(__file__).resolve().parent.parent))
@@ -172,6 +174,55 @@ logger.info("SCHEMA_VERSION: %s", SCHEMA_VERSION)
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", get_random_secret_key())
+
+# Durable integration capabilities have their own versioned signing-key ring.
+# Keep retired keys in the JSON mapping until every job signed with them has
+# reached an unambiguous terminal state.  The SECRET_KEY fallback preserves
+# existing installations; production deployments should configure an
+# independently rotatable ring.
+_integration_signing_keys_json = os.environ.get(
+    "INTEGRATION_SIGNING_KEYS_JSON", ""
+).strip()
+if _integration_signing_keys_json:
+    try:
+        INTEGRATION_SIGNING_KEYS = json.loads(_integration_signing_keys_json)
+    except (TypeError, ValueError) as exc:
+        raise ImproperlyConfigured(
+            "INTEGRATION_SIGNING_KEYS_JSON must be a JSON object"
+        ) from exc
+else:
+    INTEGRATION_SIGNING_KEYS = {"django-secret-key-v1": SECRET_KEY}
+
+if not isinstance(INTEGRATION_SIGNING_KEYS, dict) or not INTEGRATION_SIGNING_KEYS:
+    raise ImproperlyConfigured(
+        "INTEGRATION_SIGNING_KEYS_JSON must contain at least one key"
+    )
+if any(
+    not isinstance(key_id, str)
+    or not key_id
+    or len(key_id) > 64
+    or not isinstance(key_value, str)
+    or len(key_value) < 32
+    for key_id, key_value in INTEGRATION_SIGNING_KEYS.items()
+):
+    raise ImproperlyConfigured(
+        "Integration signing key IDs must be non-empty strings and key values "
+        "must contain at least 32 characters"
+    )
+_integration_primary_key_id = os.environ.get(
+    "INTEGRATION_SIGNING_PRIMARY_KEY_ID", ""
+).strip()
+if len(INTEGRATION_SIGNING_KEYS) > 1 and not _integration_primary_key_id:
+    raise ImproperlyConfigured(
+        "INTEGRATION_SIGNING_PRIMARY_KEY_ID is required for a multi-key ring"
+    )
+INTEGRATION_SIGNING_PRIMARY_KEY_ID = _integration_primary_key_id or next(
+    iter(INTEGRATION_SIGNING_KEYS)
+)
+if INTEGRATION_SIGNING_PRIMARY_KEY_ID not in INTEGRATION_SIGNING_KEYS:
+    raise ImproperlyConfigured(
+        "INTEGRATION_SIGNING_PRIMARY_KEY_ID is absent from the signing-key ring"
+    )
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get("DJANGO_DEBUG", "False").lower() in ("true", "1", "yes")

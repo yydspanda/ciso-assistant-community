@@ -57,7 +57,7 @@ class ServiceNowFieldMapper(BaseFieldMapper):
         local_data = {}
 
         # Iterate over configured map: Local Key -> Remote Key
-        for local_field, remote_field in self._get_mappings().items():
+        for local_field, remote_field in self.governed_mappings().items():
             # Only process fields that are technically allowed AND present in the payload
             if local_field in allowed_fields and remote_field in data_to_map:
                 val = data_to_map[remote_field]

@@ -56,7 +56,35 @@ class ServiceNowOrchestrator(BaseITSMOrchestrator):
             "updated": payload.get("sys_updated_on"),
         }
 
+    def classify_webhook_event(self, event_type: str) -> str:
+        if event_type == "sn_update":
+            return "update"
+        if event_type == "sn_delete":
+            return "delete"
+        return "invalid"
+
+    def project_webhook_payload(
+        self, *, event_type: str, payload: dict[str, Any], model_key: str
+    ) -> dict[str, Any]:
+        if self.classify_webhook_event(event_type) not in {"update", "delete"}:
+            raise ValueError("Unsupported ServiceNow webhook event")
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid ServiceNow webhook payload")
+        remote_id = self._extract_remote_id(payload)
+        if not remote_id:
+            raise ValueError("Missing ServiceNow sys_id")
+        mapper = self.mapper_for(model_key)
+        allowed = mapper.remote_field_names("pull", "update") | {
+            "sys_id",
+            "sys_updated_on",
+        }
+        return {key: payload[key] for key in sorted(allowed) if key in payload}
+
     def handle_webhook_event(self, event_type: str, payload: Dict[str, Any]) -> bool:
+        raise RuntimeError(
+            "Direct webhook mutation is disabled; persist a durable sync intent."
+        )
+
         # Define event types in your ServiceNow 'Business Rule' that calls this webhook
         # e.g., 'sn_update', 'sn_delete'
         remote_id = self._extract_remote_id(payload)

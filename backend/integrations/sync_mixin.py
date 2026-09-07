@@ -43,6 +43,25 @@ class IntegrationSyncableMixin:
         )
         return self._get_changed_fields(old) if old else []
 
+    def _has_existing_sync_mapping(self) -> bool:
+        """Cheap preflight used only to decide whether to take the root mutex.
+
+        Authority is re-read after the lock by ``_trigger_sync``. A concurrent
+        first link cannot lose the update: the explicit link transaction takes
+        the same root mutex and queues a complete initial projection.
+        """
+
+        if self._state.adding or getattr(self, "folder_id", None) is None:
+            return False
+        from django.contrib.contenttypes.models import ContentType
+
+        from integrations.models import SyncMapping
+
+        return SyncMapping.objects.filter(
+            content_type=ContentType.objects.get_for_model(self),
+            local_object_id=self.pk,
+        ).exists()
+
     def _trigger_sync(self, is_new: bool, changed_fields: list[str]) -> None:
         """Queue an outbound sync for every active ITSM integration that has a
         mapping configured for this model. No-op when nothing relevant changed
@@ -51,31 +70,47 @@ class IntegrationSyncableMixin:
             return
 
         from django.contrib.contenttypes.models import ContentType
-        from django.db import transaction
 
-        from iam.models import Folder
-        from integrations.models import IntegrationConfiguration
-        from integrations.settings_access import is_model_configured
-        from integrations.tasks import sync_object_to_integrations
+        from integrations.capabilities import persist_outbound_sync_jobs
+        from integrations.models import SyncMapping
 
-        configurations = IntegrationConfiguration.objects.filter(
-            folder=Folder.get_root_folder(),
-            provider__provider_type="itsm",
-            is_active=True,
+        content_type = ContentType.objects.get_for_model(self)
+        object_folder_id = getattr(self, "folder_id", None)
+        if object_folder_id is None:
+            return
+        # A model save is not authority to create a new remote relationship.
+        # Only an existing, owner-coherent mapping may trigger an outbound sync;
+        # the explicit link endpoints create that mapping under IAM + row locks.
+        config_ids = list(
+            SyncMapping.objects.filter(
+                content_type=content_type,
+                local_object_id=self.pk,
+                folder_id=object_folder_id,
+                configuration__folder_id=object_folder_id,
+                configuration__is_active=True,
+                configuration__provider__is_active=True,
+                configuration__provider__provider_type="itsm",
+            )
+            .order_by("configuration_id")
+            .values_list("configuration_id", flat=True)
         )
-        config_ids = [
-            c.id
-            for c in configurations
-            if is_model_configured(c.settings, self.INTEGRATION_MODEL_KEY)
-        ]
         if not config_ids:
             return
 
-        content_type = ContentType.objects.get_for_model(self)
         pk = self.pk
-        transaction.on_commit(
-            lambda: sync_object_to_integrations.schedule(
-                args=(content_type, pk, config_ids, changed_fields),
-                delay=1,
-            )
+        requested_by_id = getattr(
+            self, "_integration_sync_requested_by_id_snapshot", None
+        )
+        origin_principal = (
+            f"user:{requested_by_id}"
+            if requested_by_id is not None
+            else "ciso-assistant:model-outbox"
+        )
+        persist_outbound_sync_jobs(
+            content_type_id=content_type.id,
+            object_id=pk,
+            configuration_ids=config_ids,
+            changed_fields=changed_fields,
+            origin_principal=origin_principal,
+            requested_by_id=requested_by_id,
         )

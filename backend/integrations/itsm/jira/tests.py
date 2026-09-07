@@ -20,6 +20,14 @@ def configuration():
     return mock_config
 
 
+@pytest.fixture(autouse=True)
+def allow_documentation_host_for_unit_tests():
+    """Unit tests mock Jira itself, so DNS must not make them environment-dependent."""
+
+    with patch("integrations.itsm.jira.client.check_integration_url"):
+        yield
+
+
 @pytest.fixture
 def mapper(configuration):
     return JiraFieldMapper(configuration)
@@ -56,19 +64,42 @@ def test_create_jira_issue(mock_jira, configuration):
 
     client = JiraClient(configuration)
 
-    applied_control = AppliedControl(
-        folder_id=None,
-        name="Test Control",
-        description="Test Description",
-        status="in_progress",
-        priority=2,
-    )
+    assert mock_jira.call_args.kwargs["max_retries"] == 0
 
-    issue_key = client.create_remote_object(applied_control)
+    issue_key = client.create_remote_payload(
+        {
+            "summary": "Test Control",
+            "description": "Test Description",
+            "priority": {"name": "High"},
+        }
+    )
 
     assert issue_key == "PROJ-123"
     mock_jira.return_value.create_issue.assert_called_once()
-    mock_jira.return_value.transition_issue.assert_called_with("PROJ-123", "2")
+    mock_jira.return_value.transition_issue.assert_not_called()
+
+
+@patch("integrations.itsm.jira.client.JIRA")
+def test_create_jira_issue_rejects_embedded_status_transition(mock_jira, configuration):
+    client = JiraClient(configuration)
+
+    with pytest.raises(ValueError, match="separate durable jobs"):
+        client.create_remote_payload({"summary": "Test", "status": "In Progress"})
+
+    mock_jira.return_value.create_issue.assert_not_called()
+
+
+@patch("integrations.itsm.jira.client.JIRA")
+def test_update_jira_issue_rejects_multiple_provider_effects(mock_jira, configuration):
+    client = JiraClient(configuration)
+
+    with pytest.raises(ValueError, match="separate durable jobs"):
+        client.update_remote_object(
+            "PROJ-1", {"summary": "Changed", "status": "In Progress"}
+        )
+
+    mock_jira.return_value.issue.assert_not_called()
+    mock_jira.return_value.transition_issue.assert_not_called()
 
 
 @patch("integrations.itsm.jira.client.JIRA")

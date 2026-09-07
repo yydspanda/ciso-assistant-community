@@ -59,11 +59,19 @@ class ServiceNowClient(BaseIntegrationClient):
 
     def create_remote_object(self, local_object: AppliedControl) -> str:
         """Creates a record in ServiceNow and returns the sys_id."""
-        payload = self.mapper.to_remote(local_object)
+        return self.create_remote_payload(self.mapper.to_remote(local_object))
+
+    def create_remote_payload(self, payload: dict[str, Any]) -> str:
+        """Create a record from an immutable durable-worker projection."""
+
+        payload = dict(payload)
 
         url = f"{self.base_url}/api/now/table/{self.table}"
 
-        logger.info("Attempting to create ServiceNow record", payload=payload)
+        logger.info(
+            "Attempting to create ServiceNow record",
+            changed_fields=sorted(payload),
+        )
 
         try:
             response = requests.post(
@@ -91,7 +99,9 @@ class ServiceNowClient(BaseIntegrationClient):
 
         except requests.exceptions.RequestException:
             logger.error(
-                "Failed to create ServiceNow record", payload=payload, exc_info=True
+                "Failed to create ServiceNow record",
+                changed_fields=sorted(payload),
+                exc_info=True,
             )
             raise
 

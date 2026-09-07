@@ -6,18 +6,20 @@ registry-drift guards."""
 import pytest
 
 from core.models import (
+    Actor,
     AppliedControl,
     Asset,
     Comment,
     Evidence,
     Framework,
+    Incident,
     RequirementAssessment,
     RequirementNode,
     RiskAssessment,
     RiskMatrix,
     RiskScenario,
 )
-from iam.models import Folder
+from iam.models import Folder, RoleAssignment
 
 MERGE_URL = "/api/applied-controls/merge/"
 
@@ -286,6 +288,539 @@ def test_folder_mismatch_flag(authenticated_client, folder, other_folder):
     resp = authenticated_client.post(MERGE_URL, payload, format="json")
     assert resp.status_code == 200, resp.json()
     assert resp.json()["folder_mismatch"] is True
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("merge_url", "policy_source"),
+    ((MERGE_URL, False), ("/api/policies/merge/", True)),
+)
+@pytest.mark.parametrize("dry_run", (False, True))
+def test_merge_never_rewires_audit_rows_without_full_audit_scope(
+    authenticated_client,
+    folder,
+    monkeypatch,
+    merge_url,
+    policy_source,
+    dry_run,
+):
+    source = (
+        _make_policy(folder, "scoped-source")
+        if policy_source
+        else _make_control(folder, "scoped-source")
+    )
+    target = (
+        _make_policy(folder, "scoped-target")
+        if policy_source
+        else _make_control(folder, "scoped-target")
+    )
+    ra = _make_compliance_assessment(folder)
+    ra.applied_controls.add(source)
+    monkeypatch.setattr(
+        "core.assignment_access.has_full_view_compliance_assessment",
+        lambda _user, _assessment: False,
+    )
+
+    response = authenticated_client.post(
+        merge_url,
+        {
+            "source_ids": [str(source.id)],
+            "target": {"type": "existing", "id": str(target.id)},
+            "dry_run": dry_run,
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert AppliedControl.objects.filter(id=source.id).exists()
+    assert set(ra.applied_controls.values_list("id", flat=True)) == {source.id}
+
+
+@pytest.mark.django_db
+def test_merge_guards_existing_target_and_new_target_audit_links(
+    authenticated_client, folder, monkeypatch
+):
+    source = _make_control(folder, "unlinked-source")
+    target = _make_control(folder, "linked-target")
+    ra = _make_compliance_assessment(folder)
+    ra.applied_controls.add(target)
+    monkeypatch.setattr(
+        "core.assignment_access.has_full_view_compliance_assessment",
+        lambda _user, _assessment: False,
+    )
+
+    existing_response = authenticated_client.post(
+        MERGE_URL,
+        {
+            "source_ids": [str(source.id)],
+            "target": {"type": "existing", "id": str(target.id)},
+        },
+        format="json",
+    )
+    new_response = authenticated_client.post(
+        MERGE_URL,
+        {
+            "source_ids": [str(source.id)],
+            "target": {
+                "type": "new",
+                "fields": {
+                    "name": "forbidden-new-target",
+                    "folder": str(folder.id),
+                    "requirement_assessments": [str(ra.id)],
+                },
+            },
+        },
+        format="json",
+    )
+
+    assert existing_response.status_code == 403, existing_response.content
+    assert new_response.status_code == 403, new_response.content
+    assert AppliedControl.objects.filter(id=source.id).exists()
+    assert set(ra.applied_controls.values_list("id", flat=True)) == {target.id}
+
+
+@pytest.mark.django_db
+def test_merge_rejects_links_owned_by_a_locked_audit(authenticated_client, folder):
+    source = _make_control(folder, "locked-source")
+    target = _make_control(folder, "locked-target")
+    ra = _make_compliance_assessment(folder)
+    ra.applied_controls.add(source)
+    ra.compliance_assessment.is_locked = True
+    ra.compliance_assessment.save(update_fields=["is_locked"])
+
+    response = authenticated_client.post(
+        MERGE_URL,
+        {
+            "source_ids": [str(source.id)],
+            "target": {"type": "existing", "id": str(target.id)},
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert AppliedControl.objects.filter(id=source.id).exists()
+    assert set(ra.applied_controls.values_list("id", flat=True)) == {source.id}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("dry_run", (False, True))
+def test_merge_rejects_hidden_direct_relations_without_preview_counts(
+    authenticated_client, folder, monkeypatch, dry_run
+):
+    source = _make_control(folder, "hidden-evidence-source")
+    target = _make_control(folder, "hidden-evidence-target")
+    evidence = Evidence.objects.create(name="hidden-evidence", folder=folder)
+    source.evidences.add(evidence)
+    original = RoleAssignment.get_viewable_object_ids
+
+    def hide_evidence(user, model, folder=None):
+        if model is Evidence:
+            return Evidence.objects.none().values_list("id", flat=True)
+        return original(user, model, folder)
+
+    monkeypatch.setattr(
+        RoleAssignment,
+        "get_viewable_object_ids",
+        staticmethod(hide_evidence),
+    )
+
+    response = authenticated_client.post(
+        MERGE_URL,
+        {
+            "source_ids": [str(source.id)],
+            "target": {"type": "existing", "id": str(target.id)},
+            "dry_run": dry_run,
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert b"unioned_m2m_preview" not in response.content
+    assert AppliedControl.objects.filter(id=source.id).exists()
+    assert set(source.evidences.values_list("id", flat=True)) == {evidence.id}
+    assert not target.evidences.exists()
+
+
+@pytest.mark.django_db
+def test_merge_keeps_independently_visible_owner_identity_across_home_folder(
+    authenticated_client, folder
+):
+    from iam.models import User
+
+    user = User.objects.get(email="admin@tests.com")
+    actor, _ = Actor.objects.get_or_create(user=user)
+    assert actor.specific.folder_id != folder.id
+    source = _make_control(folder, "visible-owner-source")
+    target = _make_control(folder, "visible-owner-target")
+    source.owner.add(actor)
+
+    response = authenticated_client.post(
+        MERGE_URL,
+        {
+            "source_ids": [str(source.id)],
+            "target": {"type": "existing", "id": str(target.id)},
+        },
+        format="json",
+    )
+
+    assert response.status_code == 200, response.content
+    assert set(target.owner.values_list("id", flat=True)) == {actor.id}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("dry_run", (False, True))
+def test_merge_rejects_hidden_reverse_parent_without_preview_counts(
+    authenticated_client, folder, monkeypatch, dry_run
+):
+    scenario = _make_risk_scenario(folder)
+    source = _make_control(folder, "hidden-parent-source")
+    target = _make_control(folder, "hidden-parent-target")
+    scenario.applied_controls.add(source)
+    original = RoleAssignment.get_viewable_object_ids
+
+    def hide_scenario(user, model, folder=None):
+        if model is RiskScenario:
+            return RiskScenario.objects.none().values_list("id", flat=True)
+        return original(user, model, folder)
+
+    monkeypatch.setattr(
+        RoleAssignment,
+        "get_viewable_object_ids",
+        staticmethod(hide_scenario),
+    )
+
+    response = authenticated_client.post(
+        MERGE_URL,
+        {
+            "source_ids": [str(source.id)],
+            "target": {"type": "existing", "id": str(target.id)},
+            "dry_run": dry_run,
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert b"rewired_preview" not in response.content
+    assert AppliedControl.objects.filter(id=source.id).exists()
+    assert set(scenario.applied_controls.values_list("id", flat=True)) == {source.id}
+
+
+@pytest.mark.django_db
+def test_merge_requires_change_authority_on_reverse_parent(
+    authenticated_client, folder, monkeypatch
+):
+    scenario = _make_risk_scenario(folder)
+    source = _make_control(folder, "no-parent-change-source")
+    target = _make_control(folder, "no-parent-change-target")
+    scenario.applied_controls.add(source)
+    _patch_perm_denial(monkeypatch, "change_riskscenario")
+
+    response = authenticated_client.post(
+        MERGE_URL,
+        {
+            "source_ids": [str(source.id)],
+            "target": {"type": "existing", "id": str(target.id)},
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert AppliedControl.objects.filter(id=source.id).exists()
+    assert set(scenario.applied_controls.values_list("id", flat=True)) == {source.id}
+
+
+@pytest.mark.django_db
+def test_merge_rejects_locked_reverse_parent_owner(authenticated_client, folder):
+    scenario = _make_risk_scenario(folder)
+    scenario.risk_assessment.is_locked = True
+    scenario.risk_assessment.save(update_fields=["is_locked"])
+    source = _make_control(folder, "locked-parent-source")
+    target = _make_control(folder, "locked-parent-target")
+    scenario.existing_applied_controls.add(source)
+
+    response = authenticated_client.post(
+        MERGE_URL,
+        {
+            "source_ids": [str(source.id)],
+            "target": {"type": "existing", "id": str(target.id)},
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert AppliedControl.objects.filter(id=source.id).exists()
+    assert set(scenario.existing_applied_controls.values_list("id", flat=True)) == {
+        source.id
+    }
+
+
+@pytest.mark.django_db
+def test_merge_rejects_cross_folder_document_parent(
+    authenticated_client, folder, other_folder
+):
+    from doc_management.models import DocumentContainer
+
+    source = _make_control(folder, "document-drift-source")
+    target = _make_control(folder, "document-drift-target")
+    document = DocumentContainer.objects.create(
+        name="wrong-owner-document", folder=other_folder
+    )
+    document.applied_controls.add(source)
+
+    response = authenticated_client.post(
+        MERGE_URL,
+        {
+            "source_ids": [str(source.id)],
+            "target": {"type": "existing", "id": str(target.id)},
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert AppliedControl.objects.filter(id=source.id).exists()
+    assert set(document.applied_controls.values_list("id", flat=True)) == {source.id}
+
+
+@pytest.mark.django_db
+def test_merge_rejects_relation_added_during_lock_acquisition(
+    authenticated_client, folder, monkeypatch
+):
+    from core import applied_controls_helper
+
+    source = _make_control(folder, "late-relation-source")
+    target = _make_control(folder, "late-relation-target")
+    evidence = Evidence.objects.create(name="late-evidence", folder=folder)
+    original = applied_controls_helper.lock_rows_in_global_model_order
+    injected = False
+
+    def inject_after_candidate_locks(target_ids_by_model):
+        nonlocal injected
+        locked = original(target_ids_by_model)
+        if not injected:
+            injected = True
+            source.evidences.add(evidence)
+        return locked
+
+    monkeypatch.setattr(
+        applied_controls_helper,
+        "lock_rows_in_global_model_order",
+        inject_after_candidate_locks,
+    )
+
+    response = authenticated_client.post(
+        MERGE_URL,
+        {
+            "source_ids": [str(source.id)],
+            "target": {"type": "existing", "id": str(target.id)},
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert AppliedControl.objects.filter(id=source.id).exists()
+    # The injected relation belongs to the request transaction and rolls back.
+    assert not source.evidences.exists()
+    assert not target.evidences.exists()
+
+
+@pytest.mark.django_db
+def test_merge_rejects_requirement_link_reparented_with_same_ra_id(
+    authenticated_client, folder, monkeypatch
+):
+    from core import applied_controls_helper
+
+    source = _make_control(folder, "ra-race-source")
+    target = _make_control(folder, "ra-race-target")
+    requirement_assessment = _make_compliance_assessment(folder)
+    requirement_assessment.applied_controls.add(source)
+    original = applied_controls_helper.lock_rows_in_global_model_order
+    moved = False
+
+    def move_same_ra_after_candidate_locks(target_ids_by_model):
+        nonlocal moved
+        locked = original(target_ids_by_model)
+        if not moved:
+            moved = True
+            requirement_assessment.applied_controls.remove(source)
+            requirement_assessment.applied_controls.add(target)
+        return locked
+
+    monkeypatch.setattr(
+        applied_controls_helper,
+        "lock_rows_in_global_model_order",
+        move_same_ra_after_candidate_locks,
+    )
+
+    response = authenticated_client.post(
+        MERGE_URL,
+        {
+            "source_ids": [str(source.id)],
+            "target": {"type": "existing", "id": str(target.id)},
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert AppliedControl.objects.filter(id=source.id).exists()
+    assert set(
+        requirement_assessment.applied_controls.values_list("id", flat=True)
+    ) == {source.id}
+
+
+@pytest.mark.django_db
+def test_merge_reproves_source_visibility_after_control_lock(
+    authenticated_client, folder, monkeypatch
+):
+    from core import applied_controls_helper
+    from core.views import AppliedControlViewSet
+
+    source = _make_control(folder, "visibility-race-source")
+    target = _make_control(folder, "visibility-race-target")
+    original_get_queryset = AppliedControlViewSet.get_queryset
+    original_lock = applied_controls_helper.lock_rows_in_global_model_order
+    changed = False
+
+    def published_queryset(view):
+        return original_get_queryset(view).filter(is_published=True)
+
+    def hide_after_candidate_locks(target_ids_by_model):
+        nonlocal changed
+        locked = original_lock(target_ids_by_model)
+        if not changed:
+            changed = True
+            AppliedControl.objects.filter(id=source.id).update(is_published=False)
+        return locked
+
+    monkeypatch.setattr(AppliedControlViewSet, "get_queryset", published_queryset)
+    monkeypatch.setattr(
+        applied_controls_helper,
+        "lock_rows_in_global_model_order",
+        hide_after_candidate_locks,
+    )
+
+    response = authenticated_client.post(
+        MERGE_URL,
+        {
+            "source_ids": [str(source.id)],
+            "target": {"type": "existing", "id": str(target.id)},
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    source.refresh_from_db()
+    assert source.is_published is True
+    assert AppliedControl.objects.filter(id=target.id).exists()
+
+
+@pytest.mark.django_db
+def test_merge_cannot_rewrite_submitted_validation_payload(
+    authenticated_client, folder
+):
+    from core.models import ValidationFlow
+    from iam.models import User
+
+    requester = User.objects.get(email="admin@tests.com")
+    source = _make_policy(folder, "submitted-policy-source")
+    target = _make_policy(folder, "submitted-policy-target")
+    flow = ValidationFlow.objects.create(
+        folder=folder,
+        requester=requester,
+        status=ValidationFlow.Status.SUBMITTED,
+    )
+    flow.policies.add(source)
+
+    response = authenticated_client.post(
+        POLICY_MERGE_URL,
+        {
+            "source_ids": [str(source.id)],
+            "target": {"type": "existing", "id": str(target.id)},
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert AppliedControl.objects.filter(id=source.id).exists()
+    assert set(flow.policies.values_list("id", flat=True)) == {source.id}
+
+
+@pytest.mark.django_db
+def test_merge_new_target_authorizes_requested_reverse_parents_before_create(
+    authenticated_client, folder, monkeypatch
+):
+    source = _make_control(folder, "requested-parent-source")
+    incident = Incident.objects.create(name="requested-incident", folder=folder)
+    before = AppliedControl.objects.count()
+    _patch_perm_denial(monkeypatch, "change_incident")
+
+    response = authenticated_client.post(
+        MERGE_URL,
+        {
+            "source_ids": [str(source.id)],
+            "target": {
+                "type": "new",
+                "fields": {
+                    "name": "forbidden-created-target",
+                    "folder": str(folder.id),
+                    "incidents": [str(incident.id)],
+                },
+            },
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert AppliedControl.objects.count() == before
+    assert AppliedControl.objects.filter(id=source.id).exists()
+    assert not incident.applied_controls.exists()
+
+
+@pytest.mark.django_db
+def test_merge_rejects_mapping_whose_provider_is_inactive(authenticated_client, folder):
+    from django.contrib.contenttypes.models import ContentType
+
+    from integrations.models import (
+        IntegrationConfiguration,
+        IntegrationProvider,
+        SyncMapping,
+    )
+
+    source = _make_control(folder, "inactive-provider-source")
+    target = _make_control(folder, "inactive-provider-target")
+    provider = IntegrationProvider.objects.create(
+        name="inactive-provider",
+        provider_type=IntegrationProvider.ProviderType.ITSM,
+        is_active=False,
+        folder=Folder.get_root_folder(),
+    )
+    configuration = IntegrationConfiguration.objects.create(
+        provider=provider,
+        folder=folder,
+        webhook_secret="not-a-real-secret",
+        webhook_url="",
+        is_active=True,
+    )
+    mapping = SyncMapping.objects.create(
+        configuration=configuration,
+        content_type=ContentType.objects.get_for_model(AppliedControl),
+        local_object_id=source.id,
+        remote_id="INACTIVE-PROVIDER",
+        folder=folder,
+    )
+
+    response = authenticated_client.post(
+        MERGE_URL,
+        {
+            "source_ids": [str(source.id)],
+            "target": {"type": "existing", "id": str(target.id)},
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert AppliedControl.objects.filter(id=source.id).exists()
+    mapping.refresh_from_db()
+    assert mapping.local_object_id == source.id
 
 
 # --- managed-document conflict ----------------------------------------------

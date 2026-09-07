@@ -165,8 +165,8 @@ class JiraFieldMapper(BaseFieldMapper):
     def to_remote(self, local_object: models.Model) -> dict[str, Any]:
         allowed_fields = self.get_allowed_fields("push", "create")
         remote_data = {}
-        for local_field, remote_field in self._get_mappings().items():
-            if local_field not in allowed_fields or not remote_field:
+        for local_field, remote_field in self.governed_mappings().items():
+            if local_field not in allowed_fields:
                 continue
             value = self._get_local_value(local_object, local_field)
             if value is None:
@@ -181,7 +181,7 @@ class JiraFieldMapper(BaseFieldMapper):
     ) -> dict[str, Any]:
         allowed_fields = self.get_allowed_fields("push", "update")
         remote_data = {}
-        mappings = self._get_mappings()
+        mappings = self.governed_mappings()
         for local_field in changed_fields:
             if local_field not in allowed_fields or local_field not in mappings:
                 continue
@@ -204,8 +204,8 @@ class JiraFieldMapper(BaseFieldMapper):
         allowed_fields = self.get_allowed_fields("pull", "update")
         local_data: dict[str, Any] = {}
 
-        for local_field, remote_field in self._get_mappings().items():
-            if local_field not in allowed_fields or not remote_field:
+        for local_field, remote_field in self.governed_mappings().items():
+            if local_field not in allowed_fields:
                 continue
             if remote_field not in data_to_map:
                 continue

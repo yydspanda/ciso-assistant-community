@@ -60,7 +60,10 @@ class JiraClient(BaseIntegrationClient):
             server=server_url,
             basic_auth=(self.credentials["email"], self.credentials["api_token"]),
             timeout=30,
-            max_retries=3,
+            # Durable authority accounts for one provider effect per job.
+            # jira-python retries mutating requests as well as reads, so the
+            # authority-bearing client must not hide additional POST/PUT calls.
+            max_retries=0,
         )
         self.jira._session.max_redirects = 0
         self.mapper = JiraFieldMapper(configuration, model_key)
@@ -94,21 +97,22 @@ class JiraClient(BaseIntegrationClient):
     # CRUD
 
     def create_remote_object(self, local_object: AppliedControl):
+        return self.create_remote_payload(self.mapper.to_remote(local_object))
+
+    def create_remote_payload(self, payload: dict[str, Any]) -> str:
         project_key, issue_type = self._resolve_target()
         if not project_key:
             raise ValueError("Jira project_key/table_name is not configured")
 
-        issue_dict = self.mapper.to_remote(local_object)
+        issue_dict = dict(payload)
+        if "status" in issue_dict:
+            raise ValueError(
+                "Jira creation and status transition require separate durable jobs"
+            )
         issue_dict["project"] = {"key": project_key}
         issue_dict["issuetype"] = {"name": issue_type or "Task"}
 
-        target_status_name = issue_dict.pop("status", None)
-
         issue = self.jira.create_issue(fields=issue_dict)
-
-        # Handle the status transition separately
-        if target_status_name:
-            self._transition_issue_to_status(issue.key, target_status_name)
 
         logger.info(f"Created Jira issue {issue.key}")
         return issue.key
@@ -118,6 +122,11 @@ class JiraClient(BaseIntegrationClient):
             # Status must be handled as a transition, not an edit.
             target_status_name = None
             if "status" in changes:
+                if len(changes) != 1:
+                    raise ValueError(
+                        "Jira field updates and status transitions require "
+                        "separate durable jobs"
+                    )
                 target_status_name = changes.pop("status", None)
 
             # Update all other fields (if any remain)

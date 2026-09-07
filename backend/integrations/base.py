@@ -1,10 +1,16 @@
 from abc import ABC, abstractmethod
+from datetime import timedelta
+import hmac
+import json
 from typing import Any
 
 import structlog
 from django.contrib.contenttypes.models import ContentType
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 from django.http import HttpRequest
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
 from core.base_models import AbstractBaseModel
 from integrations.models import IntegrationConfiguration, SyncMapping
@@ -40,6 +46,16 @@ class BaseIntegrationClient(ABC):
     def create_remote_object(self, local_object) -> str:
         """Create object in remote system, return remote ID"""
         pass
+
+    def create_remote_payload(self, payload: dict[str, Any]) -> str:
+        """Create from an already approved immutable provider projection.
+
+        Durable workers use this boundary so a delayed job never remaps a
+        newer local object state. Providers that support creation must override
+        it; the default fails closed.
+        """
+
+        raise NotImplementedError("Provider cannot create from a durable payload")
 
     @abstractmethod
     def update_remote_object(self, remote_id: str, changes: dict[str, Any]) -> bool:
@@ -114,16 +130,57 @@ class BaseFieldMapper(ABC):
         }
 
     def get_allowed_fields(self, direction: str, operation: str) -> set[str]:
+        from integrations.syncable import mappable_field_keys
+
+        model_fields = mappable_field_keys(self.model_key)
         allowed = set()
         for field, ops in self._field_operations().items():
-            if operation in ops.get(direction, set()):
+            if field in model_fields and operation in ops.get(direction, set()):
                 allowed.add(field)
         return allowed
+
+    def governed_mappings(self) -> dict[str, str]:
+        """Return a fail-closed mapping restricted to the public sync schema."""
+
+        from integrations.syncable import mappable_field_keys
+
+        mappings = self._get_mappings()
+        if not isinstance(mappings, dict):
+            raise ValueError("Integration field_map must be an object")
+        model_fields = mappable_field_keys(self.model_key)
+        governed: dict[str, str] = {}
+        remote_targets: set[str] = set()
+        for local_field, remote_field in mappings.items():
+            if (
+                not isinstance(local_field, str)
+                or local_field not in model_fields
+                or not isinstance(remote_field, str)
+                or not remote_field
+                or remote_field != remote_field.strip()
+                or remote_field in remote_targets
+            ):
+                raise ValueError("Integration field_map is outside the governed schema")
+            governed[local_field] = remote_field
+            remote_targets.add(remote_field)
+        return governed
+
+    def allowed_mappings(self, direction: str, operation: str) -> dict[str, str]:
+        allowed_fields = self.get_allowed_fields(direction, operation)
+        return {
+            local_field: remote_field
+            for local_field, remote_field in self.governed_mappings().items()
+            if local_field in allowed_fields
+        }
+
+    def remote_field_names(self, direction: str, operation: str) -> set[str]:
+        return set(self.allowed_mappings(direction, operation).values())
 
     def to_remote(self, local_object: models.Model) -> dict[str, Any]:
         """Convert local object to remote format (all fields)"""
         remote_data = {}
-        for local_field, remote_field in self._get_mappings().items():
+        for local_field, remote_field in self.allowed_mappings(
+            "push", "create"
+        ).items():
             value = self._get_local_value(local_object, local_field)
             if value is not None:
                 transformed = self._transform_value_to_remote(local_field, value)
@@ -136,7 +193,7 @@ class BaseFieldMapper(ABC):
     ) -> dict[str, Any]:
         """Convert only specific fields to remote format"""
         remote_data = {}
-        mappings = self._get_mappings()
+        mappings = self.allowed_mappings("push", "update")
 
         for local_field in changed_fields:
             if local_field in mappings:
@@ -152,7 +209,12 @@ class BaseFieldMapper(ABC):
     def to_local(self, remote_data: dict[str, Any]) -> dict[str, Any]:
         """Convert remote data to local format"""
         local_data = {}
-        reverse_mappings = {v: k for k, v in self._get_mappings().items()}
+        reverse_mappings = {
+            remote_field: local_field
+            for local_field, remote_field in self.allowed_mappings(
+                "pull", "update"
+            ).items()
+        }
 
         for remote_field, local_field in reverse_mappings.items():
             # Use helper to get potentially nested value
@@ -238,6 +300,9 @@ class BaseSyncOrchestrator(ABC):
     """Orchestrates sync operations between local and remote systems"""
 
     DEFAULT_MODEL_KEY = "applied_control"
+    # A provider must explicitly opt in only after its API accepts the durable
+    # request digest as an idempotency/correlation key for every side effect.
+    SUPPORTS_IDEMPOTENT_OPERATIONS = False
 
     def __init__(self, configuration: IntegrationConfiguration):
         self.configuration = configuration
@@ -299,6 +364,249 @@ class BaseSyncOrchestrator(ABC):
         """
         return []
 
+    def execute_outbound_payload(
+        self,
+        *,
+        model_key: str,
+        operation_kind: str,
+        remote_id: str,
+        payload: dict[str, Any],
+        operation_id: str,
+    ) -> tuple[str, dict[str, Any]]:
+        """Perform provider I/O only; never read or mutate application rows."""
+
+        client = self.client_for(model_key)
+        if operation_kind == "create":
+            remote_id = client.create_remote_payload(dict(payload))
+            if not remote_id:
+                raise RuntimeError("Provider returned no remote object identifier")
+        elif operation_kind == "update":
+            if not remote_id:
+                raise RuntimeError("An update requires a remote object identifier")
+            if (
+                payload
+                and client.update_remote_object(remote_id, dict(payload)) is False
+            ):
+                raise RuntimeError("Provider rejected the remote update")
+        elif operation_kind == "refresh_existing":
+            if not remote_id or payload:
+                raise RuntimeError(
+                    "A refresh requires an existing identifier and an empty payload"
+                )
+        else:
+            raise ValueError("Unsupported durable integration operation")
+
+        remote_data = client.get_remote_object(remote_id)
+        if not isinstance(remote_data, dict):
+            raise RuntimeError("Provider returned an invalid remote snapshot")
+        logger.info(
+            "Completed durable provider operation",
+            operation_id=operation_id,
+            operation_kind=operation_kind,
+            remote_id=remote_id,
+        )
+        return remote_id, self.validate_remote_snapshot(
+            model_key=model_key,
+            remote_id=remote_id,
+            remote_data=remote_data,
+        )
+
+    def project_remote_snapshot(
+        self, *, model_key: str, remote_data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Retain only provider identity, version, and explicitly mapped fields."""
+
+        from integrations.remote_ids import normalize_remote_id
+
+        if not isinstance(remote_data, dict):
+            raise ValueError("Remote snapshots must be JSON objects")
+        raw_fields = remote_data.get("fields", {})
+        if not isinstance(raw_fields, dict):
+            raise ValueError("Remote snapshot fields must be a JSON object")
+        allowed_fields = set(self.mapper_for(model_key).governed_mappings().values())
+        raw_key = remote_data.get("key")
+        projected = {
+            "key": (
+                normalize_remote_id(self.configuration.provider.name, raw_key)
+                if raw_key is not None
+                else None
+            ),
+            "updated": remote_data.get("updated"),
+            "fields": {
+                key: raw_fields[key]
+                for key in sorted(allowed_fields)
+                if key in raw_fields
+            },
+        }
+        # Normalize through Django's JSON encoder now, before the value reaches
+        # a persistent audit/cache field. This rejects non-serializable SDK
+        # objects and prevents a later model save from becoming the first check.
+        return json.loads(json.dumps(projected, cls=DjangoJSONEncoder))
+
+    def validate_remote_snapshot(
+        self,
+        *,
+        model_key: str,
+        remote_id: str,
+        remote_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Project and authenticate the identity/version of a provider readback."""
+
+        from integrations.remote_ids import normalize_remote_id
+
+        projected = self.project_remote_snapshot(
+            model_key=model_key,
+            remote_data=remote_data,
+        )
+        expected_id = normalize_remote_id(
+            self.configuration.provider.name,
+            remote_id,
+        )
+        observed_id = normalize_remote_id(
+            self.configuration.provider.name,
+            projected.get("key"),
+        )
+        if not hmac.compare_digest(expected_id, observed_id):
+            raise ValueError("Provider readback returned a different object")
+        projected["key"] = expected_id
+        observed_version = self.extract_remote_snapshot_version(projected)
+        if observed_version is None:
+            raise ValueError("Provider readback has no valid version")
+        if observed_version > timezone.now() + timedelta(minutes=5):
+            raise ValueError("Provider readback version is in the future")
+        return projected
+
+    def extract_webhook_remote_version(self, payload: dict[str, Any]) -> str | None:
+        remote_data = self._extract_remote_data(payload)
+        if not isinstance(remote_data, dict):
+            return None
+        value = remote_data.get("updated")
+        return value if isinstance(value, str) and value else None
+
+    def extract_remote_snapshot_version(
+        self, remote_data: dict[str, Any]
+    ) -> Any | None:
+        if not isinstance(remote_data, dict):
+            return None
+        raw_value = remote_data.get("updated")
+        if not isinstance(raw_value, str) or not raw_value:
+            return None
+        parsed = parse_datetime(raw_value)
+        if parsed is None:
+            return None
+        if timezone.is_naive(parsed):
+            parsed = timezone.make_aware(parsed)
+        return parsed
+
+    def classify_webhook_event(self, event_type: str) -> str:
+        """Map a provider event to update/delete/ignore/invalid."""
+
+        if event_type in {"created", "updated"}:
+            return "update"
+        if event_type == "deleted":
+            return "delete"
+        return "ignore"
+
+    def project_webhook_payload(
+        self, *, event_type: str, payload: dict[str, Any], model_key: str
+    ) -> dict[str, Any]:
+        """Return the minimal provider-shaped payload safe to retain.
+
+        Providers must explicitly define their webhook schema. A valid
+        signature alone is never authority to persist arbitrary fields.
+        """
+
+        raise ValueError("The provider has no governed webhook payload schema")
+
+    def prepare_incoming_event(
+        self,
+        *,
+        event_type: str,
+        payload: dict[str, Any],
+        mapping: "SyncMapping",
+        local_object: models.Model,
+    ) -> dict[str, Any]:
+        """Build a deterministic incoming plan without network or DB writes."""
+
+        from integrations.remote_ids import (
+            InvalidRemoteIdentifier,
+            normalize_remote_id,
+        )
+        from integrations.syncable import model_key_for_content_type
+
+        action = self.classify_webhook_event(event_type)
+        raw_remote_id = self._extract_remote_id(payload)
+        try:
+            remote_id = (
+                normalize_remote_id(self.configuration.provider.name, raw_remote_id)
+                if raw_remote_id
+                else ""
+            )
+        except InvalidRemoteIdentifier:
+            return {"action": "invalid", "reason": "invalid_remote_id"}
+        if action in {"update", "delete"} and not remote_id:
+            return {"action": "invalid", "reason": "missing_remote_id"}
+        if remote_id and remote_id != mapping.remote_id:
+            return {"action": "invalid", "reason": "remote_id_changed"}
+        if action in {"ignore", "invalid", "delete"}:
+            return {"action": action, "remote_id": remote_id}
+
+        remote_data = self._extract_remote_data(payload)
+        if not isinstance(remote_data, dict) or not remote_data:
+            return {"action": "invalid", "reason": "missing_remote_data"}
+        model_key = (
+            model_key_for_content_type(mapping.content_type) or self.DEFAULT_MODEL_KEY
+        )
+        mapper = self.mapper_for(model_key)
+        try:
+            remote_data = self.project_remote_snapshot(
+                model_key=model_key,
+                remote_data=remote_data,
+            )
+        except (TypeError, ValueError):
+            return {"action": "invalid", "reason": "invalid_remote_snapshot"}
+        if mapping.last_synced_at is None and mapping.remote_data != remote_data:
+            # NULL is the conservative migration/runtime sentinel for a mapping
+            # without proved successful-sync evidence.  It must not collapse to
+            # remote-wins, otherwise an upgraded legacy row could silently
+            # overwrite a newer local value using an untrusted auto_now marker.
+            return {
+                "action": "review",
+                "reason": "unproved_sync_baseline",
+                "remote_id": remote_id,
+                "remote_data": remote_data,
+                "local_data": mapper.to_local(remote_data),
+            }
+        has_conflict = bool(
+            hasattr(local_object, "updated_at")
+            and mapping.last_synced_at is not None
+            and local_object.updated_at > mapping.last_synced_at
+            and mapping.remote_data != remote_data
+        )
+        resolution = self.configuration.settings.get(
+            "conflict_resolution", "remote_wins"
+        )
+        if has_conflict and resolution == "manual":
+            return {
+                "action": "review",
+                "reason": "manual_conflict",
+                "remote_id": remote_id,
+                "remote_data": remote_data,
+                "local_data": mapper.to_local(remote_data),
+            }
+        if has_conflict and resolution == "local_wins":
+            return {
+                "action": "push_local",
+                "remote_id": remote_id,
+                "remote_payload": mapper.to_remote(local_object),
+            }
+        return {
+            "action": "apply_remote",
+            "remote_id": remote_id,
+            "remote_data": remote_data,
+            "local_data": mapper.to_local(remote_data),
+        }
+
     def push_changes(
         self, local_object: models.Model, changed_fields: list[str]
     ) -> bool:
@@ -311,7 +619,11 @@ class BaseSyncOrchestrator(ABC):
         Returns:
             True if sync succeeded, False otherwise
         """
-        from .models import SyncMapping  # Import here to avoid circular imports
+        raise RuntimeError(
+            "Direct integration writes are disabled; persist a durable sync intent."
+        )
+
+        from .models import SyncMapping  # pragma: no cover
         from integrations.settings_access import is_model_configured
         from integrations.syncable import model_key_for_content_type
 
@@ -339,10 +651,12 @@ class BaseSyncOrchestrator(ABC):
             )
             return False
 
+        mapping = self._get_existing_mapping(local_object)
+        if mapping is None:
+            return False
+
         mapper = self.mapper_for(model_key)
         client = self.client_for(model_key)
-
-        mapping = self._get_or_create_mapping(local_object)
 
         try:
             if mapping.remote_id:
@@ -399,7 +713,11 @@ class BaseSyncOrchestrator(ABC):
         Returns:
             True if sync succeeded, False otherwise
         """
-        from .models import SyncMapping  # Import here to avoid circular imports
+        raise RuntimeError(
+            "Direct integration writes are disabled; persist a durable sync intent."
+        )
+
+        from .models import SyncMapping  # pragma: no cover
         from integrations.syncable import model_key_for_content_type
 
         try:
@@ -482,6 +800,11 @@ class BaseSyncOrchestrator(ABC):
         """
         raise NotImplementedError("extract_webhook_event_type must be implemented")
 
+    def extract_webhook_remote_id(self, payload: dict[str, Any]) -> str:
+        """Return the provider-specific identifier used to resolve a mapping."""
+
+        return self._extract_remote_id(payload)
+
     def handle_webhook_event(self, event_type: str, payload: dict[str, Any]) -> bool:
         """Handle incoming webhook event
 
@@ -492,7 +815,11 @@ class BaseSyncOrchestrator(ABC):
         Returns:
             True if event was handled successfully
         """
-        try:
+        raise RuntimeError(
+            "Direct webhook mutation is disabled; persist a durable sync intent."
+        )
+
+        try:  # pragma: no cover
             remote_id = self._extract_remote_id(payload)
             if not remote_id:
                 logger.warning(
@@ -528,26 +855,40 @@ class BaseSyncOrchestrator(ABC):
         """Extract remote object data from webhook payload"""
         pass
 
-    def _get_or_create_mapping(self, local_object: models.Model) -> SyncMapping:
-        """Get or create SyncMapping for local object"""
+    def _get_existing_mapping(self, local_object: models.Model) -> SyncMapping | None:
+        """Return the exact owner-coherent mapping; never create one on save."""
         from .models import SyncMapping
 
         content_type = ContentType.objects.get_for_model(local_object)
-        mapping, created = SyncMapping.objects.get_or_create(
-            configuration=self.configuration,
-            content_type=content_type,
-            local_object_id=local_object.pk,
-            defaults={
-                "sync_status": SyncMapping.SyncStatus.PENDING,
-                "version": 1,
-            },
-        )
-
-        if created:
-            logger.info(
-                f"Created new mapping for {content_type.model} {local_object.pk}"
+        object_folder_id = getattr(local_object, "folder_id", None)
+        if object_folder_id is None:
+            logger.warning(
+                "Skipping push for object without an owner folder",
+                model=content_type.model,
+                object_id=str(local_object.pk),
             )
+            return None
 
+        mapping = (
+            SyncMapping.objects.filter(
+                configuration_id=self.configuration.pk,
+                configuration__is_active=True,
+                configuration__provider__is_active=True,
+                configuration__folder_id=object_folder_id,
+                content_type=content_type,
+                local_object_id=local_object.pk,
+                folder_id=object_folder_id,
+            )
+            .select_related("configuration")
+            .first()
+        )
+        if mapping is None:
+            logger.warning(
+                "Skipping push without an active, owner-coherent mapping",
+                config_id=str(self.configuration.pk),
+                model=content_type.model,
+                object_id=str(local_object.pk),
+            )
         return mapping
 
     def _get_local_object(self, mapping: SyncMapping) -> AbstractBaseModel:
@@ -559,12 +900,17 @@ class BaseSyncOrchestrator(ABC):
     def _update_local_object(
         self, local_object: models.Model, local_data: dict[str, Any]
     ) -> None:
-        """Update local object with data, skipping sync trigger"""
-        for field, value in local_data.items():
-            setattr(local_object, field, value)
+        """Apply legacy pull callers through the same typed local boundary."""
+        from integrations.local_commands import apply_inbound_update
+        from integrations.syncable import model_key_for_content_type
 
-        # Save with skip_sync flag to prevent infinite loop
-        local_object.save(skip_sync=True)
+        content_type = ContentType.objects.get_for_model(local_object)
+        model_key = model_key_for_content_type(content_type) or self.DEFAULT_MODEL_KEY
+        apply_inbound_update(
+            local_object=local_object,
+            local_data=local_data,
+            mapper=self.mapper_for(model_key),
+        )
         logger.debug(
             f"Updated local object {local_object.pk} with fields: {list(local_data.keys())}"
         )
@@ -690,6 +1036,11 @@ class BaseSyncOrchestrator(ABC):
 
         SyncEvent.objects.create(
             mapping=mapping,
+            mapping_id_snapshot=mapping.id,
+            configuration_id_snapshot=mapping.configuration_id,
+            content_type_id_snapshot=mapping.content_type_id,
+            local_object_id_snapshot=mapping.local_object_id,
+            remote_id_snapshot=mapping.remote_id,
             direction=direction,
             changes={"fields": changed_fields},
             triggered_by=SyncEvent.TriggeredBy.WEBHOOK

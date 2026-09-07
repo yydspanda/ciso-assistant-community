@@ -2,6 +2,7 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
 from . import views
+from .reconciliation_views import IntegrationSyncJobReconcileView
 
 app_name = "integrations"
 
@@ -32,6 +33,11 @@ urlpatterns = [
         "sync-mappings/<uuid:pk>/",
         views.SyncMappingDeleteView.as_view(),
         name="sync-mapping-delete",
+    ),
+    path(
+        "sync-jobs/<uuid:job_id>/reconcile/",
+        IntegrationSyncJobReconcileView.as_view(),
+        name="sync-job-reconcile",
     ),
     path("", include(router.urls)),
 ]

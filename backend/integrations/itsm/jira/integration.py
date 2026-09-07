@@ -95,17 +95,46 @@ class JiraOrchestrator(BaseITSMOrchestrator):
             }
         return payload
 
+    def classify_webhook_event(self, event_type: str) -> str:
+        if event_type in {"issue_created", "jira:issue_created"}:
+            return "ignore"
+        if event_type in {"issue_updated", "jira:issue_updated"}:
+            return "update"
+        if event_type in {"issue_deleted", "jira:issue_deleted"}:
+            return "delete"
+        return "invalid"
+
+    def project_webhook_payload(
+        self, *, event_type: str, payload: Dict[str, Any], model_key: str
+    ) -> Dict[str, Any]:
+        if self.classify_webhook_event(event_type) not in {"update", "delete"}:
+            raise ValueError("Unsupported Jira webhook event")
+        issue = payload.get("issue") if isinstance(payload, dict) else None
+        if not isinstance(issue, dict) or not issue.get("key"):
+            raise ValueError("Invalid Jira webhook payload")
+        raw_fields = issue.get("fields", {})
+        if not isinstance(raw_fields, dict):
+            raise ValueError("Invalid Jira issue fields")
+        mapper = self.mapper_for(model_key)
+        allowed = mapper.remote_field_names("pull", "update") | {"updated"}
+        fields = {key: raw_fields[key] for key in sorted(allowed) if key in raw_fields}
+        return {"issue": {"key": issue["key"], "fields": fields}}
+
     def handle_webhook_event(self, event_type: str, payload: Dict[str, Any]) -> bool:
         """Handle Jira-specific webhook events"""
+        raise RuntimeError(
+            "Direct webhook mutation is disabled; persist a durable sync intent."
+        )
+
         # Jira webhook event types
 
-        if "issue_created" in event_type:
+        if event_type in {"issue_created", "jira:issue_created"}:
             # NOTE: For now, we don't create local objects from Jira
             # This could be implemented if needed
             logger.info("Jira issue created", key=payload.get("issue", {}).get("key"))
             return True
 
-        elif "issue_updated" in event_type:
+        elif event_type in {"issue_updated", "jira:issue_updated"}:
             logger.info(
                 "Updating Jira issue from webhook event",
                 webhook_event=event_type,
@@ -115,7 +144,7 @@ class JiraOrchestrator(BaseITSMOrchestrator):
             remote_data = self._extract_remote_data(payload)
             return self.pull_changes(remote_id, remote_data)
 
-        elif "issue_deleted" in event_type:
+        elif event_type in {"issue_deleted", "jira:issue_deleted"}:
             remote_id = self._extract_remote_id(payload)
             return self._handle_remote_deletion(remote_id)
 
