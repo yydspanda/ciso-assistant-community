@@ -31,6 +31,7 @@ env:
   POSTGRES_VERSION: "16"
   UBUNTU_VERSION: "ubuntu-24.04"
   PYTHON_VERSION: "3.14"
+  UV_VERSION: "0.12.7"
 
 jobs:
   startup-functional-test:
@@ -68,6 +69,7 @@ jobs:
       - name: Install uv and set up python ${{ matrix.python-version }}
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - name: Check uv version
@@ -276,6 +278,7 @@ jobs:
       - name: Install uv and set up python ${{ matrix.python-version }}
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - name: Check uv version

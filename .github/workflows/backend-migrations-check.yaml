@@ -24,6 +24,7 @@ env:
   enterprise-backend-settings-module: enterprise_core.settings
   UBUNTU_VERSION: "ubuntu-24.04"
   PYTHON_VERSION: "3.12"
+  UV_VERSION: "0.12.7"
 
 jobs:
   migrations-check:
@@ -51,6 +52,7 @@ jobs:
       - name: Install uv and set up python ${{ matrix.python-version }}
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - name: Install backend requirements
@@ -87,6 +89,7 @@ jobs:
       - name: Install uv and set up python ${{ matrix.python-version }}
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - name: Install enterprise backend requirements

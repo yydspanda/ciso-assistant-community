@@ -32,6 +32,7 @@ env:
   POSTGRES_VERSION: "16"
   UBUNTU_VERSION: "24.04"
   PYTHON_VERSION: "3.14"
+  UV_VERSION: "0.12.7"
 
 jobs:
   build_community_frontend:
@@ -177,6 +178,7 @@ jobs:
       - name: Install uv and set up python ${{ env.PYTHON_VERSION }}
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
 
@@ -238,6 +240,7 @@ jobs:
       - name: Install uv and set up python ${{ env.PYTHON_VERSION }}
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
 
@@ -333,6 +336,7 @@ jobs:
       - name: Install uv and set up python ${{ matrix.python-version }}
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ matrix.python-version }}
           enable-cache: true
 
@@ -429,14 +433,38 @@ jobs:
       - name: Run migrations
         working-directory: ${{ env.backend-directory }}
         run: |
-          uv run python manage.py makemigrations
+          uv run python manage.py makemigrations --check --dry-run
           uv run python manage.py migrate
 
       - name: Start test server
         working-directory: ${{ env.backend-directory }}
         run: |
           uv run python manage.py createsuperuser --noinput
-          nohup uv run python manage.py runserver localhost:8173 &
+          BACKEND_LOG="$PWD/functional-backend-runserver.log"
+          nohup uv run python manage.py runserver localhost:8173 --noreload >"$BACKEND_LOG" 2>&1 &
+          BACKEND_PID=$!
+          BACKEND_READY=0
+          BACKEND_DEADLINE=$((SECONDS + 60))
+          while ((SECONDS < BACKEND_DEADLINE)); do
+            if curl --noproxy localhost,127.0.0.1 -fsS \
+              --connect-timeout 1 --max-time 2 \
+              http://localhost:8173/api/health/ >/dev/null 2>&1; then
+              BACKEND_READY=1
+              break
+            fi
+            if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+              echo "::error::Community test backend exited before becoming ready."
+              tail -n 200 "$BACKEND_LOG" || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [[ "$BACKEND_READY" -ne 1 ]]; then
+            echo "::error::Community test backend did not become ready within 60 seconds."
+            tail -n 200 "$BACKEND_LOG" || true
+            exit 1
+          fi
+          echo "Community test backend is ready."
 
       - name: Run tests with browser ${{ matrix.playwright-browser }}
         working-directory: ${{ env.frontend-directory }}/
@@ -533,6 +561,7 @@ jobs:
       - name: Install uv and set up python ${{ matrix.python-version }}
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ matrix.python-version }}
           enable-cache: true
 
@@ -631,14 +660,42 @@ jobs:
         working-directory: ${{ env.backend-directory }}
         env:
           SETTINGS_MODULE: ${{ env.enterprise-backend-settings-module }}
-        run: uv run --project ../enterprise/backend python manage.py migrate --settings="$SETTINGS_MODULE"
+        run: |
+          uv run --project ../enterprise/backend python manage.py makemigrations --check --dry-run --settings="$SETTINGS_MODULE"
+          uv run --project ../enterprise/backend python manage.py migrate --settings="$SETTINGS_MODULE"
+
       - name: Start test server
         working-directory: ${{ env.backend-directory }}
         env:
           SETTINGS_MODULE: ${{ env.enterprise-backend-settings-module }}
         run: |
           uv run --project ../enterprise/backend python manage.py createsuperuser --noinput --settings="$SETTINGS_MODULE"
-          nohup uv run --project ../enterprise/backend python manage.py runserver localhost:8173 --settings="$SETTINGS_MODULE" &
+          BACKEND_LOG="$PWD/functional-backend-runserver.log"
+          nohup uv run --project ../enterprise/backend python manage.py runserver localhost:8173 \
+            --noreload --settings="$SETTINGS_MODULE" >"$BACKEND_LOG" 2>&1 &
+          BACKEND_PID=$!
+          BACKEND_READY=0
+          BACKEND_DEADLINE=$((SECONDS + 60))
+          while ((SECONDS < BACKEND_DEADLINE)); do
+            if curl --noproxy localhost,127.0.0.1 -fsS \
+              --connect-timeout 1 --max-time 2 \
+              http://localhost:8173/api/health/ >/dev/null 2>&1; then
+              BACKEND_READY=1
+              break
+            fi
+            if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+              echo "::error::Enterprise test backend exited before becoming ready."
+              tail -n 200 "$BACKEND_LOG" || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [[ "$BACKEND_READY" -ne 1 ]]; then
+            echo "::error::Enterprise test backend did not become ready within 60 seconds."
+            tail -n 200 "$BACKEND_LOG" || true
+            exit 1
+          fi
+          echo "Enterprise test backend is ready."
 
       - name: Run tests with browser ${{ matrix.playwright-browser }}
         working-directory: ${{ env.enterprise-frontend-build-directory }}/

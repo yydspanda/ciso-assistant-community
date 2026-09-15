@@ -11,4 +11,26 @@ runs:
           -v "${{ github.workspace }}/frontend/tests/keycloak:/opt/keycloak/data/import" \
           quay.io/keycloak/keycloak:26.3.0 \
           start-dev --import-realm
+
+        KEYCLOAK_DEADLINE=$((SECONDS + 90))
+        while ((SECONDS < KEYCLOAK_DEADLINE)); do
+          if curl --noproxy localhost,127.0.0.1 -fsS \
+            --connect-timeout 1 --max-time 2 \
+            http://localhost:8080/realms/test/.well-known/openid-configuration \
+            >/dev/null 2>&1; then
+            echo "Keycloak test realm is ready."
+            exit 0
+          fi
+
+          if [[ "$(docker inspect --format '{{.State.Running}}' keycloak-test 2>/dev/null || true)" != "true" ]]; then
+            echo "::error::Keycloak exited before the imported test realm became ready."
+            docker logs --tail 200 keycloak-test 2>&1 || true
+            exit 1
+          fi
+          sleep 1
+        done
+
+        echo "::error::Keycloak test realm did not become ready within 90 seconds."
+        docker logs --tail 200 keycloak-test 2>&1 || true
+        exit 1
       shell: bash

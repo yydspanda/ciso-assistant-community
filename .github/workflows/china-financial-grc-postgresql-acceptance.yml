@@ -17,6 +17,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  UV_VERSION: "0.12.7"
+
 jobs:
   postgresql-synthetic-technical-acceptance:
     runs-on: ubuntu-24.04
@@ -27,6 +30,7 @@ jobs:
       - name: Install uv and Python
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: "3.14"
           enable-cache: true
 
