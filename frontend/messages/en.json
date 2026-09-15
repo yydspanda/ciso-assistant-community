@@ -1188,6 +1188,7 @@
 	"selectSourceAudit": "Select a source audit to enrich from",
 	"mapFromSuccess": "Audit updated successfully",
 	"mapFromError": "Failed to map from source audit",
+	"mapFromNavigationError": "The target audit could not be opened automatically. Open it manually to continue.",
 	"currentState": "Current State",
 	"projectedState": "Projected State",
 	"confirmMapping": "Confirm mapping",

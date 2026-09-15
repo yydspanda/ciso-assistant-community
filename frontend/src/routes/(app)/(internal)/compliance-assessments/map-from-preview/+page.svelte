@@ -6,6 +6,7 @@
 	import { m } from '$paraglide/messages';
 	import { getFlash } from 'sveltekit-flash-message';
 	import type { PageData } from './$types';
+	import { applyMapFrom } from './map-from-action';
 
 	const flash = getFlash(page);
 
@@ -64,28 +65,36 @@
 	let isApplying = $state(false);
 
 	async function confirmMapFrom() {
+		if (isApplying) return;
 		isApplying = true;
 		try {
-			const response = await fetch(`/compliance-assessments/${data.targetId}/map-from`, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ source_audit_id: data.sourceId })
+			const outcome = await applyMapFrom({
+				sourceId: data.sourceId,
+				targetId: data.targetId,
+				fetcher: fetch,
+				navigate: goto
 			});
 
-			if (response.ok) {
-				const result = await response.json();
-				flash.set({
-					type: 'success',
-					message: `${m.mapFromSuccess()} (${result.updated_count} ${m.requirementsUpdated()})`
-				});
-				goto(`/compliance-assessments/${data.targetId}`);
-			} else {
-				const err = await response.json();
+			if (outcome.status === 'failed') {
 				flash.set({
 					type: 'error',
-					message: err.error || m.mapFromError()
+					message: outcome.message || m.mapFromError()
 				});
+				return;
 			}
+
+			const countSuffix =
+				outcome.updatedCount === undefined
+					? ''
+					: ` (${outcome.updatedCount} ${m.requirementsUpdated()})`;
+			// Start the toast lifetime only after navigation settles. If navigation
+			// fails, report the committed update as a partial UI failure, not a write failure.
+			flash.set({
+				type: outcome.navigated ? 'success' : 'warning',
+				message: outcome.navigated
+					? `${m.mapFromSuccess()}${countSuffix}`
+					: `${m.mapFromSuccess()}${countSuffix}. ${m.mapFromNavigationError()}`
+			});
 		} catch {
 			flash.set({ type: 'error', message: m.mapFromError() });
 		} finally {

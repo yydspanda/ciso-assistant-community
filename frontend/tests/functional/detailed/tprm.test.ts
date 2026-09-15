@@ -8,6 +8,8 @@ import { SideBar } from '../../utils/sidebar.js';
 let vars = TestContent.generateTestVars();
 let testObjectsData: { [k: string]: any } = TestContent.itemBuilder(vars);
 
+test.describe.configure({ mode: 'serial' });
+
 const entityAssessment = {
 	name: 'Test entity assessment',
 	// folder is inherited from the entity via initialData, no need to specify it
@@ -255,12 +257,24 @@ test('third-party representative can fill their assigned audit', async ({
 			await page.waitForTimeout(1000); // workaround flakiness due to overlapping calls
 		};
 
+		// The API serializes parent_requirement as a nested object. Prove that the
+		// client resolves it to the real non-assessable node instead of accidentally
+		// skipping straight to the first answerable requirement.
+		await expect(page.getByRole('heading', { name: 'ACCESS CONTROL', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Yes', exact: true })).toHaveCount(0);
+		const nextButton = page.getByRole('button', { name: m.next() });
+		await expect(nextButton).toBeVisible();
+		await nextButton.click();
+		await expect(
+			page.getByRole('heading', { name: 'Authorized Access Control', exact: true })
+		).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Yes', exact: true }).first()).toBeVisible();
+
 		// Card view shows one requirement at a time — fill a few to verify functionality
 		// Requirement 1: click Yes
 		await clickAndPause(page.getByRole('button', { name: 'Yes' }).first());
 
 		// Navigate to next requirements and set results (fill 5 more)
-		const nextButton = page.getByRole('button', { name: m.next() });
 		for (let i = 0; i < 5 && !(await nextButton.isDisabled()); i++) {
 			await nextButton.click();
 			await page.waitForTimeout(500);
@@ -275,6 +289,7 @@ test('third-party representative can fill their assigned audit', async ({
 			await prevButton.click();
 			await page.waitForTimeout(300);
 		}
+		await page.getByRole('button', { name: m.next() }).click();
 
 		// Open the evidence accordion section (collapsed by default)
 		await page.getByTestId('evidence-accordion-trigger').click();

@@ -228,6 +228,24 @@
 			.map((r: Record<string, any>) => ({ type: 'splash' as const, data: r }))
 	);
 
+	function resolveParentNode(parentReference: unknown): Record<string, any> | undefined {
+		if (!parentReference) return undefined;
+
+		const parentId =
+			typeof parentReference === 'object' && parentReference !== null
+				? (parentReference as Record<string, unknown>).id
+				: parentReference;
+		const parentUrn =
+			typeof parentReference === 'object' && parentReference !== null
+				? (parentReference as Record<string, unknown>).urn
+				: parentReference;
+
+		return data.requirements.find(
+			(r: Record<string, any>) =>
+				(parentId != null && r.id === parentId) || (parentUrn != null && r.urn === parentUrn)
+		);
+	}
+
 	const navItems: NavItem[] = $derived.by(() => {
 		const sorted = [...assessmentNavItems, ...splashNavItems].sort((a, b) => {
 			const orderA =
@@ -245,15 +263,15 @@
 		const seenParents = new Set<string>();
 		const items: NavItem[] = [];
 		for (const item of sorted) {
-			const parentUrn =
+			const requirementId = item.data.requirement?.id ?? item.data.requirement;
+			const parentReference =
 				item.type === 'assessment'
-					? requirementHashmap[item.data.requirement?.id]?.parent_requirement
+					? requirementHashmap[requirementId]?.parent_requirement
 					: item.data.parent_requirement;
-			if (parentUrn && !seenParents.has(parentUrn)) {
-				seenParents.add(parentUrn);
-				const parentNode = data.requirements.find(
-					(r: Record<string, any>) => r.id === parentUrn || r.urn === parentUrn
-				);
+			const parentNode = resolveParentNode(parentReference);
+			const parentKey = parentNode ? String(parentNode.id ?? parentNode.urn ?? '') : '';
+			if (parentKey && !seenParents.has(parentKey)) {
+				seenParents.add(parentKey);
 				if (parentNode && parentNode.display_mode !== 'splash' && !parentNode.assessable) {
 					items.push({ type: 'section', data: parentNode });
 				}
@@ -1343,8 +1361,8 @@
 			</div>
 		{/if}
 
-		<!-- Previous / Next navigation (shown for both splash and assessment items) -->
-		{#if currentSplashNode || currentItem}
+		<!-- Previous / Next navigation for every navigable item, including section headers -->
+		{#if currentSplashNode || currentSectionNode || currentItem}
 			<div class="flex items-center justify-between card bg-surface-50-950 shadow-sm px-5 py-3">
 				<button
 					class="btn preset-tonal-surface"

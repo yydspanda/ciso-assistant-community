@@ -28,6 +28,7 @@
 		getFieldVisibility,
 		hasComputedResult,
 		hasComputedScore,
+		isFieldEditable,
 		shouldShowAutoQuestion,
 		buildAutoAlignmentQuestion,
 		alignmentValueFromChoiceUrn,
@@ -48,6 +49,7 @@
 	import { invalidateAll } from '$app/navigation';
 	import Anchor from '$lib/components/Anchor/Anchor.svelte';
 	import MappingInferenceView from '$lib/components/ComplianceAssessment/MappingInferenceView.svelte';
+	import { clientSideToast } from '$lib/utils/stores';
 
 	interface Props {
 		data: PageData;
@@ -101,6 +103,67 @@
 	const showAppliedControls = $derived(fieldVis.showAppliedControls);
 	const showEvidences = $derived(fieldVis.showEvidences);
 	const showRespondentAlignment = $derived(fieldVis.showRespondentAlignment);
+	const canEditAnswers = $derived(isFieldEditable(complianceAssessment, 'answers', viewerRole));
+	const canEditStatus = $derived(isFieldEditable(complianceAssessment, 'status', viewerRole));
+	const canEditResult = $derived(isFieldEditable(complianceAssessment, 'result', viewerRole));
+	const canEditRespondentAlignment = $derived(
+		isFieldEditable(complianceAssessment, 'respondent_alignment', viewerRole)
+	);
+	const canEditScore = $derived(isFieldEditable(complianceAssessment, 'score', viewerRole));
+	const canEditIsScored = $derived(isFieldEditable(complianceAssessment, 'is_scored', viewerRole));
+	const canEditDocumentationScore = $derived(
+		isFieldEditable(complianceAssessment, 'documentation_score', viewerRole)
+	);
+	const canEditObservation = $derived(
+		isFieldEditable(complianceAssessment, 'observation', viewerRole)
+	);
+	const canEditAppliedControls = $derived(
+		isFieldEditable(complianceAssessment, 'applied_controls', viewerRole)
+	);
+	const canEditEvidences = $derived(isFieldEditable(complianceAssessment, 'evidences', viewerRole));
+	let scalarUpdatePending = $state<Record<string, boolean>>({});
+
+	function scalarUpdateKey(requirementAssessment: Record<string, any>, field: string): string {
+		return `${requirementAssessment.id}:${field}`;
+	}
+
+	function isScalarUpdatePending(
+		requirementAssessment: Record<string, any>,
+		field: string
+	): boolean {
+		return scalarUpdatePending[scalarUpdateKey(requirementAssessment, field)] === true;
+	}
+
+	function showScalarUpdateError(): void {
+		clientSideToast.set({ type: 'error', message: m.error(), timeout: 10000 });
+	}
+
+	type ScalarUpdateField =
+		| 'answers'
+		| 'status'
+		| 'result'
+		| 'respondent_alignment'
+		| 'score'
+		| 'documentation_score'
+		| 'is_scored'
+		| 'observation';
+
+	function canSubmitScalarField(field: string): field is ScalarUpdateField {
+		return (
+			[
+				'answers',
+				'status',
+				'result',
+				'respondent_alignment',
+				'score',
+				'documentation_score',
+				'is_scored',
+				'observation'
+			].includes(field) &&
+			!isReadOnly &&
+			isFieldEditable(complianceAssessment, field, viewerRole)
+		);
+	}
 
 	const hasQuestions = $derived(
 		requirementAssessments.some(
@@ -129,36 +192,95 @@
 	// Function to update requirement assessments, the data argument contain fields as keys and the associated values as values.
 	async function updateBulk(
 		requirementAssessment: Record<string, any>,
-		data: { [key: string]: string | number | boolean | null }
-	) {
+		data: Record<string, unknown>
+	): Promise<boolean> {
+		const fields = Object.keys(data);
+		if (fields.length === 0 || fields.some((field) => !canSubmitScalarField(field))) {
+			showScalarUpdateError();
+			return false;
+		}
 		const form = document.getElementById(
 			`tableModeForm-${requirementAssessment.id}`
 		) as HTMLFormElement;
+		if (!form) {
+			showScalarUpdateError();
+			return false;
+		}
 		const formData = {
 			...data,
 			id: requirementAssessment.id
 		};
-		const res = await fetch(form.action, {
-			method: 'POST',
-			body: JSON.stringify(formData)
-		});
-		return res;
+		try {
+			const response = await fetch(form.action, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(formData)
+			});
+			if (response.ok) return true;
+		} catch {
+			// The authoritative state is restored by the caller below.
+		}
+		showScalarUpdateError();
+		return false;
 	}
 
 	// Function to update requirement assessments
-	async function update(requirementAssessment: Record<string, any>, field: string) {
+	async function update(
+		requirementAssessment: Record<string, any>,
+		field: string,
+		previousValue: unknown
+	): Promise<boolean> {
+		const pendingKey = scalarUpdateKey(requirementAssessment, field);
+		if (scalarUpdatePending[pendingKey]) {
+			requirementAssessment[field] = previousValue;
+			return false;
+		}
+		scalarUpdatePending[pendingKey] = true;
 		const value = requirementAssessment[field];
-		await updateBulk(requirementAssessment, {
+		const updated = await updateBulk(requirementAssessment, {
 			[field]: value
 		});
 
-		if (invalidateAllBool) {
-			await invalidateAll();
+		if (!updated) {
+			requirementAssessment[field] = previousValue;
+			if (requirementAssessment.updateForm?.data) {
+				requirementAssessment.updateForm.data[field] = previousValue;
+			}
 		}
 
-		// Update requirementAssessment.updateForm.data with the specified field and value
-		if (requirementAssessment.updateForm && requirementAssessment.updateForm.data) {
+		try {
+			if (invalidateAllBool) await invalidateAll();
+		} finally {
+			scalarUpdatePending[pendingKey] = false;
+		}
+
+		if (updated && requirementAssessment.updateForm?.data) {
 			requirementAssessment.updateForm.data[field] = value;
+		}
+		return updated;
+	}
+
+	async function updateAnswer(
+		requirementAssessment: Record<string, any>,
+		urn: string,
+		newAnswer: unknown
+	): Promise<void> {
+		const pendingKey = scalarUpdateKey(requirementAssessment, 'answers');
+		if (scalarUpdatePending[pendingKey]) return;
+
+		const previousAnswers = structuredClone(requirementAssessment.answers ?? {});
+		scalarUpdatePending[pendingKey] = true;
+		requirementAssessment.answers ??= {};
+		requirementAssessment.answers[urn] = newAnswer;
+		const updated = await updateBulk(requirementAssessment, {
+			answers: { [urn]: newAnswer }
+		});
+		if (!updated) requirementAssessment.answers = previousAnswers;
+
+		try {
+			if (invalidateAllBool) await invalidateAll();
+		} finally {
+			scalarUpdatePending[pendingKey] = false;
 		}
 	}
 
@@ -209,48 +331,110 @@
 
 	let addedMeasure = $state(0);
 	let addedEvidence = $state(0);
+	type RelationshipUpdateField = 'evidences' | 'applied_controls';
+	type RelationshipUpdateContext = 'selectEvidences' | 'selectAppliedControls';
+	const relationshipFieldByContext: Record<RelationshipUpdateContext, RelationshipUpdateField> = {
+		selectEvidences: 'evidences',
+		selectAppliedControls: 'applied_controls'
+	};
 
-	const requirementAssessmentScores = Object.fromEntries(
+	type ScoreField = 'score' | 'documentation_score';
+	const requirementAssessmentScores: Record<string, unknown> = Object.fromEntries(
 		// svelte-ignore state_referenced_locally
-		requirementAssessments.map((requirement) => {
-			return [requirement.id, [requirement.is_scored, requirement.score]];
-		})
+		requirementAssessments.flatMap((requirement) => [
+			[scalarUpdateKey(requirement, 'score'), requirement.score],
+			[scalarUpdateKey(requirement, 'documentation_score'), requirement.documentation_score]
+		])
+	);
+	const persistedRequirementAssessmentScores: Record<string, unknown> = Object.fromEntries(
+		// svelte-ignore state_referenced_locally
+		requirementAssessments.flatMap((requirement) => [
+			[scalarUpdateKey(requirement, 'score'), requirement.score],
+			[scalarUpdateKey(requirement, 'documentation_score'), requirement.documentation_score]
+		])
 	);
 
-	async function updateScore(requirementAssessment: Record<string, any>) {
-		const score = requirementAssessment.score;
-		const documentationScore = requirementAssessment.documentation_score;
-		requirementAssessmentScores[requirementAssessment.id] = [
-			requirementAssessment.is_scored,
-			score,
-			documentationScore
-		];
+	async function updateScore(
+		requirementAssessment: Record<string, any>,
+		field: ScoreField
+	): Promise<void> {
+		const value = requirementAssessment[field];
+		const pendingKey = scalarUpdateKey(requirementAssessment, field);
+		requirementAssessmentScores[pendingKey] = value;
 		setTimeout(async () => {
-			const currentScoreValue = requirementAssessmentScores[requirementAssessment.id];
-			if (score === currentScoreValue[1] && documentationScore === currentScoreValue[2]) {
-				await updateBulk(requirementAssessment, {
-					score: score,
-					documentation_score: documentationScore
-				});
+			if (!Object.is(value, requirementAssessmentScores[pendingKey])) return;
+			if (scalarUpdatePending[pendingKey]) return;
+			scalarUpdatePending[pendingKey] = true;
+			const previous = persistedRequirementAssessmentScores[pendingKey];
+			const updated = await updateBulk(requirementAssessment, { [field]: value });
+			if (updated) {
+				persistedRequirementAssessmentScores[pendingKey] = value;
+			} else {
+				requirementAssessment[field] = previous;
 			}
-		}, 500); // There must be 500ms without a score change for a request to be sent and modify the score of the RequirementAsessment in the backend
+			try {
+				if (invalidateAllBool) await invalidateAll();
+			} finally {
+				scalarUpdatePending[pendingKey] = false;
+			}
+		}, 500); // Send a score update only after 500 ms without another local score change.
 	}
 
-	function modalUpdateForm(requirementAssessment: Record<string, any>, context: string): void {
+	function applyRelationshipUpdate(
+		requirementAssessment: Record<string, any>,
+		field: RelationshipUpdateField
+	): void {
+		const actionData = page.form as {
+			form?: {
+				message?: {
+					object?: Record<string, any>;
+					field?: string;
+					toast?: { type: string; message: string };
+				};
+			};
+		} | null;
+		const update = actionData?.form?.message;
+		const object = update?.object;
+
+		if (update?.field !== field || object?.id !== requirementAssessment.id) return;
+		const relationships = object[field];
+		if (!Array.isArray(relationships)) return;
+
+		requirementAssessment[field] = relationships;
+		const relationshipIds = relationships
+			.map((relationship) => (typeof relationship === 'string' ? relationship : relationship?.id))
+			.filter((id): id is string => typeof id === 'string');
+		requirementAssessment.object[field] = relationshipIds;
+		requirementAssessment.updateForm.data[field] = relationshipIds;
+		if (update.toast) clientSideToast.set(update.toast);
+
+		if (field === 'evidences') addedEvidence += 1;
+		else addedMeasure += 1;
+	}
+
+	function modalUpdateForm(
+		requirementAssessment: Record<string, any>,
+		context: RelationshipUpdateContext
+	): void {
+		const field = relationshipFieldByContext[context];
 		const modalComponent: ModalComponent = {
 			ref: UpdateModal,
 			props: {
 				form: requirementAssessment.updateForm,
 				model: requirementAssessment.updatedModel,
 				object: requirementAssessment.object,
-				formAction: '?/update&id=' + requirementAssessment.id,
+				formAction: `?/update&id=${encodeURIComponent(requirementAssessment.id)}&field=${field}`,
+				invalidateAll: false,
 				context
 			}
 		};
 		const modal: ModalSettings = {
 			type: 'component',
 			component: modalComponent,
-			title: getTitle(requirementAssessment)
+			title: getTitle(requirementAssessment),
+			response: (confirmed) => {
+				if (confirmed === true) applyRelationshipUpdate(requirementAssessment, field);
+			}
 		};
 		modalStore.trigger(modal);
 	}
@@ -569,13 +753,17 @@
 															labelKey="label"
 															field="status"
 															colorMap={complianceStatusTailwindColorMap}
-															disabled={isReadOnly}
+															disabled={isReadOnly ||
+																!canEditStatus ||
+																isScalarUpdatePending(requirementAssessment, 'status')}
 															initialValue={requirementAssessment.status}
 															onChange={(newValue) => {
+																if (isScalarUpdatePending(requirementAssessment, 'status')) return;
+																const previousStatus = requirementAssessment.status;
 																const newStatus =
 																	requirementAssessment.status === newValue ? 'to_do' : newValue;
 																requirementAssessment.status = newStatus;
-																update(requirementAssessment, 'status');
+																void update(requirementAssessment, 'status', previousStatus);
 															}}
 														/>
 													</div>
@@ -605,15 +793,19 @@
 															labelKey="label"
 															field="result"
 															colorMap={complianceResultTailwindColorMap}
-															disabled={isReadOnly}
+															disabled={isReadOnly ||
+																!canEditResult ||
+																isScalarUpdatePending(requirementAssessment, 'result')}
 															initialValue={requirementAssessment.result}
 															onChange={(newValue) => {
+																if (isScalarUpdatePending(requirementAssessment, 'result')) return;
+																const previousResult = requirementAssessment.result;
 																const newResult =
 																	requirementAssessment.result === newValue
 																		? 'not_assessed'
 																		: newValue;
 																requirementAssessment.result = newResult;
-																update(requirementAssessment, 'result');
+																void update(requirementAssessment, 'result', previousResult);
 															}}
 														/>
 													{/if}
@@ -626,16 +818,12 @@
 													questions={requirementAssessment.requirement.questions}
 													initialValue={requirementAssessment.answers}
 													field="answers"
-													disabled={isReadOnly}
+													disabled={isReadOnly ||
+														!canEditAnswers ||
+														isScalarUpdatePending(requirementAssessment, 'answers')}
 													{shallow}
 													onChange={async (urn, newAnswer) => {
-														requirementAssessment.answers[urn] = newAnswer;
-														await updateBulk(requirementAssessment, {
-															answers: { [urn]: newAnswer }
-														});
-														if (invalidateAllBool) {
-															await invalidateAll();
-														}
+														await updateAnswer(requirementAssessment, urn, newAnswer);
 													}}
 												/>
 											</div>
@@ -657,11 +845,22 @@
 														)
 													}}
 													field="respondent_alignment"
-													disabled={isReadOnly}
+													disabled={isReadOnly ||
+														!canEditRespondentAlignment ||
+														isScalarUpdatePending(requirementAssessment, 'respondent_alignment')}
 													onChange={(_urn, choiceUrn) => {
+														if (
+															isScalarUpdatePending(requirementAssessment, 'respondent_alignment')
+														)
+															return;
+														const previousAlignment = requirementAssessment.respondent_alignment;
 														const newAlignment = alignmentValueFromChoiceUrn(choiceUrn);
 														requirementAssessment.respondent_alignment = newAlignment;
-														update(requirementAssessment, 'respondent_alignment');
+														void update(
+															requirementAssessment,
+															'respondent_alignment',
+															previousAlignment
+														);
 													}}
 												/>
 											</div>
@@ -726,25 +925,38 @@
 															: m.score()}
 														styles="w-full p-1"
 														onChange={(newScore) => {
+															if (isScalarUpdatePending(requirementAssessment, 'score')) return;
 															requirementAssessment.score = newScore;
-															updateScore(requirementAssessment);
+															updateScore(requirementAssessment, 'score');
 														}}
-														disabled={!requirementAssessment.is_scored}
+														disabled={isReadOnly ||
+															!canEditScore ||
+															!requirementAssessment.is_scored ||
+															isScalarUpdatePending(requirementAssessment, 'score')}
 													>
 														{#snippet left()}
 															<div>
 																<Checkbox
 																	form={isScoredForms[requirementAssessment.id]}
 																	field="is_scored"
-																	disabled={isReadOnly}
+																	disabled={isReadOnly ||
+																		!canEditIsScored ||
+																		isScalarUpdatePending(requirementAssessment, 'is_scored')}
 																	label={''}
 																	helpText={m.scoringHelpText()}
 																	checkboxComponent="switch"
 																	classes="h-full flex flex-row items-center justify-center my-1"
 																	classesContainer="h-full flex flex-row items-center space-x-4"
 																	onChange={async (newValue) => {
+																		if (isScalarUpdatePending(requirementAssessment, 'is_scored'))
+																			return;
+																		const previousIsScored = requirementAssessment.is_scored;
 																		requirementAssessment.is_scored = newValue;
-																		await update(requirementAssessment, 'is_scored');
+																		await update(
+																			requirementAssessment,
+																			'is_scored',
+																			previousIsScored
+																		);
 																	}}
 																/>
 															</div>
@@ -761,10 +973,20 @@
 															isDoc={true}
 															styles="w-full p-1"
 															onChange={(newScore) => {
+																if (
+																	isScalarUpdatePending(
+																		requirementAssessment,
+																		'documentation_score'
+																	)
+																)
+																	return;
 																requirementAssessment.documentation_score = newScore;
-																updateScore(requirementAssessment);
+																updateScore(requirementAssessment, 'documentation_score');
 															}}
-															disabled={!requirementAssessment.is_scored}
+															disabled={isReadOnly ||
+																!canEditDocumentationScore ||
+																!requirementAssessment.is_scored ||
+																isScalarUpdatePending(requirementAssessment, 'documentation_score')}
 														/>
 													{/if}
 												{/if}
@@ -914,10 +1136,18 @@
 															<Accordion.ItemContent>
 																<TableMarkdownField
 																	bind:value={requirementAssessment.observation}
-																	disabled={isReadOnly}
+																	disabled={isReadOnly ||
+																		!canEditObservation ||
+																		isScalarUpdatePending(requirementAssessment, 'observation')}
 																	onSave={async (newValue) => {
-																		await update(requirementAssessment, 'observation');
-																		requirementAssessment.observationBuffer = newValue;
+																		if (isScalarUpdatePending(requirementAssessment, 'observation'))
+																			return;
+																		const updated = await update(
+																			requirementAssessment,
+																			'observation',
+																			requirementAssessment.observationBuffer
+																		);
+																		if (updated) requirementAssessment.observationBuffer = newValue;
 																	}}
 																/>
 															</Accordion.ItemContent>
@@ -932,6 +1162,7 @@
 														<Accordion.Item value="appliedControl">
 															<Accordion.ItemTrigger
 																class="flex w-full items-center cursor-pointer"
+																data-testid="applied-control-accordion-trigger"
 															>
 																<p class="flex flex-1 items-center space-x-2 text-left">
 																	<span>{m.appliedControl()}</span>
@@ -959,7 +1190,7 @@
 															</Accordion.ItemTrigger>
 															<Accordion.ItemContent>
 																<div class="flex flex-row space-x-2 items-center">
-																	{#if !shallow && !isReadOnly}
+																	{#if !shallow && !isReadOnly && canEditAppliedControls}
 																		{#if requirementAssessment.measureCreateForm}
 																			<button
 																				class="btn preset-filled-primary-500 self-start"
@@ -968,6 +1199,7 @@
 																						requirementAssessment.measureCreateForm
 																					)}
 																				type="button"
+																				data-testid="create-applied-control-button"
 																				><i class="fa-solid fa-plus mr-2"
 																				></i>{m.addAppliedControl()}</button
 																			>
@@ -975,6 +1207,7 @@
 																		<button
 																			class="btn preset-filled-secondary-500 self-start"
 																			type="button"
+																			data-testid="select-applied-controls-button"
 																			onclick={() =>
 																				modalUpdateForm(
 																					requirementAssessment,
@@ -993,6 +1226,7 @@
 																					class="anchor"
 																					href="/applied-controls/{ac.id}"
 																					label={ac.str}
+																					data-testid="applied-control-link"
 																					><i class="fa-solid fa-fire-extinguisher mr-2"
 																					></i>{ac.str}</Anchor
 																				>
@@ -1014,6 +1248,7 @@
 														<Accordion.Item value="evidence">
 															<Accordion.ItemTrigger
 																class="flex w-full items-center cursor-pointer"
+																data-testid="evidence-accordion-trigger"
 															>
 																<p class="flex flex-1 items-center space-x-2 text-left">
 																	<span>{m.evidence()}</span>
@@ -1043,7 +1278,7 @@
 															</Accordion.ItemTrigger>
 															<Accordion.ItemContent>
 																<div class="flex flex-row space-x-2 items-center">
-																	{#if !shallow && !isReadOnly}
+																	{#if !shallow && !isReadOnly && canEditEvidences}
 																		{#if requirementAssessment.evidenceCreateForm}
 																			<button
 																				class="btn preset-filled-primary-500 self-start"

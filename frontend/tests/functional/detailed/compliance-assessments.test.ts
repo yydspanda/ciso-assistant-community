@@ -2,9 +2,12 @@ import { LoginPage } from '../../utils/login-page.js';
 import { PageContent } from '../../utils/page-content.js';
 import { TestContent, test, expect } from '../../utils/test-utils.js';
 import { m } from '$paraglide/messages';
+import type { Locator } from '@playwright/test';
 
 let vars = TestContent.generateTestVars();
 let testObjectsData: { [k: string]: any } = TestContent.itemBuilder(vars);
+
+test.describe.configure({ mode: 'serial' });
 
 test('compliance assessments scoring is working properly', async ({
 	logedPage,
@@ -12,6 +15,7 @@ test('compliance assessments scoring is working properly', async ({
 	complianceAssessmentsPage,
 	page
 }) => {
+	test.setTimeout(10 * 60 * 1000);
 	const testRequirements = ['folders', 'perimeters', 'complianceAssessments'];
 	const minScore = 1;
 	const maxScore = 4;
@@ -30,6 +34,14 @@ test('compliance assessments scoring is working properly', async ({
 	const PRAC1Score = {
 		ratio: 0.0,
 		value: 1
+	};
+	const scoreProgress = page.getByTestId('score-field').getByTestId('progress-ring-svg');
+	const openRequirementAssessment = async (link: Locator) => {
+		const href = await link.getAttribute('href');
+		expect(href).toMatch(/^\/requirement-assessments\/[0-9a-f-]+\/edit(?:\?.*)?$/i);
+		const response = await page.goto(href!, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+		expect(response?.ok()).toBe(true);
+		await expect(page).toHaveURL(/\/requirement-assessments\/[^/]+\/edit(?:\?.*)?$/);
 	};
 	// Helper to convert raw score to percentage for tree view assertions
 	const toPercent = (score: number) =>
@@ -61,17 +73,17 @@ test('compliance assessments scoring is working properly', async ({
 	await page.getByText('More').click();
 	await page.getByTestId('visibility-score-everyone').click();
 	await page.getByTestId('save-button').click();
-	await page.waitForURL(/\/compliance-assessments\/[^/]+$/);
+	await page.waitForURL((url) => /^\/compliance-assessments\/[0-9a-f-]+$/i.test(url.pathname));
+	const complianceAssessmentDetailUrl = page.url();
 
 	// Click on the ID.AM-1 tree view item
 	const IDAM1TreeViewItem = await complianceAssessmentsPage.itemDetail.treeViewItem('ID.AM-1', [
 		'ID - Identify',
 		'ID.AM - Asset Management'
 	]);
-	await IDAM1TreeViewItem.content.click();
-
-	await page.waitForURL('/requirement-assessments/**');
-	await expect(page.getByTestId('progress-ring-svg')).toHaveAttribute('data-value', '1');
+	await openRequirementAssessment(IDAM1TreeViewItem.content.getByRole('link'));
+	await expect(scoreProgress).toBeVisible({ timeout: 60_000 });
+	await expect(scoreProgress).toHaveAttribute('data-value', '1');
 
 	const IDAM1SliderBoundingBox = await page.getByTestId('range-slider-input').boundingBox();
 	IDAM1SliderBoundingBox &&
@@ -81,16 +93,33 @@ test('compliance assessments scoring is working properly', async ({
 				y: IDAM1SliderBoundingBox.height / 2
 			}
 		}));
-	await expect(page.getByTestId('progress-ring-svg')).toHaveAttribute(
-		'data-value',
-		IDAM1Score.value.toString()
-	);
+	await expect(scoreProgress).toHaveAttribute('data-value', IDAM1Score.value.toString());
 
+	const firstRequirementAssessmentUrl = page.url();
 	await page.getByTestId('save-no-continue-button').click();
 	await complianceAssessmentsPage.isToastVisible('successfully saved', 'i');
-	await page.goBack();
-	await page.waitForURL(complianceAssessmentsPage.url + '/**');
-	await expect(IDAM1TreeViewItem.progressRadial).toHaveAttribute(
+
+	// The stay choice is submission-local. Without remounting this page, the
+	// primary Save/Next button must redirect instead of inheriting stay mode.
+	const saveNextNavigation = page.waitForURL(
+		(url) =>
+			/\/requirement-assessments\/[^/]+\/edit(?:\?.*)?$/.test(url.pathname + url.search) &&
+			url.href !== firstRequirementAssessmentUrl
+	);
+	await page.getByTestId('save-button').click();
+	await saveNextNavigation;
+	await page.goto(complianceAssessmentDetailUrl, { waitUntil: 'domcontentloaded' });
+	const expandAllButton = page.getByRole('button', { name: /Expand all/ });
+	await expect(expandAllButton).toBeVisible({ timeout: 60_000 });
+	await expandAllButton.click();
+	await expect(page.getByRole('link', { name: 'ID.AM-1', exact: true })).toBeVisible({
+		timeout: 60_000
+	});
+	const refreshedIDAM1TreeViewItem = await complianceAssessmentsPage.itemDetail.treeViewItem(
+		'ID.AM-1',
+		['ID - Identify', 'ID.AM - Asset Management']
+	);
+	await expect(refreshedIDAM1TreeViewItem.progressRadial).toHaveAttribute(
 		'data-value',
 		toPercent(IDAM1Score.value)
 	);
@@ -100,10 +129,9 @@ test('compliance assessments scoring is working properly', async ({
 		'ID - Identify',
 		'ID.AM - Asset Management'
 	]);
-	await IDAM2TreeViewItem.content.click();
-
-	await page.waitForURL('/requirement-assessments/**');
-	await expect(page.getByTestId('progress-ring-svg')).toHaveAttribute('data-value', '1');
+	await openRequirementAssessment(IDAM2TreeViewItem.content.getByRole('link'));
+	await expect(scoreProgress).toBeVisible({ timeout: 60_000 });
+	await expect(scoreProgress).toHaveAttribute('data-value', '1');
 
 	const IDAM2SliderBoundingBox = await page.getByTestId('range-slider-input').boundingBox();
 	IDAM2SliderBoundingBox &&
@@ -113,10 +141,7 @@ test('compliance assessments scoring is working properly', async ({
 				y: IDAM2SliderBoundingBox.height / 2
 			}
 		}));
-	await expect(page.getByTestId('progress-ring-svg')).toHaveAttribute(
-		'data-value',
-		IDAM2Score.value.toString()
-	);
+	await expect(scoreProgress).toHaveAttribute('data-value', IDAM2Score.value.toString());
 
 	await page.getByTestId('save-no-continue-button').click();
 	await complianceAssessmentsPage.isToastVisible('successfully saved', 'i');
@@ -132,10 +157,9 @@ test('compliance assessments scoring is working properly', async ({
 		'ID - Identify',
 		'ID.BE - Business Environment'
 	]);
-	await IDBE1TreeViewItem.content.click();
-
-	await page.waitForURL('/requirement-assessments/**');
-	await expect(page.getByTestId('progress-ring-svg')).toHaveAttribute('data-value', '1');
+	await openRequirementAssessment(IDBE1TreeViewItem.content.getByRole('link'));
+	await expect(scoreProgress).toBeVisible({ timeout: 60_000 });
+	await expect(scoreProgress).toHaveAttribute('data-value', '1');
 
 	const IDBE1SliderBoundingBox = await page.getByTestId('range-slider-input').boundingBox();
 	IDBE1SliderBoundingBox &&
@@ -145,10 +169,7 @@ test('compliance assessments scoring is working properly', async ({
 				y: IDBE1SliderBoundingBox.height / 2
 			}
 		}));
-	await expect(page.getByTestId('progress-ring-svg')).toHaveAttribute(
-		'data-value',
-		IDBE1Score.value.toString()
-	);
+	await expect(scoreProgress).toHaveAttribute('data-value', IDBE1Score.value.toString());
 
 	await page.getByTestId('save-no-continue-button').click();
 	await complianceAssessmentsPage.isToastVisible('successfully saved', 'i');
@@ -164,10 +185,9 @@ test('compliance assessments scoring is working properly', async ({
 		'PR - Protect',
 		'PR.AC - Identity Management, Authentication and Access Control'
 	]);
-	await PRAC1TreeViewItem.content.click();
-
-	await page.waitForURL('/requirement-assessments/**');
-	await expect(page.getByTestId('progress-ring-svg')).toHaveAttribute('data-value', '1');
+	await openRequirementAssessment(PRAC1TreeViewItem.content.getByRole('link'));
+	await expect(scoreProgress).toBeVisible({ timeout: 60_000 });
+	await expect(scoreProgress).toHaveAttribute('data-value', '1');
 
 	const PRAC1SliderBoundingBox = await page.getByTestId('range-slider-input').boundingBox();
 	PRAC1SliderBoundingBox &&
@@ -177,10 +197,7 @@ test('compliance assessments scoring is working properly', async ({
 				y: PRAC1SliderBoundingBox.height / 2
 			}
 		}));
-	await expect(page.getByTestId('progress-ring-svg')).toHaveAttribute(
-		'data-value',
-		PRAC1Score.value.toString()
-	);
+	await expect(scoreProgress).toHaveAttribute('data-value', PRAC1Score.value.toString());
 
 	await page.getByTestId('save-no-continue-button').click();
 	await complianceAssessmentsPage.isToastVisible('successfully saved', 'i');

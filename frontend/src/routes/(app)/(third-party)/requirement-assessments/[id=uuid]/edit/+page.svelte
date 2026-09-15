@@ -16,7 +16,7 @@
 	import { getSecureRedirect, getFieldVisibility, alignmentColorMap } from '$lib/utils/helpers';
 	import { Progress, Tabs } from '@skeletonlabs/skeleton-svelte';
 
-	import { hideSuggestions } from '$lib/utils/stores';
+	import { clientSideToast, hideSuggestions } from '$lib/utils/stores';
 	import { m } from '$paraglide/messages';
 	import { canPerformActionOnObject } from '$lib/utils/access-control';
 	import { countMasked } from '$lib/utils/related-visibility';
@@ -29,6 +29,7 @@
 	import { zod4 as zod } from 'sveltekit-superforms/adapters';
 	import Checkbox from '$lib/components/Forms/Checkbox.svelte';
 	import { superForm } from 'sveltekit-superforms';
+	import { get } from 'svelte/store';
 	import {
 		getModalStore,
 		type ModalComponent,
@@ -267,8 +268,20 @@
 		resetForm: false,
 		validators: zod(schema),
 		taintedMessage: m.taintedFormMessage(),
-		validationMethod: 'auto'
+		validationMethod: 'auto',
+		onSubmit: ({ submitter, jsonData }) => {
+			jsonData({
+				...get(requirementAssessmentForm.form),
+				noRedirect: submitter?.getAttribute('data-no-redirect') === 'true'
+			});
+		},
+		onUpdate: ({ form }) => {
+			if (form.message?.toast) {
+				clientSideToast.set(form.message.toast);
+			}
+		}
 	});
+	const requirementAssessmentSubmitting = requirementAssessmentForm.submitting;
 
 	let mappingInference = $derived(data.requirementAssessment.mapping_inference);
 
@@ -439,7 +452,7 @@
 			<MarkdownRenderer content={data.requirement.description} />
 		</div>
 	{/if}
-	{#if has_threats || has_reference_controls || annotation || mappingInference.result || typical_evidence}
+	{#if has_threats || has_reference_controls || annotation || mappingInference?.result || typical_evidence}
 		<div class="card p-4 preset-tonal-secondary text-sm flex flex-col justify-evenly cursor-auto">
 			<h2 class="font-semibold text-base flex flex-row justify-between">
 				<div>
@@ -522,7 +535,7 @@
 						</div>
 					</div>
 				{/if}
-				{#if mappingInference.result}
+				{#if mappingInference?.result}
 					<MappingInferenceView {mappingInference} />
 				{/if}
 			{/if}
@@ -907,15 +920,14 @@
 					<button
 						class="btn preset-filled-secondary-500 font-semibold w-full"
 						data-testid="save-no-continue-button"
-						type="submit"
-						onclick={() =>
-							form.form.update((data) => {
-								return { ...data, noRedirect: true };
-							})}>{m.saveAndContinue()}</button
+						data-no-redirect="true"
+						disabled={$requirementAssessmentSubmitting}
+						type="submit">{m.saveAndContinue()}</button
 					>
 					<button
 						class="btn preset-filled-primary-500 font-semibold w-full"
 						data-testid="save-button"
+						disabled={$requirementAssessmentSubmitting}
 						type="submit"
 						>{page.data.nextRequirementAssessmentId ? m.saveAndNext() : m.save()}</button
 					>

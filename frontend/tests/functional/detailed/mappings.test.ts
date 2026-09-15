@@ -8,6 +8,8 @@ const vars = TestContent.generateTestVars();
 const testObjectsData: { [k: string]: any } = TestContent.itemBuilder(vars);
 const FOLDER_WORKAROUND_SUFFIX = ' foo';
 
+test.describe.configure({ mode: 'serial' });
+
 test('user can import required libraries and create required objects', async ({
 	page,
 	logedPage,
@@ -57,6 +59,7 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 	};
 
 	const applyMappingButton = page.getByTestId('apply-mapping-button');
+	const scoreProgress = page.getByTestId('score-field').getByTestId('progress-ring-svg');
 
 	//NOTE: The form fields can't be passed to the PageContent constructor because the form is not an usual one
 	const applyMappingForm = new FormContent(page, 'Create audit from baseline', [
@@ -95,8 +98,9 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 		);
 		await OrgContextTree.content.click();
 
-		await page.waitForURL('/requirement-assessments/**');
-		await expect(page.getByTestId('progress-ring-svg')).toHaveAttribute('data-value', '0');
+		await page.waitForURL(/\/requirement-assessments\/[^/]+\/edit(?:\?.*)?$/);
+		await expect(scoreProgress).toBeVisible();
+		await expect(scoreProgress).toHaveAttribute('data-value', '0');
 
 		await page.getByTestId('form-input-result').selectOption('compliant');
 
@@ -106,7 +110,7 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 		for (let i = 1; i < OrgContextScore.value; i++) {
 			await slider.press('ArrowRight');
 		}
-		await expect(page.getByTestId('progress-ring-svg')).toHaveAttribute('data-value', '75');
+		await expect(scoreProgress).toHaveAttribute('data-value', '75');
 
 		await page.getByTestId('save-no-continue-button').click();
 		await complianceAssessmentsPage.isToastVisible('successfully saved', 'i');
@@ -152,17 +156,15 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 		]);
 		await IDAM1TreeViewItem.content.click();
 
-		await page.waitForURL('/requirement-assessments/**');
+		await page.waitForURL(/\/requirement-assessments\/[^/]+\/edit(?:\?.*)?$/);
 		for (const spinner of await page.locator('.loading-spinner').all()) {
 			await expect(spinner).not.toBeVisible({
 				timeout: 10_000
 			});
 		}
 
-		await expect(page.getByTestId('progress-ring-svg')).toHaveAttribute(
-			'data-value',
-			IDAM1Score.value.toString()
-		);
+		await expect(scoreProgress).toBeVisible();
+		await expect(scoreProgress).toHaveAttribute('data-value', IDAM1Score.value.toString());
 
 		await page.getByTestId('save-no-continue-button').click();
 		await complianceAssessmentsPage.isToastVisible('successfully saved', 'i');

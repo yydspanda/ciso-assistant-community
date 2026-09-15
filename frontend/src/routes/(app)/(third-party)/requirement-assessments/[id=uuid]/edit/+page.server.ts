@@ -11,10 +11,99 @@ import { type TableSource } from '@skeletonlabs/skeleton-svelte';
 import type { Actions } from '@sveltejs/kit';
 import { fail, redirect } from '@sveltejs/kit';
 import { setFlash } from 'sveltekit-flash-message/server';
-import { superValidate } from 'sveltekit-superforms';
+import { message, setError, superValidate } from 'sveltekit-superforms';
 import { zod4 as zod } from 'sveltekit-superforms/adapters';
 import type { PageServerLoad } from './$types';
 import { z } from 'zod';
+
+function failUpdateWithToast(
+	form: Record<string, any>,
+	messageText: string,
+	status = 502,
+	type: 'error' | 'warning' = 'error'
+) {
+	form.valid = false;
+	form.message = {
+		toast: {
+			type,
+			message: messageText,
+			...(type === 'error' ? { timeout: 10000 } : {})
+		}
+	};
+	return fail(status >= 400 && status <= 599 ? status : 502, { form });
+}
+
+async function handleUpdateErrorResponse(response: Response, form: Record<string, any>) {
+	let payload: Record<string, unknown>;
+	try {
+		const parsed = await response.json();
+		if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+			throw new TypeError('Expected an object error response');
+		}
+		payload = parsed as Record<string, unknown>;
+	} catch (error) {
+		console.error('Failed to parse requirement assessment update error', error);
+		return failUpdateWithToast(form, response.statusText || m.error(), response.status);
+	}
+
+	if (payload.label) payload.filtering_labels = payload.label;
+	if (payload.warning) {
+		const warning = Array.isArray(payload.warning) ? payload.warning[0] : payload.warning;
+		return failUpdateWithToast(
+			form,
+			typeof warning === 'string' ? safeTranslate(warning) : m.error(),
+			response.status,
+			'warning'
+		);
+	}
+	if (payload.error || payload.detail) {
+		const rawError = payload.error || payload.detail;
+		const errorText = Array.isArray(rawError) ? rawError[0] : rawError;
+		return failUpdateWithToast(
+			form,
+			typeof errorText === 'string' ? safeTranslate(errorText) : m.error(),
+			response.status
+		);
+	}
+
+	let firstFieldError: string | undefined;
+	for (const [key, value] of Object.entries(payload)) {
+		const errors = Array.isArray(value) ? value : [value];
+		for (const error of errors) {
+			if (typeof error !== 'string') continue;
+			const translated = safeTranslate(error);
+			firstFieldError ??= translated;
+			setError(form, key, translated);
+		}
+	}
+	return failUpdateWithToast(form, firstFieldError || m.error(), response.status);
+}
+
+function uuidId(value: unknown): string | null {
+	return typeof value === 'string' && z.string().uuid().safeParse(value).success ? value : null;
+}
+
+function complianceAssessmentId(value: unknown): string | null {
+	if (typeof value === 'string') return uuidId(value);
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+	const id = (value as Record<string, unknown>).id;
+	return uuidId(id);
+}
+
+const requirementAssessmentUpdateFields = new Set([
+	'answers',
+	'status',
+	'result',
+	'extended_result',
+	'score',
+	'is_scored',
+	'is_score_overridden',
+	'documentation_score',
+	'observation',
+	'evidences',
+	'applied_controls',
+	'security_exceptions'
+]);
 
 export const load = (async ({ fetch, params }) => {
 	const URLModel = 'requirement-assessments';
@@ -197,11 +286,17 @@ export const actions: Actions = {
 		const form = await superValidate(event.request, zod(schema));
 
 		if (!form.valid) {
-			console.log(form.errors);
 			return fail(400, { form: form });
 		}
 
-		const formData: Record<string, any> = { ...form.data };
+		const noRedirect = form.data.noRedirect === true;
+		const nextRequirementAssessmentId = form.data.nextRequirementAssessmentId;
+		// This route edits only fields rendered by its assessment form. Parent,
+		// folder, lifecycle and future schema fields are never forwarded merely
+		// because a forged or stale SuperForm payload contains them.
+		const formData: Record<string, any> = Object.fromEntries(
+			Object.entries(form.data).filter(([key]) => requirementAssessmentUpdateFields.has(key))
+		);
 
 		// Strip fields the backend hid from the GET response. Sending them back as
 		// empty arrays / null would silently wipe data the user could not see.
@@ -211,12 +306,39 @@ export const actions: Actions = {
 		try {
 			const currentRaResponse = await event.fetch(endpoint);
 			if (!currentRaResponse.ok) {
-				return handleErrorResponse({ event, response: currentRaResponse, form });
+				return handleUpdateErrorResponse(currentRaResponse, form);
 			}
-			currentRa = await currentRaResponse.json();
+			const parsedCurrentRa = await currentRaResponse.json();
+			if (
+				!parsedCurrentRa ||
+				typeof parsedCurrentRa !== 'object' ||
+				Array.isArray(parsedCurrentRa) ||
+				(parsedCurrentRa as Record<string, unknown>).id !== event.params.id
+			) {
+				throw new TypeError('Expected the requested requirement-assessment response');
+			}
+			currentRa = parsedCurrentRa as Record<string, any>;
 		} catch (error) {
 			console.error('Failed to fetch requirement assessment before update', error);
-			return fail(502, { form });
+			return failUpdateWithToast(form, m.error());
+		}
+
+		// Resolve the redirect before mutating. A malformed read response must not
+		// allow the PATCH to commit and then strand the browser on a failed redirect.
+		let postUpdateRedirect: string | null = null;
+		if (!noRedirect) {
+			const secureNext = getSecureRedirect(event.url.searchParams.get('next'));
+			if (nextRequirementAssessmentId) {
+				const nextId = uuidId(nextRequirementAssessmentId);
+				if (!nextId) return failUpdateWithToast(form, m.error());
+				postUpdateRedirect = `/requirement-assessments/${nextId}/edit${secureNext ? `?next=${secureNext}` : ''}`;
+			} else if (secureNext) {
+				postUpdateRedirect = secureNext;
+			} else {
+				const assessmentId = complianceAssessmentId(currentRa.compliance_assessment);
+				if (!assessmentId) return failUpdateWithToast(form, m.error());
+				postUpdateRedirect = `/compliance-assessments/${assessmentId}/`;
+			}
 		}
 
 		const visibilityControlled = [
@@ -253,29 +375,30 @@ export const actions: Actions = {
 			body: JSON.stringify(formData)
 		};
 
-		const response = await event.fetch(endpoint, requestInitOptions);
-
-		if (!response.ok) return handleErrorResponse({ event, response, form });
-
-		const object = await response.json();
-		const model: string = safeTranslate(urlParamModelVerboseName(URLModel));
-		setFlash({ type: 'success', message: m.successfullySavedObject({ object: model }) }, event);
-		if (formData.noRedirect) return;
-
-		// If there's a next requirement assessment, redirect to it
-		if (formData.nextRequirementAssessmentId) {
-			const nextParam = getSecureRedirect(event.url.searchParams.get('next'));
-			redirect(
-				302,
-				`/requirement-assessments/${formData.nextRequirementAssessmentId}/edit${nextParam ? `?next=${nextParam}` : ''}`
-			);
+		let response: Response;
+		try {
+			response = await event.fetch(endpoint, requestInitOptions);
+		} catch (error) {
+			console.error('Failed to update requirement assessment', error);
+			return failUpdateWithToast(form, m.error());
 		}
 
-		redirect(
-			302,
-			getSecureRedirect(event.url.searchParams.get('next')) ||
-				`/compliance-assessments/${object.compliance_assessment}/`
-		);
+		if (!response.ok) return handleUpdateErrorResponse(response, form);
+
+		const model: string = safeTranslate(urlParamModelVerboseName(URLModel));
+		const successToast = {
+			type: 'success' as const,
+			message: m.successfullySavedObject({ object: model })
+		};
+		if (noRedirect) {
+			// Keep the button choice submission-local. A later Save/Next must not
+			// inherit Save-and-stay from this successful response.
+			form.data.noRedirect = false;
+			return message(form, { toast: successToast });
+		}
+		setFlash(successToast, event);
+
+		redirect(302, postUpdateRedirect!);
 	},
 	createAppliedControl: async (event) => {
 		const URLModel = 'applied-controls';
@@ -284,7 +407,6 @@ export const actions: Actions = {
 		const form = await superValidate(event.request, zod(schema));
 
 		if (!form.valid) {
-			console.log(form.errors);
 			return fail(400, { form: form });
 		}
 

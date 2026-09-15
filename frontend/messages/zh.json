@@ -14,6 +14,7 @@
 	"selectSourceAudit": "选择要从中丰富的来源审计",
 	"mapFromSuccess": "审计已成功更新",
 	"mapFromError": "无法从来源审计映射",
+	"mapFromNavigationError": "无法自动打开目标审计，请手动打开后继续。",
 	"currentState": "当前状态",
 	"projectedState": "预期状态",
 	"confirmMapping": "确认映射",
