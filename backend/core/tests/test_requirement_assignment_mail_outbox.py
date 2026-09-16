@@ -2,21 +2,34 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
 import hashlib
 import json
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+from queue import Queue
+from threading import Event
 
 import pytest
 from django.contrib.auth.models import Permission
 from django.contrib.contenttypes.models import ContentType
-from django.db import connection
+from django.db import close_old_connections, connection, connections
+from django.db.models import QuerySet
 from django.utils import timezone
+from iam.models import Folder, Role, RoleAssignment, User
 from structlog.testing import capture_logs
 
-from core.assignment_mailing import build_assignment_mail_payload_digest
+from core.assignment_mailing import (
+    CLAIM_TIMEOUT,
+    build_assignment_mail_payload_digest,
+    deliver_requirement_assignment_mail_outbox,
+    fail_stale_requirement_assignment_mail_claims,
+    queue_requirement_assignment_mails,
+)
 from core.models import (
     Actor,
+    ComplianceAssessment,
     RequirementAssignment,
     RequirementAssignmentEvent,
     RequirementAssignmentMailOutbox,
@@ -29,10 +42,10 @@ from core.tasks import (
 from core.tests.test_compliance_assessment_tree_iam import (
     _client,
     _grant,
+)
+from core.tests.test_compliance_assessment_tree_iam import (
     audit_iam_world as _audit_iam_world_fixture,
 )
-from iam.models import Folder, Role, RoleAssignment, User
-
 
 pytestmark = pytest.mark.django_db
 audit_iam_world = _audit_iam_world_fixture
@@ -84,6 +97,354 @@ def _queue(world, monkeypatch, django_capture_on_commit_callbacks):
     with django_capture_on_commit_callbacks(execute=True):
         response = _client(world["auditor"]).post(_mail_url(world), {}, format="json")
     return response, enqueued
+
+
+def _track_row_lock_models(monkeypatch) -> list[tuple[type, dict]]:
+    locked_models: list[tuple[type, dict]] = []
+    original_select_for_update = QuerySet.select_for_update
+
+    def tracked_select_for_update(queryset, *args, **kwargs):
+        locked_models.append((queryset.model, kwargs))
+        return original_select_for_update(queryset, *args, **kwargs)
+
+    monkeypatch.setattr(QuerySet, "select_for_update", tracked_select_for_update)
+    return locked_models
+
+
+def test_queue_and_delivery_use_parent_first_lock_order_and_terminal_status(
+    mailing_world,
+    monkeypatch,
+):
+    locked_models = _track_row_lock_models(monkeypatch)
+    outbox_ids, transitioned = queue_requirement_assignment_mails(
+        requester=mailing_world["auditor"],
+        compliance_assessment_id=mailing_world["target"].id,
+        assert_complete_access=lambda requester, assessment: None,
+    )
+    expected_graph_order = [
+        ComplianceAssessment,
+        RequirementAssignment,
+        RequirementAssignmentMailOutbox,
+        ComplianceAssessment.authors.through,
+        RequirementAssignment.actor.through,
+        Actor,
+        User,
+    ]
+    relevant_models = set(expected_graph_order)
+
+    assert transitioned == 1
+    assert len(outbox_ids) == 1
+    relevant_calls = [call for call in locked_models if call[0] in relevant_models]
+    assert [model for model, _ in relevant_calls] == expected_graph_order
+    assert relevant_calls[0] == (ComplianceAssessment, {"of": ("self",)})
+    assert relevant_calls[1] == (RequirementAssignment, {"of": ("self",)})
+
+    locked_models.clear()
+    monkeypatch.setattr(User, "mailing", lambda *args, **kwargs: True)
+    assert deliver_requirement_assignment_mail.call_local(str(outbox_ids[0])) == (
+        "delivered"
+    )
+    assert [model for model, _ in locked_models if model in relevant_models] == [
+        ComplianceAssessment,
+        RequirementAssignment,
+        RequirementAssignmentMailOutbox,
+        *expected_graph_order,
+    ]
+    outbox = RequirementAssignmentMailOutbox.objects.get(id=outbox_ids[0])
+    assert outbox.status == RequirementAssignmentMailOutbox.Status.DELIVERED
+    assert outbox.attempts == 1
+
+
+def test_queue_locks_requester_and_recipient_users_together_in_pk_order(
+    mailing_world,
+    monkeypatch,
+):
+    locked_user_batches = []
+    original_fetch_all = QuerySet._fetch_all
+
+    def track_locked_user_batch(queryset):
+        original_fetch_all(queryset)
+        if queryset.model is User and queryset.query.select_for_update:
+            locked_user_batches.append(
+                tuple(user.id for user in queryset._result_cache or ())
+            )
+
+    monkeypatch.setattr(QuerySet, "_fetch_all", track_locked_user_batch)
+
+    queue_requirement_assignment_mails(
+        requester=mailing_world["auditor"],
+        compliance_assessment_id=mailing_world["target"].id,
+        assert_complete_access=lambda requester, assessment: None,
+    )
+
+    expected = tuple(
+        sorted(
+            (mailing_world["auditor"].id, mailing_world["author"].id),
+            key=str,
+        )
+    )
+    assert locked_user_batches == [expected]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_postgresql_queue_and_delivery_reverse_competition_has_no_deadlock(
+    mailing_world,
+    monkeypatch,
+):
+    if connection.vendor != "postgresql":
+        pytest.skip("PostgreSQL lock-order evidence requires PostgreSQL.")
+
+    recipient = mailing_world["author"].email.strip()
+    recipient_hash = hashlib.sha256(recipient.encode("utf-8")).hexdigest()
+    digest = build_assignment_mail_payload_digest(
+        compliance_assessment_id=mailing_world["target"].id,
+        assignment_id=mailing_world["assignment"].id,
+        recipient_actor_id=mailing_world["author_actor"].id,
+        recipient_address_hash=recipient_hash,
+    )
+    outbox = RequirementAssignmentMailOutbox.objects.create(
+        assignment=mailing_world["assignment"],
+        recipient_actor=mailing_world["author_actor"],
+        requested_by=mailing_world["auditor"],
+        folder=mailing_world["child_folder"],
+        payload_digest=digest,
+        recipient_address_hash=recipient_hash,
+    )
+    monkeypatch.setattr(
+        "core.assignment_mailing.enqueue_requirement_assignment_mail_jobs",
+        lambda ids: None,
+    )
+    monkeypatch.setattr(User, "mailing", lambda *args, **kwargs: True)
+
+    assignment_locked = Event()
+    release_queue = Event()
+    queue_pid: Queue[int] = Queue()
+    delivery_pid: Queue[int] = Queue()
+
+    def configure_thread_connection(application_name: str, pid_queue: Queue[int]):
+        close_old_connections()
+        database = connections["default"]
+        database.close()
+        with database.cursor() as cursor:
+            cursor.execute(
+                "SELECT set_config('application_name', %s, false)",
+                [application_name],
+            )
+            cursor.execute("SET lock_timeout = '8s'")
+            cursor.execute("SET statement_timeout = '12s'")
+            cursor.execute("SELECT pg_backend_pid()")
+            pid_queue.put(cursor.fetchone()[0])
+
+    def run_queue():
+        configure_thread_connection("mail-outbox-queue", queue_pid)
+        paused = False
+
+        def pause_after_assignment_lock(execute, sql, params, many, context):
+            nonlocal paused
+            result = execute(sql, params, many, context)
+            if (
+                not paused
+                and "core_requirementassignment" in sql
+                and "FOR UPDATE" in sql.upper()
+            ):
+                paused = True
+                assignment_locked.set()
+                if not release_queue.wait(10):
+                    raise AssertionError("delivery did not reach the parent lock")
+            return result
+
+        try:
+            with connections["default"].execute_wrapper(pause_after_assignment_lock):
+                requester = User.objects.get(id=mailing_world["auditor"].id)
+                return queue_requirement_assignment_mails(
+                    requester=requester,
+                    compliance_assessment_id=mailing_world["target"].id,
+                    assert_complete_access=lambda requester, assessment: None,
+                )
+        finally:
+            connections["default"].close()
+            close_old_connections()
+
+    def run_delivery():
+        configure_thread_connection("mail-outbox-delivery", delivery_pid)
+        try:
+            return deliver_requirement_assignment_mail.call_local(str(outbox.id))
+        finally:
+            connections["default"].close()
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        queue_future = executor.submit(run_queue)
+        assert assignment_locked.wait(10)
+        blocker_pid = queue_pid.get(timeout=10)
+        delivery_future = executor.submit(run_delivery)
+        blocked_pid = delivery_pid.get(timeout=10)
+        try:
+            deadline = time.monotonic() + 8
+            blocked_by_queue = False
+            blocked_query = ""
+            while time.monotonic() < deadline:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        SELECT
+                            %s = ANY(pg_blocking_pids(pid)),
+                            query
+                        FROM pg_stat_activity
+                        WHERE pid = %s
+                        """,
+                        [blocker_pid, blocked_pid],
+                    )
+                    observation = cursor.fetchone()
+                    if observation is not None:
+                        blocked_by_queue, blocked_query = observation
+                if blocked_by_queue:
+                    break
+                time.sleep(0.05)
+            assert blocked_by_queue is True
+            assert "core_complianceassessment" in blocked_query
+        finally:
+            release_queue.set()
+
+        queued_ids, transitioned = queue_future.result(timeout=15)
+        delivery_result = delivery_future.result(timeout=15)
+
+    assert queued_ids == [outbox.id]
+    assert transitioned == 1
+    assert delivery_result == "delivered"
+    outbox.refresh_from_db()
+    assert outbox.status == RequirementAssignmentMailOutbox.Status.DELIVERED
+    assert outbox.attempts == 1
+
+
+def test_claim_timestamp_is_generated_after_parent_locks_are_acquired(
+    mailing_world,
+    monkeypatch,
+):
+    outbox_ids, transitioned = queue_requirement_assignment_mails(
+        requester=mailing_world["auditor"],
+        compliance_assessment_id=mailing_world["target"].id,
+        assert_complete_access=lambda requester, assessment: None,
+    )
+    assert transitioned == 1
+    outbox_id = outbox_ids[0]
+
+    from core import assignment_mailing
+
+    before_wait = timezone.now()
+    after_wait = before_wait + CLAIM_TIMEOUT + timedelta(minutes=1)
+    current_time = [before_wait]
+    original_lock = assignment_mailing._lock_parent_and_outbox
+    lock_calls = 0
+
+    def lock_then_advance_clock(locator):
+        nonlocal lock_calls
+        graph = original_lock(locator)
+        lock_calls += 1
+        if lock_calls == 1:
+            current_time[0] = after_wait
+        return graph
+
+    monkeypatch.setattr(
+        assignment_mailing,
+        "_lock_parent_and_outbox",
+        lock_then_advance_clock,
+    )
+    monkeypatch.setattr(
+        assignment_mailing.timezone,
+        "now",
+        lambda: current_time[0],
+    )
+    monkeypatch.setattr(User, "mailing", lambda *args, **kwargs: True)
+
+    assert deliver_requirement_assignment_mail_outbox(outbox_id) == "delivered"
+    outbox = RequirementAssignmentMailOutbox.objects.get(id=outbox_id)
+    assert outbox.claimed_at == after_wait
+
+
+def test_only_one_sending_claim_per_compliance_assessment(
+    mailing_world,
+    monkeypatch,
+):
+    first_ids, transitioned = queue_requirement_assignment_mails(
+        requester=mailing_world["auditor"],
+        compliance_assessment_id=mailing_world["target"].id,
+        assert_complete_access=lambda requester, assessment: None,
+    )
+    assert transitioned == 1
+    first = RequirementAssignmentMailOutbox.objects.get(id=first_ids[0])
+    first.status = RequirementAssignmentMailOutbox.Status.SENDING
+    first.claimed_at = timezone.now()
+    first.attempts = 1
+    first.save(update_fields=["status", "claimed_at", "attempts"])
+
+    second_assignment = RequirementAssignment.objects.create(
+        compliance_assessment=mailing_world["target"],
+        folder=mailing_world["child_folder"],
+        status=RequirementAssignment.Status.IN_PROGRESS,
+    )
+    second_assignment.actor.add(mailing_world["author_actor"])
+    recipient = mailing_world["author"].email.strip()
+    recipient_hash = hashlib.sha256(recipient.encode("utf-8")).hexdigest()
+    second = RequirementAssignmentMailOutbox.objects.create(
+        assignment=second_assignment,
+        recipient_actor=mailing_world["author_actor"],
+        requested_by=mailing_world["auditor"],
+        folder=mailing_world["child_folder"],
+        payload_digest=build_assignment_mail_payload_digest(
+            compliance_assessment_id=mailing_world["target"].id,
+            assignment_id=second_assignment.id,
+            recipient_actor_id=mailing_world["author_actor"].id,
+            recipient_address_hash=recipient_hash,
+        ),
+        recipient_address_hash=recipient_hash,
+    )
+    smtp_calls = []
+    monkeypatch.setattr(
+        User,
+        "mailing",
+        lambda self, *args, **kwargs: smtp_calls.append(self.email) or True,
+    )
+
+    assert deliver_requirement_assignment_mail_outbox(second.id) == "noop"
+    second.refresh_from_db()
+    assert second.status == RequirementAssignmentMailOutbox.Status.QUEUED
+    assert second.attempts == 0
+    assert smtp_calls == []
+
+    first.status = RequirementAssignmentMailOutbox.Status.DELIVERED
+    first.save(update_fields=["status"])
+    assert deliver_requirement_assignment_mail_outbox(second.id) == "delivered"
+    assert smtp_calls == [recipient]
+
+
+def test_recipient_digest_and_smtp_envelope_use_the_same_exact_stripped_address(
+    mailing_world,
+    monkeypatch,
+):
+    raw_address = "  Mixed.Local@Example.COM  "
+    User.objects.filter(id=mailing_world["author"].id).update(email=raw_address)
+    mailing_world["author"].refresh_from_db()
+    expected_recipient = raw_address.strip()
+
+    outbox_ids, transitioned = queue_requirement_assignment_mails(
+        requester=mailing_world["auditor"],
+        compliance_assessment_id=mailing_world["target"].id,
+        assert_complete_access=lambda requester, assessment: None,
+    )
+    assert transitioned == 1
+    outbox = RequirementAssignmentMailOutbox.objects.get(id=outbox_ids[0])
+    expected_hash = hashlib.sha256(expected_recipient.encode("utf-8")).hexdigest()
+    envelopes = []
+    monkeypatch.setattr(
+        User,
+        "mailing",
+        lambda self, *args, **kwargs: envelopes.append(self.email) or True,
+    )
+
+    assert deliver_requirement_assignment_mail_outbox(outbox.id) == "delivered"
+    assert outbox.recipient_address_hash == expected_hash
+    assert envelopes == [expected_recipient]
 
 
 def test_post_commits_transition_and_outbox_but_never_sends_smtp_in_request(
@@ -249,7 +610,7 @@ def test_smtp_boundary_runs_inside_the_exact_recipient_lock_transaction(
         (
             baseline_atomic_depth + 1,
             mailing_world["author"].id,
-            mailing_world["author"].email.strip().casefold(),
+            mailing_world["author"].email.strip(),
         )
     ]
 
@@ -366,6 +727,87 @@ def test_ambiguous_smtp_failure_is_terminal_and_never_swept_for_retry(
     assert swept == []
     assert outbox.status == RequirementAssignmentMailOutbox.Status.FAILED
     assert outbox.failure_code == "delivery_error"
+
+
+def test_smtp_success_followed_by_state_write_failure_is_terminal(
+    mailing_world,
+    monkeypatch,
+    django_capture_on_commit_callbacks,
+):
+    response, _ = _queue(mailing_world, monkeypatch, django_capture_on_commit_callbacks)
+    assert response.status_code == 200, response.content
+    outbox = RequirementAssignmentMailOutbox.objects.get()
+    smtp_calls = []
+    original_save = RequirementAssignmentMailOutbox.save
+
+    monkeypatch.setattr(
+        User,
+        "mailing",
+        lambda self, *args, **kwargs: smtp_calls.append(self.id) or True,
+    )
+
+    def fail_delivered_state_write(self, *args, **kwargs):
+        if self.status == RequirementAssignmentMailOutbox.Status.DELIVERED:
+            raise RuntimeError("synthetic delivery-state persistence failure")
+        return original_save(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        RequirementAssignmentMailOutbox,
+        "save",
+        fail_delivered_state_write,
+    )
+
+    assert deliver_requirement_assignment_mail.call_local(str(outbox.id)) == "failed"
+    assert deliver_requirement_assignment_mail.call_local(str(outbox.id)) == "noop"
+    outbox.refresh_from_db()
+    assert smtp_calls == [mailing_world["author"].id]
+    assert outbox.status == RequirementAssignmentMailOutbox.Status.FAILED
+    assert outbox.attempts == 1
+    assert outbox.failure_code == "delivery_error"
+
+
+def test_unpersisted_claim_terminalization_is_logged_explicitly(
+    mailing_world,
+    monkeypatch,
+    django_capture_on_commit_callbacks,
+):
+    response, _ = _queue(mailing_world, monkeypatch, django_capture_on_commit_callbacks)
+    assert response.status_code == 200, response.content
+    outbox = RequirementAssignmentMailOutbox.objects.get()
+    original_save = RequirementAssignmentMailOutbox.save
+
+    monkeypatch.setattr(User, "mailing", lambda *args, **kwargs: True)
+
+    def fail_delivered_state_write(self, *args, **kwargs):
+        if self.status == RequirementAssignmentMailOutbox.Status.DELIVERED:
+            raise RuntimeError("synthetic delivery-state persistence failure")
+        return original_save(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        RequirementAssignmentMailOutbox,
+        "save",
+        fail_delivered_state_write,
+    )
+    monkeypatch.setattr(
+        "core.assignment_mailing._fail_claim",
+        lambda *args, **kwargs: False,
+    )
+
+    with capture_logs() as logs:
+        assert (
+            deliver_requirement_assignment_mail.call_local(str(outbox.id)) == "failed"
+        )
+
+    terminalization_failure = next(
+        item
+        for item in logs
+        if item.get("event") == "requirement_assignment_mail_terminalization_failed"
+    )
+    assert terminalization_failure["outbox_id"] == str(outbox.id)
+    assert terminalization_failure["failure_code"] == "delivery_error"
+    assert terminalization_failure["error_type"] == "claim_still_sending"
+    outbox.refresh_from_db()
+    assert outbox.status == RequirementAssignmentMailOutbox.Status.SENDING
 
 
 @pytest.mark.parametrize("primary_outcome", ["exception", "rejected"])
@@ -741,13 +1183,59 @@ def test_periodic_sweeper_fails_stale_claim_without_automatic_redelivery(
         "core.tasks.deliver_requirement_assignment_mail",
         lambda outbox_id: enqueued.append(outbox_id),
     )
+    locked_models = _track_row_lock_models(monkeypatch)
 
     assert sweep_requirement_assignment_mail_outbox.call_local() == 0
+    relevant_models = {
+        ComplianceAssessment,
+        RequirementAssignment,
+        RequirementAssignmentMailOutbox,
+    }
+    assert [model for model, _ in locked_models if model in relevant_models] == [
+        ComplianceAssessment,
+        RequirementAssignment,
+        RequirementAssignmentMailOutbox,
+    ]
     outbox.refresh_from_db()
     assert outbox.status == RequirementAssignmentMailOutbox.Status.FAILED
     assert outbox.failure_code == "claim_timeout"
     assert outbox.failed_at is not None
     assert enqueued == []
+
+
+def test_stale_claim_sweeper_processes_at_most_one_hundred_in_stable_order(
+    mailing_world,
+):
+    stale_at = timezone.now() - CLAIM_TIMEOUT - timedelta(minutes=1)
+    outboxes = [
+        RequirementAssignmentMailOutbox(
+            id=uuid.UUID(int=index + 1),
+            assignment=mailing_world["assignment"],
+            recipient_actor=None,
+            requested_by=mailing_world["auditor"],
+            folder=mailing_world["child_folder"],
+            payload_digest=f"{index + 1:064x}",
+            recipient_address_hash=f"{index + 1001:064x}",
+            status=RequirementAssignmentMailOutbox.Status.SENDING,
+            claimed_at=stale_at,
+            attempts=1,
+        )
+        for index in range(101)
+    ]
+    RequirementAssignmentMailOutbox.objects.bulk_create(outboxes)
+
+    assert fail_stale_requirement_assignment_mail_claims(limit=1000) == 100
+
+    failed_ids = list(
+        RequirementAssignmentMailOutbox.objects.filter(
+            status=RequirementAssignmentMailOutbox.Status.FAILED
+        )
+        .order_by("id")
+        .values_list("id", flat=True)
+    )
+    assert failed_ids == [uuid.UUID(int=index + 1) for index in range(100)]
+    remaining = RequirementAssignmentMailOutbox.objects.get(id=uuid.UUID(int=101))
+    assert remaining.status == RequirementAssignmentMailOutbox.Status.SENDING
 
 
 def test_any_draft_without_deliverable_author_fails_the_whole_request(
@@ -781,7 +1269,7 @@ def test_any_draft_without_deliverable_author_fails_the_whole_request(
 def test_changed_recipient_rejects_stale_unique_intent_instead_of_silent_noop(
     mailing_world, monkeypatch
 ):
-    old_address = mailing_world["author"].email.strip().casefold()
+    old_address = mailing_world["author"].email.strip()
     old_address_hash = hashlib.sha256(old_address.encode("utf-8")).hexdigest()
     old_digest = build_assignment_mail_payload_digest(
         compliance_assessment_id=mailing_world["target"].id,

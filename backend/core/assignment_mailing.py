@@ -11,7 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Iterable
-from datetime import timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Final
 from uuid import UUID
 
@@ -20,6 +21,7 @@ from django.contrib.auth.models import Permission
 from django.db import transaction
 from django.db.models import F, Q
 from django.utils import timezone
+from iam.models import Folder, RoleAssignment, User
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from core.models import (
@@ -30,8 +32,6 @@ from core.models import (
     RequirementAssignmentMailOutbox,
 )
 from core.utils import has_full_view_compliance_assessment
-from iam.models import Folder, RoleAssignment, User
-
 
 MAIL_TEMPLATE: Final = "tprm/third_party_email.html"
 MAIL_TEMPLATE_KEY: Final = "questionnaire_assignment"
@@ -40,6 +40,32 @@ MAIL_OBJECT: Final = "auditee-assessments"
 PAYLOAD_SCHEMA: Final = "requirement-assignment-mail-v1"
 CLAIM_TIMEOUT: Final = timedelta(minutes=15)
 logger = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _DeliveryLocator:
+    """Untrusted, read-only coordinates used to enter the lock hierarchy."""
+
+    compliance_assessment_id: UUID
+    assignment_id: UUID
+    outbox_id: UUID
+
+
+@dataclass(slots=True)
+class _LockedDeliveryGraph:
+    """The exact recipient authority graph held by one database transaction."""
+
+    assessment: ComplianceAssessment
+    assignment: RequirementAssignment
+    outbox: RequirementAssignmentMailOutbox
+    author_link_ids: tuple[int, ...]
+    assignment_actor_link_ids: tuple[int, ...]
+    actor: Actor | None
+    recipient_user: User | None
+
+
+class _DeliveryLocatorChanged(Exception):
+    """The unlocked locator changed before all parent rows were locked."""
 
 
 def _exact_permission(app_label: str, model: str, codename: str) -> Permission:
@@ -80,7 +106,7 @@ def _normalize_recipient(actor: Actor) -> str | None:
     if not hasattr(specific, "mailing"):
         return None
     addresses = {
-        address.strip().casefold()
+        address.strip()
         for address in actor.get_emails()
         if isinstance(address, str) and address.strip()
     }
@@ -121,6 +147,248 @@ def build_assignment_mail_payload_digest(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _read_delivery_locator(outbox_id: UUID | str) -> _DeliveryLocator | None:
+    """Read only enough identity to acquire parent locks in canonical order."""
+
+    identity = (
+        RequirementAssignmentMailOutbox.objects.filter(id=outbox_id)
+        .values_list(
+            "assignment__compliance_assessment_id",
+            "assignment_id",
+            "id",
+        )
+        .first()
+    )
+    if identity is None:
+        return None
+    return _DeliveryLocator(*identity)
+
+
+def _lock_parent_and_outbox(
+    locator: _DeliveryLocator,
+) -> tuple[
+    ComplianceAssessment,
+    RequirementAssignment,
+    RequirementAssignmentMailOutbox,
+]:
+    """Lock CA -> assignment -> outbox and reject a stale unlocked locator."""
+
+    assessment = ComplianceAssessment.objects.select_for_update().get(
+        id=locator.compliance_assessment_id
+    )
+    assignment = RequirementAssignment.objects.select_for_update().get(
+        id=locator.assignment_id
+    )
+    outbox = RequirementAssignmentMailOutbox.objects.select_for_update().get(
+        id=locator.outbox_id
+    )
+    if (
+        assignment.compliance_assessment_id != assessment.id
+        or outbox.assignment_id != assignment.id
+    ):
+        raise _DeliveryLocatorChanged
+    return assessment, assignment, outbox
+
+
+def _lock_delivery_graph(locator: _DeliveryLocator) -> _LockedDeliveryGraph:
+    """Lock the complete delivery graph in one deterministic hierarchy.
+
+    Both many-to-many tables are locked in a fixed table order and every set of
+    rows is sorted by primary key.  Callers must already be inside ``atomic``.
+    """
+
+    assessment, assignment, outbox = _lock_parent_and_outbox(locator)
+    actor_id = outbox.recipient_actor_id
+
+    author_link_ids = tuple(
+        ComplianceAssessment.authors.through.objects.select_for_update()
+        .filter(
+            complianceassessment_id=assessment.id,
+            actor_id=actor_id,
+        )
+        .order_by("id")
+        .values_list("id", flat=True)
+    )
+    assignment_actor_link_ids = tuple(
+        RequirementAssignment.actor.through.objects.select_for_update()
+        .filter(
+            requirementassignment_id=assignment.id,
+            actor_id=actor_id,
+        )
+        .order_by("id")
+        .values_list("id", flat=True)
+    )
+
+    actor = None
+    if actor_id is not None:
+        actor = (
+            Actor.objects.select_for_update().filter(id=actor_id).order_by("id").first()
+        )
+
+    recipient_user = None
+    if actor is not None and actor.user_id is not None:
+        recipient_user = (
+            User.objects.select_for_update()
+            .filter(id=actor.user_id)
+            .order_by("id")
+            .first()
+        )
+        if recipient_user is not None:
+            actor.user = recipient_user
+
+    return _LockedDeliveryGraph(
+        assessment=assessment,
+        assignment=assignment,
+        outbox=outbox,
+        author_link_ids=author_link_ids,
+        assignment_actor_link_ids=assignment_actor_link_ids,
+        actor=actor,
+        recipient_user=recipient_user,
+    )
+
+
+def _validate_locked_delivery_graph(
+    graph: _LockedDeliveryGraph,
+    *,
+    claimed_at: datetime,
+) -> tuple[str | None, str | None]:
+    """Validate status, identity, authority anchors, address, and payload."""
+
+    outbox = graph.outbox
+    assignment = graph.assignment
+    actor = graph.actor
+    recipient_user = graph.recipient_user
+
+    if (
+        outbox.status != RequirementAssignmentMailOutbox.Status.SENDING
+        or outbox.claimed_at != claimed_at
+    ):
+        return "claim_changed", None
+    if (
+        assignment.compliance_assessment_id != graph.assessment.id
+        or outbox.assignment_id != assignment.id
+        or outbox.folder_id != assignment.folder_id
+    ):
+        return "payload_mismatch", None
+    if assignment.status != RequirementAssignment.Status.IN_PROGRESS:
+        return "assignment_not_active", None
+    if outbox.recipient_actor_id is None:
+        return "recipient_missing", None
+    if actor is None or actor.id != outbox.recipient_actor_id:
+        return "recipient_changed", None
+    if not graph.author_link_ids or not graph.assignment_actor_link_ids:
+        return "recipient_not_authorized", None
+    if (
+        actor.user_id is None
+        or recipient_user is None
+        or actor.user_id != recipient_user.id
+    ):
+        return "recipient_changed", None
+
+    recipient = _normalize_recipient(actor)
+    if recipient is None or _address_hash(recipient) != outbox.recipient_address_hash:
+        return "recipient_changed", None
+    digest = build_assignment_mail_payload_digest(
+        compliance_assessment_id=graph.assessment.id,
+        assignment_id=assignment.id,
+        recipient_actor_id=actor.id,
+        recipient_address_hash=outbox.recipient_address_hash,
+    )
+    if digest != outbox.payload_digest:
+        return "payload_mismatch", None
+    return None, recipient
+
+
+def _terminal_reproof(
+    graph: _LockedDeliveryGraph,
+    *,
+    claimed_at: datetime,
+    expected_recipient: str,
+) -> str | None:
+    """Re-read the held graph immediately before the external SMTP call."""
+
+    graph.outbox.refresh_from_db()
+    graph.assignment.refresh_from_db()
+    if graph.actor is not None:
+        graph.actor.refresh_from_db()
+    if graph.recipient_user is not None:
+        graph.recipient_user.refresh_from_db()
+    if (
+        graph.actor is not None
+        and graph.recipient_user is not None
+        and graph.actor.user_id == graph.recipient_user.id
+    ):
+        graph.actor.user = graph.recipient_user
+
+    failure_code, current_recipient = _validate_locked_delivery_graph(
+        graph,
+        claimed_at=claimed_at,
+    )
+    if failure_code is not None:
+        return failure_code
+    actor = graph.actor
+    if actor is None:
+        return "recipient_changed"
+    if not (
+        ComplianceAssessment.authors.through.objects.filter(
+            id__in=graph.author_link_ids,
+            complianceassessment_id=graph.assessment.id,
+            actor_id=actor.id,
+        ).exists()
+        and RequirementAssignment.actor.through.objects.filter(
+            id__in=graph.assignment_actor_link_ids,
+            requirementassignment_id=graph.assignment.id,
+            actor_id=actor.id,
+        ).exists()
+    ):
+        return "recipient_not_authorized"
+    if current_recipient != expected_recipient:
+        return "recipient_changed"
+    return None
+
+
+def _set_outbox_failed(
+    outbox: RequirementAssignmentMailOutbox,
+    failure_code: str,
+) -> None:
+    outbox.status = RequirementAssignmentMailOutbox.Status.FAILED
+    outbox.failed_at = timezone.now()
+    outbox.failure_code = failure_code
+    outbox.save(update_fields=["status", "failed_at", "failure_code"])
+
+
+def _fail_claim(
+    outbox_id: UUID | str,
+    *,
+    claimed_at: datetime,
+    failure_code: str,
+) -> bool:
+    """Terminalise one exact claim using the canonical parent-first order."""
+
+    for _ in range(3):
+        locator = _read_delivery_locator(outbox_id)
+        if locator is None:
+            return False
+        try:
+            with transaction.atomic():
+                _, _, outbox = _lock_parent_and_outbox(locator)
+                if (
+                    outbox.status != RequirementAssignmentMailOutbox.Status.SENDING
+                    or outbox.claimed_at != claimed_at
+                ):
+                    return False
+                _set_outbox_failed(outbox, failure_code)
+                return True
+        except (
+            _DeliveryLocatorChanged,
+            ComplianceAssessment.DoesNotExist,
+            RequirementAssignment.DoesNotExist,
+            RequirementAssignmentMailOutbox.DoesNotExist,
+        ):
+            continue
+    return False
+
+
 def enqueue_requirement_assignment_mail_jobs(outbox_ids: Iterable[UUID]) -> None:
     """Best-effort Huey enqueue; queued rows remain recoverable by the sweeper."""
 
@@ -129,7 +397,7 @@ def enqueue_requirement_assignment_mail_jobs(outbox_ids: Iterable[UUID]) -> None
     for outbox_id in outbox_ids:
         try:
             deliver_requirement_assignment_mail(str(outbox_id))
-        except Exception as exc:  # queue outage must not undo the committed state
+        except Exception as exc:  # noqa: BLE001 - queue outage cannot undo state
             logger.error(
                 "requirement_assignment_mail_enqueue_failed",
                 outbox_id=str(outbox_id),
@@ -147,7 +415,7 @@ def queue_requirement_assignment_mails(
 
     with transaction.atomic():
         assessment = (
-            ComplianceAssessment.objects.select_for_update()
+            ComplianceAssessment.objects.select_for_update(of=("self",))
             .select_related("folder")
             .get(id=compliance_assessment_id)
         )
@@ -165,34 +433,66 @@ def queue_requirement_assignment_mails(
         assert_complete_access(requester, assessment)
 
         assignments = list(
-            RequirementAssignment.objects.select_for_update()
+            RequirementAssignment.objects.select_for_update(of=("self",))
             .filter(compliance_assessment=assessment)
             .select_related("folder")
-            .order_by("created_at", "id")
+            .order_by("id")
         )
         assignment_ids = [assignment.id for assignment in assignments]
+
+        # Existing outbox rows are children of the locked assignments and must
+        # be acquired before either relationship table.  A missing row is safe
+        # to insert later because its assignment lock serialises every compliant
+        # creator of that uniqueness key.
+        locked_outboxes = {
+            (outbox.assignment_id, outbox.recipient_actor_id): outbox
+            for outbox in RequirementAssignmentMailOutbox.objects.select_for_update()
+            .filter(assignment_id__in=assignment_ids)
+            .order_by("id")
+        }
 
         # Lock the relationship rows that define the exact author/recipient set.
         author_links = list(
             ComplianceAssessment.authors.through.objects.select_for_update()
             .filter(complianceassessment_id=assessment.id)
+            .order_by("id")
             .values_list("actor_id", flat=True)
         )
         assignment_actor_links = list(
             RequirementAssignment.actor.through.objects.select_for_update()
             .filter(requirementassignment_id__in=assignment_ids)
+            .order_by("id")
             .values_list("requirementassignment_id", "actor_id")
         )
         actor_ids = set(author_links)
         actor_ids.update(actor_id for _, actor_id in assignment_actor_links)
         actors = {
             actor.id: actor
-            for actor in Actor.objects.select_for_update().filter(id__in=actor_ids)
+            for actor in Actor.objects.select_for_update()
+            .filter(id__in=actor_ids)
+            .order_by("id")
         }
-        user_ids = [actor.user_id for actor in actors.values() if actor.user_id]
+        # The requester is also referenced by both outbox.requested_by and
+        # event.event_actor.  Include it in the same sorted User lock set as the
+        # recipients so those later FK checks do not introduce a User-to-User
+        # inversion between concurrent queue requests.
+        user_ids = {requester.id}
+        user_ids.update(
+            actor.user_id for actor in actors.values() if actor.user_id is not None
+        )
         if user_ids:
             # Stabilise the mail-capable subtype and its address while hashing.
-            list(User.objects.select_for_update().filter(id__in=user_ids))
+            users = {
+                user.id: user
+                for user in User.objects.select_for_update()
+                .filter(id__in=user_ids)
+                .order_by("id")
+            }
+            if requester.id not in users:
+                raise PermissionDenied("Required mailing authority is unavailable.")
+            for actor in actors.values():
+                if actor.user_id in users:
+                    actor.user = users[actor.user_id]
 
         view_assignment = _exact_permission(
             "core", "requirementassignment", "view_requirementassignment"
@@ -253,16 +553,17 @@ def queue_requirement_assignment_mails(
                     recipient_actor_id=actor.id,
                     recipient_address_hash=recipient_hash,
                 )
-                outbox, _ = RequirementAssignmentMailOutbox.objects.get_or_create(
-                    assignment=assignment,
-                    recipient_actor=actor,
-                    defaults={
-                        "folder": assignment.folder,
-                        "requested_by": requester,
-                        "payload_digest": digest,
-                        "recipient_address_hash": recipient_hash,
-                    },
-                )
+                outbox = locked_outboxes.get((assignment.id, actor.id))
+                if outbox is None:
+                    outbox = RequirementAssignmentMailOutbox.objects.create(
+                        assignment=assignment,
+                        recipient_actor=actor,
+                        folder=assignment.folder,
+                        requested_by=requester,
+                        payload_digest=digest,
+                        recipient_address_hash=recipient_hash,
+                    )
+                    locked_outboxes[(assignment.id, actor.id)] = outbox
                 if (
                     outbox.payload_digest != digest
                     or outbox.recipient_address_hash != recipient_hash
@@ -300,183 +601,217 @@ def queue_requirement_assignment_mails(
 def deliver_requirement_assignment_mail_outbox(outbox_id: UUID | str) -> str:
     """CAS-claim and deliver one outbox row; duplicate delivery is a no-op.
 
-    The CAS protects delivery ownership, while the inner transaction binds the
-    external SMTP call to the exact active assignment, author link, assignment
-    actor link, Actor subtype, and User address that were re-proved.  A process
-    death after SMTP acceptance still leaves ``sending`` for the terminal
-    claim-timeout path; it is deliberately never re-queued automatically.
-    Immediate rescue-host fallback is also disabled on this durable path because
-    a primary SMTP exception can be ambiguous and must not trigger a duplicate.
+    The claim and delivery transactions both enter through CA -> assignment ->
+    outbox.  The delivery transaction then locks the two relationship tables,
+    Actor, and User in that order before it re-proves the complete recipient
+    graph.  The claim is committed before SMTP, so an external result is never
+    presented as though a database rollback could undo it.  A process death
+    after SMTP acceptance leaves ``sending`` for the terminal claim-timeout
+    path; it is deliberately never re-queued automatically.  Immediate
+    rescue-host fallback is also disabled because a primary SMTP exception can
+    be ambiguous and must not trigger a duplicate.
     """
 
-    claimed_at = timezone.now()
-    claimed = RequirementAssignmentMailOutbox.objects.filter(
-        id=outbox_id,
-        status=RequirementAssignmentMailOutbox.Status.QUEUED,
-        available_at__lte=claimed_at,
-    ).update(
-        status=RequirementAssignmentMailOutbox.Status.SENDING,
-        claimed_at=claimed_at,
-        failed_at=None,
-        failure_code="",
-        attempts=F("attempts") + 1,
-    )
-    if claimed != 1:
-        return "noop"
-
+    claimed_at: datetime | None = None
     failure_code = "delivery_error"
-    try:
-        with transaction.atomic():
-            try:
-                outbox = (
-                    RequirementAssignmentMailOutbox.objects.select_for_update().get(
-                        id=outbox_id,
+    failure_error: Exception | None = None
+
+    # The first read is deliberately unlocked.  It supplies only coordinates
+    # for entering the hierarchy; every identity is checked again while held.
+    claimed = False
+    for _ in range(3):
+        locator = _read_delivery_locator(outbox_id)
+        if locator is None:
+            return "noop"
+        try:
+            with transaction.atomic():
+                assessment, _, outbox = _lock_parent_and_outbox(locator)
+                # Claims for one assessment are deliberately serial.  The
+                # remaining queued rows stay eligible for the periodic sweeper
+                # after the active claim reaches a terminal state.
+                another_claim_is_active = (
+                    RequirementAssignmentMailOutbox.objects.filter(
+                        assignment__compliance_assessment_id=assessment.id,
                         status=RequirementAssignmentMailOutbox.Status.SENDING,
                     )
+                    .exclude(id=outbox.id)
+                    .exists()
                 )
-            except RequirementAssignmentMailOutbox.DoesNotExist:
+                if another_claim_is_active:
+                    return "noop"
+
+                # Generate the lease timestamp only after all claim-owner rows
+                # are held.  Time spent waiting for those locks must not age the
+                # newly persisted claim.
+                claimed_at = timezone.now()
+                claimed_rows = RequirementAssignmentMailOutbox.objects.filter(
+                    id=outbox.id,
+                    assignment_id=locator.assignment_id,
+                    status=RequirementAssignmentMailOutbox.Status.QUEUED,
+                    available_at__lte=claimed_at,
+                ).update(
+                    status=RequirementAssignmentMailOutbox.Status.SENDING,
+                    claimed_at=claimed_at,
+                    failed_at=None,
+                    failure_code="",
+                    attempts=F("attempts") + 1,
+                )
+                if claimed_rows != 1:
+                    return "noop"
+            claimed = True
+            break
+        except (
+            _DeliveryLocatorChanged,
+            ComplianceAssessment.DoesNotExist,
+            RequirementAssignment.DoesNotExist,
+            RequirementAssignmentMailOutbox.DoesNotExist,
+        ):
+            continue
+
+    if not claimed:
+        return "noop"
+    if claimed_at is None:  # defensive type narrowing; a claim always sets it
+        return "noop"
+
+    try:
+        for _ in range(3):
+            locator = _read_delivery_locator(outbox_id)
+            if locator is None:
                 return "noop"
+            try:
+                with transaction.atomic():
+                    graph = _lock_delivery_graph(locator)
+                    if (
+                        graph.outbox.status
+                        != RequirementAssignmentMailOutbox.Status.SENDING
+                        or graph.outbox.claimed_at != claimed_at
+                    ):
+                        return "noop"
 
-            assignment = RequirementAssignment.objects.select_for_update().get(
-                id=outbox.assignment_id
-            )
-            actor_id = outbox.recipient_actor_id
-            if actor_id is None:
-                failure_code = "recipient_missing"
-                raise ValueError(failure_code)
-            actor = Actor.objects.select_for_update().get(id=actor_id)
+                    failure_code, recipient = _validate_locked_delivery_graph(
+                        graph,
+                        claimed_at=claimed_at,
+                    )
+                    if failure_code is None and recipient is not None:
+                        failure_code = _terminal_reproof(
+                            graph,
+                            claimed_at=claimed_at,
+                            expected_recipient=recipient,
+                        )
 
-            # Only the direct User subtype owns this mail API. Locking Actor and
-            # User prevents subtype/address changes after the exact recipient
-            # is resolved but before the SMTP backend receives it.
-            if actor.user_id is None:
-                failure_code = "recipient_changed"
-                raise ValueError(failure_code)
-            recipient_user = User.objects.select_for_update().get(id=actor.user_id)
-            actor.user = recipient_user
+                    if failure_code is None:
+                        recipient_user = graph.recipient_user
+                        if recipient_user is None or recipient is None:
+                            failure_code = "recipient_changed"
+                        else:
+                            # The digest and the SMTP envelope use this exact
+                            # stripped address.  Do not case-fold the local part.
+                            recipient_user.email = recipient
+                            if graph.actor is not None:
+                                graph.actor.user = recipient_user
+                            try:
+                                delivered = recipient_user.mailing(
+                                    email_template_name=MAIL_TEMPLATE,
+                                    subject=MAIL_SUBJECT,
+                                    object=MAIL_OBJECT,
+                                    object_id=graph.assignment.id,
+                                    allow_rescue=False,
+                                    redact_logs=True,
+                                )
+                            except Exception as exc:  # noqa: BLE001 - SMTP boundary
+                                failure_code = "delivery_error"
+                                failure_error = exc
+                            else:
+                                if delivered is not True:
+                                    failure_code = "delivery_not_confirmed"
+                                    failure_error = ValueError(failure_code)
 
-            assignment_actor_links = list(
-                RequirementAssignment.actor.through.objects.select_for_update()
-                .filter(
-                    requirementassignment_id=assignment.id,
-                    actor_id=actor.id,
-                )
-                .values_list("id", flat=True)
-            )
-            author_links = list(
-                ComplianceAssessment.authors.through.objects.select_for_update()
-                .filter(
-                    complianceassessment_id=assignment.compliance_assessment_id,
-                    actor_id=actor.id,
-                )
-                .values_list("id", flat=True)
-            )
-
-            if assignment.status != RequirementAssignment.Status.IN_PROGRESS:
-                failure_code = "assignment_not_active"
-                raise ValueError(failure_code)
-            if not assignment_actor_links or not author_links:
-                failure_code = "recipient_not_authorized"
-                raise ValueError(failure_code)
-
-            recipient = _normalize_recipient(actor)
-            if (
-                recipient is None
-                or _address_hash(recipient) != outbox.recipient_address_hash
+                    if failure_code is not None:
+                        if failure_error is None:
+                            failure_error = ValueError(failure_code)
+                        _set_outbox_failed(graph.outbox, failure_code)
+                    else:
+                        graph.outbox.status = (
+                            RequirementAssignmentMailOutbox.Status.DELIVERED
+                        )
+                        graph.outbox.delivered_at = timezone.now()
+                        graph.outbox.failed_at = None
+                        graph.outbox.failure_code = ""
+                        graph.outbox.save(
+                            update_fields=[
+                                "status",
+                                "delivered_at",
+                                "failed_at",
+                                "failure_code",
+                            ]
+                        )
+                if failure_code is None:
+                    return "delivered"
+                break
+            except (
+                _DeliveryLocatorChanged,
+                ComplianceAssessment.DoesNotExist,
+                RequirementAssignment.DoesNotExist,
+                RequirementAssignmentMailOutbox.DoesNotExist,
             ):
-                failure_code = "recipient_changed"
-                raise ValueError(failure_code)
-            digest = build_assignment_mail_payload_digest(
-                compliance_assessment_id=assignment.compliance_assessment_id,
-                assignment_id=assignment.id,
-                recipient_actor_id=actor.id,
-                recipient_address_hash=outbox.recipient_address_hash,
-            )
-            if digest != outbox.payload_digest:
-                failure_code = "payload_mismatch"
-                raise ValueError(failure_code)
+                continue
+        else:
+            failure_code = "delivery_error"
+            failure_error = RuntimeError("delivery identity did not stabilise")
+    except Exception as exc:  # noqa: BLE001 - terminalise ambiguous claims
+        failure_error = exc
+        if failure_code is None:
+            failure_code = "delivery_error"
 
-            # Fresh terminal reproof catches same-transaction mutations in
-            # tests and protects future refactors. On PostgreSQL the row locks
-            # above additionally prevent a concurrent transaction from
-            # crossing this boundary until delivery state is committed.
-            assignment = RequirementAssignment.objects.select_for_update().get(
-                id=assignment.id
-            )
-            actor = Actor.objects.select_for_update().get(id=actor.id)
-            if assignment.status != RequirementAssignment.Status.IN_PROGRESS:
-                failure_code = "assignment_not_active"
-                raise ValueError(failure_code)
-            if actor.user_id != recipient_user.id:
-                failure_code = "recipient_changed"
-                raise ValueError(failure_code)
-            if not (
-                RequirementAssignment.actor.through.objects.filter(
-                    id__in=assignment_actor_links,
-                    requirementassignment_id=assignment.id,
-                    actor_id=actor.id,
-                ).exists()
-                and ComplianceAssessment.authors.through.objects.filter(
-                    id__in=author_links,
-                    complianceassessment_id=assignment.compliance_assessment_id,
-                    actor_id=actor.id,
-                ).exists()
-            ):
-                failure_code = "recipient_not_authorized"
-                raise ValueError(failure_code)
-
-            recipient_user = User.objects.select_for_update().get(id=actor.user_id)
-            actor.user = recipient_user
-            current_recipient = _normalize_recipient(actor)
-            if (
-                current_recipient != recipient
-                or current_recipient is None
-                or _address_hash(current_recipient) != outbox.recipient_address_hash
-            ):
-                failure_code = "recipient_changed"
-                raise ValueError(failure_code)
-
-            delivered = recipient_user.mailing(
-                email_template_name=MAIL_TEMPLATE,
-                subject=MAIL_SUBJECT,
-                object=MAIL_OBJECT,
-                object_id=assignment.id,
-                allow_rescue=False,
-                redact_logs=True,
-            )
-            if delivered is not True:
-                failure_code = "delivery_not_confirmed"
-                raise ValueError(failure_code)
-
-            outbox.status = RequirementAssignmentMailOutbox.Status.DELIVERED
-            outbox.delivered_at = timezone.now()
-            outbox.failed_at = None
-            outbox.failure_code = ""
-            outbox.save(
-                update_fields=[
-                    "status",
-                    "delivered_at",
-                    "failed_at",
-                    "failure_code",
-                ]
-            )
-        return "delivered"
-    except Exception as exc:
-        RequirementAssignmentMailOutbox.objects.filter(
-            id=outbox_id,
-            status=RequirementAssignmentMailOutbox.Status.SENDING,
-        ).update(
-            status=RequirementAssignmentMailOutbox.Status.FAILED,
-            failed_at=timezone.now(),
+    # A database error after SMTP acceptance may have rolled back only the
+    # delivery transaction.  The separately committed claim is terminalised in
+    # a new parent-first transaction and is never re-queued automatically.
+    terminalized = False
+    try:
+        terminalized = _fail_claim(
+            outbox_id,
+            claimed_at=claimed_at,
             failure_code=failure_code,
         )
+    except Exception as exc:  # noqa: BLE001 - preserve safe non-retry semantics
         logger.error(
-            "requirement_assignment_mail_delivery_failed",
+            "requirement_assignment_mail_terminalization_failed",
             outbox_id=str(outbox_id),
             failure_code=failure_code,
             error_type=type(exc).__name__,
         )
-        return "failed"
+    if not terminalized:
+        # A normal failure may already have committed FAILED inside the delivery
+        # transaction.  Only report a terminalization failure when this exact
+        # claim is still live after the fallback attempt.
+        try:
+            claim_is_still_live = RequirementAssignmentMailOutbox.objects.filter(
+                id=outbox_id,
+                status=RequirementAssignmentMailOutbox.Status.SENDING,
+                claimed_at=claimed_at,
+            ).exists()
+        except Exception as exc:  # noqa: BLE001 - observability must not retry SMTP
+            logger.error(
+                "requirement_assignment_mail_terminalization_state_unknown",
+                outbox_id=str(outbox_id),
+                failure_code=failure_code,
+                error_type=type(exc).__name__,
+            )
+        else:
+            if claim_is_still_live:
+                logger.error(
+                    "requirement_assignment_mail_terminalization_failed",
+                    outbox_id=str(outbox_id),
+                    failure_code=failure_code,
+                    error_type="claim_still_sending",
+                )
+    logger.error(
+        "requirement_assignment_mail_delivery_failed",
+        outbox_id=str(outbox_id),
+        failure_code=failure_code,
+        error_type=type(failure_error).__name__,
+    )
+    return "failed"
 
 
 def get_due_requirement_assignment_mail_ids(*, limit: int = 100) -> list[UUID]:
@@ -491,7 +826,7 @@ def get_due_requirement_assignment_mail_ids(*, limit: int = 100) -> list[UUID]:
     )
 
 
-def fail_stale_requirement_assignment_mail_claims() -> int:
+def fail_stale_requirement_assignment_mail_claims(*, limit: int = 100) -> int:
     """Close abandoned claims without retrying a possibly delivered email.
 
     A process can die after SMTP acceptance but before persisting ``delivered``.
@@ -499,16 +834,54 @@ def fail_stale_requirement_assignment_mail_claims() -> int:
     sweeper records a bounded terminal failure for explicit operator review.
     """
 
+    bounded_limit = max(0, min(limit, 100))
+    if bounded_limit == 0:
+        return 0
+
     now = timezone.now()
     cutoff = now - CLAIM_TIMEOUT
-    return (
+    candidates = list(
         RequirementAssignmentMailOutbox.objects.filter(
             status=RequirementAssignmentMailOutbox.Status.SENDING
         )
         .filter(Q(claimed_at__lte=cutoff) | Q(claimed_at__isnull=True))
-        .update(
-            status=RequirementAssignmentMailOutbox.Status.FAILED,
-            failed_at=now,
-            failure_code="claim_timeout",
+        .order_by(
+            "assignment__compliance_assessment_id",
+            "assignment_id",
+            "id",
         )
+        .values_list(
+            "assignment__compliance_assessment_id",
+            "assignment_id",
+            "id",
+        )[:bounded_limit]
     )
+    failed = 0
+    for candidate in candidates:
+        locator = _DeliveryLocator(*candidate)
+        try:
+            with transaction.atomic():
+                _, _, outbox = _lock_parent_and_outbox(locator)
+                changed = (
+                    RequirementAssignmentMailOutbox.objects.filter(
+                        id=outbox.id,
+                        status=RequirementAssignmentMailOutbox.Status.SENDING,
+                    )
+                    .filter(Q(claimed_at__lte=cutoff) | Q(claimed_at__isnull=True))
+                    .update(
+                        status=RequirementAssignmentMailOutbox.Status.FAILED,
+                        failed_at=now,
+                        failure_code="claim_timeout",
+                    )
+                )
+                failed += changed
+        except (
+            _DeliveryLocatorChanged,
+            ComplianceAssessment.DoesNotExist,
+            RequirementAssignment.DoesNotExist,
+            RequirementAssignmentMailOutbox.DoesNotExist,
+        ):
+            # A concurrent identity/delete transition is either already
+            # terminal or will be reconsidered from fresh coordinates later.
+            continue
+    return failed
