@@ -4,20 +4,20 @@ import { getModelInfo, urlParamModelVerboseName } from '$lib/utils/crud';
 import { safeTranslate } from '$lib/utils/i18n';
 import { getSecureRedirect } from '$lib/utils/helpers';
 import { formatSelectFieldData } from '$lib/utils/load';
-import { modelSchema } from '$lib/utils/schemas';
+import { modelSchema, type FormDataShape } from '$lib/utils/schemas';
 import { headData } from '$lib/utils/table';
 import { m } from '$paraglide/messages';
-import { type TableSource } from '@skeletonlabs/skeleton-svelte';
+import { type TableSource } from '$lib/components/ModelTable/types';
 import type { Actions } from '@sveltejs/kit';
 import { fail, redirect } from '@sveltejs/kit';
 import { setFlash } from 'sveltekit-flash-message/server';
-import { message, setError, superValidate } from 'sveltekit-superforms';
+import { message, setError, superValidate, type SuperValidated } from 'sveltekit-superforms';
 import { zod4 as zod } from 'sveltekit-superforms/adapters';
 import type { PageServerLoad } from './$types';
 import { z } from 'zod';
 
 function failUpdateWithToast(
-	form: Record<string, any>,
+	form: SuperValidated<FormDataShape>,
 	messageText: string,
 	status = 502,
 	type: 'error' | 'warning' = 'error'
@@ -33,7 +33,7 @@ function failUpdateWithToast(
 	return fail(status >= 400 && status <= 599 ? status : 502, { form });
 }
 
-async function handleUpdateErrorResponse(response: Response, form: Record<string, any>) {
+async function handleUpdateErrorResponse(response: Response, form: SuperValidated<FormDataShape>) {
 	let payload: Record<string, unknown>;
 	try {
 		const parsed = await response.json();
@@ -149,11 +149,16 @@ export const load = (async ({ fetch, params }) => {
 	}
 
 	const schema = modelSchema(URLModel);
-	object.evidences = object.evidences?.map((evidence) => evidence.id) ?? [];
+	object.evidences = object.evidences?.map((evidence: { id: string }) => evidence.id) ?? [];
 	object.applied_controls =
-		object.applied_controls?.map((applied_control) => applied_control.id) ?? [];
+		object.applied_controls?.map((applied_control: { id: string }) => applied_control.id) ?? [];
 	object.security_exceptions =
-		object.security_exceptions?.map((security_exception) => security_exception.id) ?? [];
+		object.security_exceptions?.map(
+			(security_exception: { id: string }) => security_exception.id
+		) ?? [];
+	object.task_templates =
+		object.task_templates?.map((task_template: { id: string }) => task_template.id) ?? [];
+	object.findings = object.findings?.map((finding: { id: string }) => finding.id) ?? [];
 	object.nextRequirementAssessmentId = nextRequirementAssessmentId;
 	const form = await superValidate(object, zod(schema), { errors: true });
 
@@ -188,8 +193,6 @@ export const load = (async ({ fetch, params }) => {
 				const data = await fetchJson(url);
 				if (data) {
 					measureSelectOptions[selectField.field] = formatSelectFieldData(data, selectField);
-				} else {
-					console.error(`Failed to fetch data for ${selectField.field}: ${response.statusText}`);
 				}
 			})
 		);
@@ -200,7 +203,15 @@ export const load = (async ({ fetch, params }) => {
 	const tables: Record<string, any> = {};
 
 	await Promise.all(
-		['applied-controls', 'evidences', 'security-exceptions'].map(async (key) => {
+		(
+			[
+				'applied-controls',
+				'task-templates',
+				'evidences',
+				'security-exceptions',
+				'findings'
+			] as const
+		).map(async (key) => {
 			const table: TableSource = {
 				head: headData(key),
 				body: [],
@@ -231,6 +242,28 @@ export const load = (async ({ fetch, params }) => {
 		);
 	}
 	evidenceModel.selectOptions = evidenceSelectOptions;
+
+	const taskTemplateModel = getModelInfo('task-templates');
+	const taskTemplateCreateSchema = modelSchema('task-templates');
+	const taskTemplateCreateForm = await superValidate(
+		{ requirement_assessments: [params.id], folder: requirementAssessment.folder.id },
+		zod(taskTemplateCreateSchema),
+		{ errors: false }
+	);
+
+	const taskTemplateSelectOptions: Record<string, any> = {};
+	if (taskTemplateModel.selectFields) {
+		await Promise.all(
+			taskTemplateModel.selectFields.map(async (selectField) => {
+				const url = `${baseUrl}/task-templates/${selectField.field}/`;
+				const data = await fetchJson(url);
+				if (data) {
+					taskTemplateSelectOptions[selectField.field] = formatSelectFieldData(data, selectField);
+				}
+			})
+		);
+	}
+	taskTemplateModel.selectOptions = taskTemplateSelectOptions;
 
 	const securityExceptionModel = getModelInfo('security-exceptions');
 	const securityExceptionCreateSchema = modelSchema('security-exceptions');
@@ -270,6 +303,8 @@ export const load = (async ({ fetch, params }) => {
 		measureModel,
 		evidenceModel,
 		evidenceCreateForm,
+		taskTemplateModel,
+		taskTemplateCreateForm,
 		securityExceptionModel,
 		securityExceptionCreateForm,
 		tables,
@@ -349,10 +384,13 @@ export const actions: Actions = {
 			'is_score_overridden',
 			'documentation_score',
 			'observation',
+			'respondent_alignment',
 			'answers',
 			'evidences',
 			'applied_controls',
-			'security_exceptions'
+			'task_templates',
+			'security_exceptions',
+			'findings'
 		];
 		for (const key of visibilityControlled) {
 			if (!(key in currentRa)) {
@@ -428,6 +466,20 @@ export const actions: Actions = {
 		const newEvidence = uuidId(result.form.message?.object?.id);
 		return newEvidence ? { form: result.form, newEvidence } : { form: result.form };
 	},
+	createTaskTemplate: async (event) => {
+		const result = await nestedWriteFormAction({
+			event,
+			action: 'create',
+			expectedUrlModel: 'task-templates',
+			boundRelationship: {
+				field: 'requirement_assessments',
+				value: [event.params.id ?? '']
+			}
+		});
+		if (!('form' in result)) return result;
+		const newTaskTemplate = uuidId(result.form.message?.object?.id);
+		return newTaskTemplate ? { form: result.form, newTaskTemplate } : { form: result.form };
+	},
 	createSecurityException: async (event) => {
 		const result = await nestedWriteFormAction({
 			event,
@@ -443,6 +495,20 @@ export const actions: Actions = {
 		return newSecurityException
 			? { form: result.form, newSecurityException }
 			: { form: result.form };
+	},
+	createFinding: async (event) => {
+		const result = await nestedWriteFormAction({
+			event,
+			action: 'create',
+			expectedUrlModel: 'findings',
+			boundRelationship: {
+				field: 'requirement_assessment',
+				value: event.params.id ?? ''
+			}
+		});
+		if (!('form' in result)) return result;
+		const newFinding = uuidId(result.form.message?.object?.id);
+		return newFinding ? { form: result.form, newFinding } : { form: result.form };
 	},
 	createSuggestedControls: async (event) => {
 		const formData = await event.request.formData();
@@ -481,7 +547,7 @@ export const actions: Actions = {
 			);
 			return fail(400, { form });
 		}
-		const newControls = await response.json().then((data) => data.map((e) => e.id));
+		const newControls = await response.json().then((data) => data.map((e: { id: string }) => e.id));
 		return { form, newControls };
 	}
 };

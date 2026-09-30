@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import uuid
 
 import pytest
@@ -167,29 +168,20 @@ def _pdf_url(assessment: RiskAssessment) -> str:
 def _capture_pdf_context(monkeypatch):
     from core import views as core_views
 
-    captured = {}
-    original_render = core_views.render_to_string
+    captured = {"payloads": []}
 
-    def fake_render(template_name, data):
+    def fake_render(template_name, data, images=None, pdf_standards=None):
         captured["template"] = template_name
-        captured["data"] = data
-        return original_render(template_name, data)
+        captured["payloads"].append(deepcopy(data))
+        return b"%PDF-risk-action-plan-iam"
 
-    class FakeHTML:
-        def __init__(self, *, string):
-            captured["html"] = string
-
-        def write_pdf(self):
-            return b"%PDF-risk-action-plan-iam"
-
-    monkeypatch.setattr(core_views, "render_to_string", fake_render)
-    monkeypatch.setattr(core_views, "HTML", FakeHTML)
+    monkeypatch.setattr(core_views, "render_pdf", fake_render)
     return captured
 
 
-def _projected_controls(captured) -> list[AppliedControl]:
-    context = captured["data"]["context"]
-    return [control for controls in context.values() for control in controls]
+def _projected_controls(captured) -> list[dict]:
+    payload = captured["payloads"][-1]
+    return [control for group in payload["groups"] for control in group["controls"]]
 
 
 def test_pdf_projects_only_visible_scenarios_and_exact_control_authority(
@@ -206,19 +198,18 @@ def test_pdf_projects_only_visible_scenarios_and_exact_control_authority(
     assert response.status_code == 200, response.content
     assert response.content == b"%PDF-risk-action-plan-iam"
     controls = _projected_controls(captured)
-    assert {control.id for control in controls} == {
-        world["ordinary"].id,
-        world["degraded_existing"].id,
+    assert {control["name"] for control in controls} == {
+        world["ordinary"].name,
+        world["degraded_existing"].name,
     }
     for control in controls:
-        assert {scenario.id for scenario in control.authorized_risk_scenarios} == {
-            world["visible_scenario"].id
-        }
-    assert world["ordinary"].name in captured["html"]
-    assert world["visible_scenario"].name in captured["html"]
-    assert world["hidden_scenario"].name not in captured["html"]
-    assert world["hidden_control"].name not in captured["html"]
-    assert world["policy"].name not in captured["html"]
+        assert control["linked"] == [str(world["visible_scenario"])]
+    rendered = repr(captured["payloads"][-1])
+    assert world["ordinary"].name in rendered
+    assert world["visible_scenario"].name in rendered
+    assert world["hidden_scenario"].name not in rendered
+    assert world["hidden_control"].name not in rendered
+    assert world["policy"].name not in rendered
 
 
 def test_pdf_includes_policy_only_after_view_policy_is_granted(
@@ -233,22 +224,22 @@ def test_pdf_includes_policy_only_after_view_policy_is_granted(
 
     without_policy = client.get(_pdf_url(world["assessment"]))
     assert without_policy.status_code == 200, without_policy.content
-    assert {control.id for control in _projected_controls(captured)} == {
-        world["ordinary"].id,
-        world["degraded_existing"].id,
+    assert {control["name"] for control in _projected_controls(captured)} == {
+        world["ordinary"].name,
+        world["degraded_existing"].name,
     }
-    assert world["policy"].name not in captured["html"]
+    assert world["policy"].name not in repr(captured["payloads"][-1])
 
     _grant(user, world["visible"], "view_policy")
     with_policy = client.get(_pdf_url(world["assessment"]))
 
     assert with_policy.status_code == 200, with_policy.content
-    assert {control.id for control in _projected_controls(captured)} == {
-        world["ordinary"].id,
-        world["degraded_existing"].id,
-        world["policy"].id,
+    assert {control["name"] for control in _projected_controls(captured)} == {
+        world["ordinary"].name,
+        world["degraded_existing"].name,
+        world["policy"].name,
     }
-    assert world["policy"].name in captured["html"]
+    assert world["policy"].name in repr(captured["payloads"][-1])
 
 
 def test_pdf_reproves_exact_relationship_projection_after_render(
@@ -259,18 +250,13 @@ def test_pdf_reproves_exact_relationship_projection_after_render(
     user = _user(world["visible"])
     _grant(user, world["visible"], *PDF_PERMISSIONS)
 
-    def mutate_relationship_during_render(template_name, data):
+    def mutate_relationship_during_render(
+        template_name, data, images=None, pdf_standards=None
+    ):
         world["visible_scenario"].applied_controls.remove(world["ordinary"])
-        return "<html>stale projection</html>"
+        return b"%PDF-stale-projection"
 
-    class UnexpectedHTML:
-        def __init__(self, *, string):  # pragma: no cover - must fail earlier
-            raise AssertionError("stale report reached PDF generation")
-
-    monkeypatch.setattr(
-        "core.views.render_to_string", mutate_relationship_during_render
-    )
-    monkeypatch.setattr("core.views.HTML", UnexpectedHTML)
+    monkeypatch.setattr("core.views.render_pdf", mutate_relationship_during_render)
 
     response = _client(user).get(_pdf_url(world["assessment"]))
 
@@ -286,34 +272,28 @@ def test_pdf_binds_every_rendered_scalar_to_the_terminal_snapshot(
     world = risk_pdf_world
     user = _user(world["visible"])
     _grant(user, world["visible"], *PDF_PERMISSIONS)
-    original_render = core_views.render_to_string
     calls = 0
 
-    def mutate_control_after_first_render(template_name, data):
+    def mutate_control_after_first_render(
+        template_name, data, images=None, pdf_standards=None
+    ):
         nonlocal calls
         calls += 1
-        html = original_render(template_name, data)
-        if calls == 1:
-            AppliedControl.objects.filter(id=world["ordinary"].id).update(
-                name=f"Changed during render {uuid.uuid4().hex}"
-            )
-        return html
-
-    class UnexpectedHTML:
-        def __init__(self, *, string):  # pragma: no cover - must fail earlier
-            raise AssertionError("mixed-version report reached PDF generation")
+        AppliedControl.objects.filter(id=world["ordinary"].id).update(
+            name=f"Changed during render {uuid.uuid4().hex}"
+        )
+        return b"%PDF-mixed-version"
 
     monkeypatch.setattr(
         core_views,
-        "render_to_string",
+        "render_pdf",
         mutate_control_after_first_render,
     )
-    monkeypatch.setattr(core_views, "HTML", UnexpectedHTML)
 
     response = _client(user).get(_pdf_url(world["assessment"]))
 
     assert response.status_code == 403, response.content
-    assert calls == 2
+    assert calls == 1
 
 
 @pytest.mark.parametrize("missing_permission", ("view_folder", "view_perimeter"))

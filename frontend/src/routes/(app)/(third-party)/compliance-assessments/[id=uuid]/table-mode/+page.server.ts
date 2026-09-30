@@ -7,9 +7,9 @@ import { safeTranslate } from '$lib/utils/i18n';
 import { fail, type Actions, type RequestEvent } from '@sveltejs/kit';
 import { message, setError, superValidate, type SuperValidated } from 'sveltekit-superforms';
 import { zod4 as zod } from 'sveltekit-superforms/adapters';
-import { z } from 'zod';
 import type { ModelInfo } from '$lib/utils/types';
 import type { PageServerLoad } from './$types';
+import { z } from 'zod';
 
 const relationshipUpdateFields = ['evidences', 'applied_controls'] as const;
 type RelationshipUpdateField = (typeof relationshipUpdateFields)[number];
@@ -39,6 +39,20 @@ const scalarUpdateSchema = z.union([
 			])
 		})
 		.strict(),
+	z
+		.object({
+			id: uuidSchema,
+			extended_result: z
+				.enum([
+					'major_nonconformity',
+					'minor_nonconformity',
+					'observation_sensitive_point',
+					'opportunity_for_improvement',
+					'good_practice'
+				])
+				.nullable()
+		})
+		.strict(),
 	z.object({ id: uuidSchema, answers: z.record(z.string(), answerValueSchema) }).strict(),
 	z
 		.object({
@@ -57,6 +71,18 @@ type RouteBoundRequirementAssessment =
 
 type RouteBoundNestedCreate =
 	{ ok: true; requirementAssessmentId: string } | { ok: false; result: ReturnType<typeof fail> };
+
+type RelatedObject = { id: string } & Record<string, unknown>;
+
+type TableModeRequirementAssessment = {
+	id: string;
+	folder?: RelatedObject | null;
+	observation?: unknown;
+	requirement: RelatedObject;
+	compliance_assessment: RelatedObject;
+	evidences?: RelatedObject[];
+	applied_controls?: RelatedObject[];
+} & Record<string, unknown>;
 
 function apiFailureStatus(status: number): number {
 	return status >= 400 && status <= 599 ? status : 502;
@@ -292,85 +318,73 @@ export const load = (async ({ fetch, params }) => {
 
 	const measureModel = getModelInfo('applied-controls');
 	const measureCreateSchema = modelSchema('applied-controls');
-
 	const evidenceModel = getModelInfo('evidences');
 	const evidenceCreateSchema = modelSchema('evidences');
-	const scoreSchema = z.object({
-		is_scored: z.boolean().optional(),
-		score: z.number().optional().nullable(),
-		documentation_score: z.number().optional().nullable()
-	});
+
 	const requirement_assessments = await Promise.all(
-		tableMode.requirement_assessments.map(async (requirementAssessment) => {
-			// TODO: merge initial data ?
-			const { folder, ...requirementAssessmentWithoutFolder } = requirementAssessment;
-			const folderId = folder?.id;
-			const measureCreateForm = folderId
-				? await superValidate(
-						{
-							requirement_assessments: [requirementAssessment.id],
-							folder: folderId
-						},
-						zod(measureCreateSchema),
-						{ errors: false }
-					)
-				: null;
-			const evidenceCreateForm = folderId
-				? await superValidate(
-						{
-							requirement_assessments: [requirementAssessment.id],
-							folder: folderId
-						},
-						zod(evidenceCreateSchema),
-						{ errors: false }
-					)
-				: null;
-			const observationBuffer = requirementAssessment.observation;
-			const scoreForm = await superValidate(
-				{
-					is_scored: requirementAssessment.is_scored,
-					score: requirementAssessment.score,
-					documentation_score: requirementAssessment.documentation_score
-				},
-				zod(scoreSchema)
-			);
-			const updateSchema = modelSchema('requirement-assessments');
-			const updatedModel: ModelInfo = getModelInfo('requirement-assessments');
-			const object = {
-				...requirementAssessmentWithoutFolder,
-				...(folderId ? { folder: folderId } : {}),
-				requirement: requirementAssessment.requirement.id,
-				compliance_assessment: requirementAssessment.compliance_assessment.id,
-				...(requirementAssessment.evidences !== undefined && {
-					evidences: requirementAssessment.evidences.map((evidence) => evidence.id)
-				}),
-				...(requirementAssessment.applied_controls !== undefined && {
-					applied_controls: requirementAssessment.applied_controls.map((ac) => ac.id)
-				})
-			};
-			const updateForm = await superValidate(object, zod(updateSchema), { errors: false });
-			return {
-				...requirementAssessment,
-				measureCreateForm,
-				evidenceCreateForm,
-				observationBuffer,
-				scoreForm,
-				updateForm,
-				updatedModel,
-				object
-			};
-		})
+		tableMode.requirement_assessments.map(
+			async (requirementAssessment: TableModeRequirementAssessment) => {
+				// TODO: merge initial data ?
+				const { folder, ...requirementAssessmentWithoutFolder } = requirementAssessment;
+				const folderId = folder?.id;
+				const measureCreateForm = folderId
+					? await superValidate(
+							{
+								requirement_assessments: [requirementAssessment.id],
+								folder: folderId
+							},
+							zod(measureCreateSchema),
+							{ errors: false }
+						)
+					: null;
+				const evidenceCreateForm = folderId
+					? await superValidate(
+							{
+								requirement_assessments: [requirementAssessment.id],
+								folder: folderId
+							},
+							zod(evidenceCreateSchema),
+							{ errors: false }
+						)
+					: null;
+				const observationBuffer = requirementAssessment.observation;
+				const updateSchema = modelSchema('requirement-assessments');
+				const updatedModel: ModelInfo = getModelInfo('requirement-assessments');
+				const object = {
+					...requirementAssessmentWithoutFolder,
+					...(folderId ? { folder: folderId } : {}),
+					requirement: requirementAssessment.requirement.id,
+					compliance_assessment: requirementAssessment.compliance_assessment.id,
+					...(requirementAssessment.evidences !== undefined && {
+						evidences: requirementAssessment.evidences.map((evidence) => evidence.id)
+					}),
+					...(requirementAssessment.applied_controls !== undefined && {
+						applied_controls: requirementAssessment.applied_controls.map((ac) => ac.id)
+					})
+				};
+				const updateForm = await superValidate(object, zod(updateSchema), { errors: false });
+				return {
+					...requirementAssessment,
+					measureCreateForm,
+					evidenceCreateForm,
+					observationBuffer,
+					updateForm,
+					updatedModel,
+					object
+				};
+			}
+		)
 	);
 
 	const requirementAssessmentsById = requirement_assessments.reduce(
 		(acc, requirementAssessment) => {
-			acc[requirementAssessment.requirement] = requirementAssessment;
+			acc[requirementAssessment.requirement.id] = requirementAssessment;
 			return acc;
 		},
-		{}
+		{} as Record<string, (typeof requirement_assessments)[number]>
 	);
 
-	const requirements = tableMode.requirements.map((requirement) => {
+	const requirements = tableMode.requirements.map((requirement: RelatedObject) => {
 		if (requirementAssessmentsById[requirement.id]) {
 			return requirementAssessmentsById[requirement.id];
 		}

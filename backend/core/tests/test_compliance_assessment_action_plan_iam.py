@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+from copy import deepcopy
 import io
 import uuid
 
@@ -106,7 +107,7 @@ def action_plan_iam_world(audit_iam_world):
     }
 
 
-def test_fully_authorized_exports_keep_legacy_wire_formats(
+def test_fully_authorized_exports_keep_supported_wire_formats(
     action_plan_iam_world, monkeypatch
 ):
     world = action_plan_iam_world
@@ -164,21 +165,26 @@ def test_fully_authorized_exports_keep_legacy_wire_formats(
 
     rendered = {}
 
-    class FakeHTML:
-        def __init__(self, *, string):
-            rendered["html"] = string
+    def fake_render_pdf(template_name, data, images=None, pdf_standards=None):
+        rendered["template"] = template_name
+        rendered["payload"] = deepcopy(data)
+        return b"%PDF-action-plan-iam"
 
-        def write_pdf(self):
-            return b"%PDF-action-plan-iam"
-
-    monkeypatch.setattr("core.views.HTML", FakeHTML)
+    monkeypatch.setattr("core.views.render_pdf", fake_render_pdf)
     pdf_response = client.get(_export_url(target, "action_plan_pdf"))
     assert pdf_response.status_code == 200, pdf_response.content
     assert pdf_response["Content-Type"] == "application/pdf"
     assert pdf_response.content == b"%PDF-action-plan-iam"
-    assert target.name in rendered["html"]
-    assert target.perimeter.name in rendered["html"]
-    assert world["assigned_requirement"].ref_id in rendered["html"]
+    assert rendered["template"] == "action_plan_en.typ"
+    assert rendered["payload"]["subject"]["name"] == target.name
+    assert rendered["payload"]["subject"]["perimeter"] == target.perimeter.name
+    controls = [
+        control
+        for group in rendered["payload"]["groups"]
+        for control in group["controls"]
+    ]
+    assert [control["name"] for control in controls] == [world["control"].name]
+    assert world["assigned_requirement"].ref_id in repr(controls[0]["linked"])
 
 
 @pytest.mark.parametrize(
@@ -377,7 +383,7 @@ def test_empty_assessment_visibility_uses_hidden_framework_policy(
         assert client.get(url).status_code == 403
 
 
-@pytest.mark.parametrize("mutation", ("unlink", "hide-policy"))
+@pytest.mark.parametrize("mutation", ("unlink", "hide-evidences"))
 def test_terminal_reproof_is_bound_to_the_serialized_projection(
     action_plan_iam_world, monkeypatch, mutation
 ):
@@ -416,6 +422,41 @@ def test_terminal_reproof_is_bound_to_the_serialized_projection(
     )
 
     assert mutated is True
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize("mutation", ("unlink", "hide-policy"))
+def test_pdf_terminal_reproof_runs_after_typst_render(
+    action_plan_iam_world, monkeypatch, mutation
+):
+    world = action_plan_iam_world
+    rendered = False
+
+    def mutate_during_render(template_name, data, images=None, pdf_standards=None):
+        nonlocal rendered
+        rendered = True
+        if mutation == "unlink":
+            world["assigned_ra"].applied_controls.remove(world["control"])
+        else:
+            visibility = {
+                key: dict(value)
+                for key, value in world["target"].field_visibility.items()
+            }
+            visibility["evidences"] = {
+                "auditor": "hidden",
+                "respondent": "hidden",
+            }
+            ComplianceAssessment.objects.filter(id=world["target"].id).update(
+                field_visibility=visibility
+            )
+        return b"%PDF-stale-action-plan"
+
+    monkeypatch.setattr("core.views.render_pdf", mutate_during_render)
+    response = _client(world["auditor"]).get(
+        _export_url(world["target"], "action_plan_pdf")
+    )
+
+    assert rendered is True
     assert response.status_code == 403
 
 

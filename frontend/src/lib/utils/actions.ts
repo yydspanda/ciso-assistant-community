@@ -1,10 +1,11 @@
 import { BASE_API_URL } from '$lib/utils/constants';
+import { contentDispositionHeader } from '$lib/utils/contentDisposition';
 import { getModelInfo, urlParamModelVerboseName } from '$lib/utils/crud';
 
 import { m } from '$paraglide/messages';
 
 import { safeTranslate } from '$lib/utils/i18n';
-import { modelSchema } from '$lib/utils/schemas';
+import { modelSchema, type FormDataShape } from '$lib/utils/schemas';
 import { fail, redirect, type RequestEvent } from '@sveltejs/kit';
 import { setFlash } from 'sveltekit-flash-message/server';
 import { message, setError, superValidate, type SuperValidated } from 'sveltekit-superforms';
@@ -14,10 +15,15 @@ import { getSecureRedirect } from './helpers';
 
 type FormAction = 'create' | 'edit';
 
-type BoundRelationshipWrite = {
-	field: 'requirement_assessments';
-	value: string[];
-};
+type BoundRelationshipWrite =
+	| {
+			field: 'requirement_assessments';
+			value: string[];
+	  }
+	| {
+			field: 'requirement_assessment';
+			value: string;
+	  };
 
 function getHTTPMethod({
 	action,
@@ -72,7 +78,7 @@ export async function handleErrorResponse({
 }: {
 	event: RequestEvent;
 	response: Response;
-	form: SuperValidated;
+	form: SuperValidated<FormDataShape>;
 }) {
 	const res: Record<string, string> = await response.json();
 	console.error(res);
@@ -92,11 +98,14 @@ export async function handleErrorResponse({
 	Object.entries(res).forEach(([key, value]) => {
 		if (Array.isArray(value)) {
 			value.forEach((item: string) => setError(form, key, safeTranslate(item)));
-		} else {
+		} else if (typeof value === 'string') {
 			setError(form, key, safeTranslate(value));
 		}
 	});
-	return message(form, { status: response.status });
+	// setError only runs for string values; nested errors must still refuse the save.
+	form.valid = false;
+	// Structured values (e.g. a 409's impact summary) reach the form through the message.
+	return message(form, { status: response.status, data: res });
 }
 
 export async function defaultWriteFormAction({
@@ -142,10 +151,11 @@ export async function defaultWriteFormAction({
 	}
 	let normalizedBoundRelationship = boundRelationship;
 	if (boundRelationship) {
-		const parsedRelationshipValue = z
-			.array(z.string().uuid())
-			.length(1)
-			.safeParse(boundRelationship.value);
+		const relationshipSchema =
+			boundRelationship.field === 'requirement_assessments'
+				? z.array(z.string().uuid()).length(1)
+				: z.string().uuid();
+		const parsedRelationshipValue = relationshipSchema.safeParse(boundRelationship.value);
 		if (!parsedRelationshipValue.success) {
 			return writeFailure({
 				event,
@@ -154,11 +164,19 @@ export async function defaultWriteFormAction({
 				error: parsedRelationshipValue.error
 			});
 		}
-		normalizedBoundRelationship = {
-			...boundRelationship,
-			value: parsedRelationshipValue.data
-		};
-		form.data[boundRelationship.field] = parsedRelationshipValue.data;
+		if (boundRelationship.field === 'requirement_assessments') {
+			normalizedBoundRelationship = {
+				field: boundRelationship.field,
+				value: parsedRelationshipValue.data as string[]
+			};
+			form.data[boundRelationship.field] = parsedRelationshipValue.data as string[];
+		} else {
+			normalizedBoundRelationship = {
+				field: boundRelationship.field,
+				value: parsedRelationshipValue.data as string
+			};
+			form.data[boundRelationship.field] = parsedRelationshipValue.data as string;
+		}
 	}
 
 	// `dataType: 'form'` submissions (models with a file field, e.g. Evidence) can't
@@ -252,7 +270,7 @@ export async function defaultWriteFormAction({
 			const fileUploadEndpoint = `${BASE_API_URL}/${urlModel}/${writtenObjectId}/upload/`;
 			const fileUploadRequestInitOptions: RequestInit = {
 				headers: {
-					'Content-Disposition': `attachment; filename=${encodeURIComponent(file.name)}`
+					'Content-Disposition': contentDispositionHeader(file.name)
 				},
 				method: 'POST',
 				body: file
@@ -302,7 +320,7 @@ export async function defaultWriteFormAction({
 		}
 	}
 
-	let flashParams = {
+	const flashParams: { type: 'success' | 'warning'; message: string } = {
 		type: 'success',
 		message: getSuccessMessage({ urlModel, action }) as string
 	};
@@ -434,7 +452,7 @@ export async function defaultDeleteFormAction({
 		}
 		if (response.error) {
 			const errorMessages = Array.isArray(response.error) ? response.error : [response.error];
-			errorMessages.forEach((error) => {
+			errorMessages.forEach((error: string) => {
 				setFlash({ type: 'error', message: safeTranslate(error) }, event);
 			});
 			return message(deleteForm, { status: res.status });

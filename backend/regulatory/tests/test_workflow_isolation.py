@@ -14,6 +14,8 @@ from automation.workflows.models import (
 )
 from automation.workflows.tasks import dispatch_internal_event_task
 from automation.workflows.tests.helpers import publisher_user
+from global_settings.models import GlobalSettings
+from global_settings.utils import clear_feature_flags_cache
 from regulatory.services import create_regulatory_chain
 
 from .factories import (
@@ -34,6 +36,20 @@ def _regulatory_audit_models():
         for model in auditlog.get_models()
         if model._meta.app_label == "regulatory"
     }
+
+
+@pytest.fixture
+def set_workflows_feature_flag():
+    def set_enabled(enabled: bool) -> None:
+        settings, _ = GlobalSettings.objects.get_or_create(
+            name=GlobalSettings.Names.FEATURE_FLAGS
+        )
+        settings.value = {**(settings.value or {}), "workflows": enabled}
+        settings.save()
+        clear_feature_flags_cache()
+
+    yield set_enabled
+    clear_feature_flags_cache()
 
 
 def test_regulatory_models_remain_audited_but_opt_out_of_workflow_events():
@@ -73,7 +89,11 @@ def test_workflow_action_registries_do_not_expose_regulatory_models():
 
 
 @pytest.mark.django_db
-def test_regulatory_event_keys_are_not_exposed_by_the_workflow_api(regulatory_root):
+def test_regulatory_event_keys_are_not_exposed_by_the_workflow_api(
+    regulatory_root,
+    set_workflows_feature_flag,
+):
+    set_workflows_feature_flag(True)
     client = APIClient()
     client.force_authenticate(publisher_user())
 
@@ -86,6 +106,20 @@ def test_regulatory_event_keys_are_not_exposed_by_the_workflow_api(regulatory_ro
     assert not regulatory_model_names.intersection(
         entry["model"] for entry in response.json()
     )
+
+
+@pytest.mark.django_db
+def test_regulatory_event_keys_api_respects_disabled_workflows_flag(
+    regulatory_root,
+    set_workflows_feature_flag,
+):
+    set_workflows_feature_flag(False)
+    client = APIClient()
+    client.force_authenticate(publisher_user())
+
+    response = client.get("/api/workflows/workflow-triggers/event-keys/")
+
+    assert response.status_code == 403
 
 
 @pytest.mark.django_db

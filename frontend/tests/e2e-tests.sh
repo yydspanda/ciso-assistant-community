@@ -292,6 +292,9 @@ build_frontend() {
   fi
 }
 
+# Hash the SOURCES. Hashing the overlay's `.build/` instead would compare a build against
+# itself: it only changes once a build has run, so every source edit after the first build
+# looked unchanged and the enterprise tests silently ran against stale code.
 compute_frontend_hash() {
   local edition="community"
   local inputs=(
@@ -472,9 +475,9 @@ if [[ -z "$USE_EXISTING_MAILER" ]]; then
   if command -v docker &>/dev/null; then
     echo "Starting mailer service..."
     if [[ -z "$DO_NOT_USE_SUDO" ]]; then
-      MAILER_PID=$(sudo docker run -d -p "$MAILER_SMTP_SERVER_PORT":1025 -p "$MAILER_WEB_SERVER_PORT":8025 mailhog/mailhog) || exit $?
+      MAILER_PID=$(sudo docker run -d -p "$MAILER_SMTP_SERVER_PORT":1025 -p "$MAILER_WEB_SERVER_PORT":8025 -e MP_SMTP_AUTH_ACCEPT_ANY=1 -e MP_SMTP_AUTH_ALLOW_INSECURE=1 axllent/mailpit:v1.31.1) || exit $?
     else
-      MAILER_PID=$(docker run -d -p "$MAILER_SMTP_SERVER_PORT":1025 -p "$MAILER_WEB_SERVER_PORT":8025 mailhog/mailhog) || exit $?
+      MAILER_PID=$(docker run -d -p "$MAILER_SMTP_SERVER_PORT":1025 -p "$MAILER_WEB_SERVER_PORT":8025 -e MP_SMTP_AUTH_ACCEPT_ANY=1 -e MP_SMTP_AUTH_ALLOW_INSECURE=1 axllent/mailpit:v1.31.1) || exit $?
     fi
     [[ -n "$MAILER_PID" ]] || exit 1
     wait_for_port "Mailer SMTP service" localhost "$MAILER_SMTP_SERVER_PORT" 60 || exit $?

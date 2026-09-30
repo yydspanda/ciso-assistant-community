@@ -25,6 +25,7 @@ from core.models import (
     Comment,
     Finding,
     Incident,
+    Policy,
     RequirementAssessment,
     RiskAssessment,
     RiskScenario,
@@ -82,6 +83,20 @@ EMPTY_APPLIED_CONTROL_PROJECTION = AppliedControlRequestProjection(
     linked_models=(),
     risk_scenarios=(),
 )
+
+
+def filter_caller_visible_applied_controls(queryset, user):
+    """Apply the permission model that owns each concrete control row.
+
+    Policy is a permission-bearing proxy over the AppliedControl table. Generic
+    control rights and policy rights must not disclose each other's rows.
+    """
+    visible_control_ids = RoleAssignment.get_viewable_object_ids(user, AppliedControl)
+    visible_policy_ids = RoleAssignment.get_viewable_object_ids(user, Policy)
+    return queryset.filter(
+        Q(category="policy", id__in=visible_policy_ids)
+        | (~Q(category="policy") & Q(id__in=visible_control_ids))
+    )
 
 
 def _relation_specs():

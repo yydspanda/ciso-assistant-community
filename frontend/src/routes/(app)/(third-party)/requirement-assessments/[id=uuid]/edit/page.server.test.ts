@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { setFlashMock, submittedForm } = vi.hoisted(() => ({
+const { getModelInfoMock, setFlashMock, submittedForm } = vi.hoisted(() => ({
+	getModelInfoMock: vi.fn((urlModel: string) => ({
+		urlModel,
+		localName: urlModel,
+		fileFields: urlModel === 'evidences' ? ['attachment'] : []
+	})),
 	setFlashMock: vi.fn(),
 	submittedForm: {
 		valid: true,
@@ -20,11 +25,7 @@ const { setFlashMock, submittedForm } = vi.hoisted(() => ({
 }));
 
 vi.mock('$lib/utils/crud', () => ({
-	getModelInfo: vi.fn((urlModel: string) => ({
-		urlModel,
-		localName: urlModel,
-		fileFields: urlModel === 'evidences' ? ['attachment'] : []
-	})),
+	getModelInfo: getModelInfoMock,
 	urlParamModelVerboseName: () => 'Requirement assessment'
 }));
 
@@ -87,7 +88,7 @@ vi.mock('sveltekit-superforms', () => ({
 }));
 
 import { nestedWriteFormAction } from '$lib/utils/actions';
-import { actions } from './+page.server';
+import { actions, load } from './+page.server';
 
 const requirementAssessmentId = '7fe956d8-a98e-43f2-bdd6-2d48922c41f7';
 const nextRequirementAssessmentId = 'a4f77517-6875-4566-b14c-49066d08643e';
@@ -118,6 +119,66 @@ function nestedActionEvent(
 		cookies: { set: vi.fn() }
 	} as never;
 }
+
+describe('requirement-assessment edit loader', () => {
+	it('keeps loading when an applied-control select-options request fails', async () => {
+		const folderId = '468fd310-197e-4763-87a1-f0f18a7ed8af';
+		const complianceAssessmentId = '4819de76-fce4-4a1c-bb3b-e97d80b61ab7';
+		const requirementId = '8131298d-5bcb-4279-8f48-bb0dd951f616';
+		const selectEndpoint = 'http://localhost:8000/api/applied-controls/category/';
+		const requirementAssessment = {
+			id: requirementAssessmentId,
+			name: 'Requirement assessment',
+			folder: { id: folderId },
+			requirement: { id: requirementId, parent_requirement: null },
+			compliance_assessment: { id: complianceAssessmentId },
+			evidences: [],
+			applied_controls: [],
+			security_exceptions: [],
+			task_templates: [],
+			findings: []
+		};
+		const fetchFn = vi.fn(async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url === endpoint) return Response.json(requirementAssessment);
+			if (url.endsWith('/global_score/')) return Response.json({ score: 0 });
+			if (url.endsWith('/requirements_list/?assessable=true')) {
+				return Response.json({
+					requirement_assessments: [{ id: requirementAssessmentId }],
+					viewer_role: 'auditor'
+				});
+			}
+			if (url === selectEndpoint) {
+				return new Response(null, { status: 503, statusText: 'Unavailable' });
+			}
+			throw new Error(`Unexpected fetch: ${url}`);
+		});
+		const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+		await getModelInfoMock.withImplementation(
+			(urlModel: string) => ({
+				urlModel,
+				localName: urlModel,
+				fileFields: urlModel === 'evidences' ? ['attachment'] : [],
+				...(urlModel === 'applied-controls' ? { selectFields: [{ field: 'category' }] } : {})
+			}),
+			async () => {
+				await expect(
+					load({ fetch: fetchFn, params: { id: requirementAssessmentId } } as never)
+				).resolves.toMatchObject({
+					requirementAssessment: { id: requirementAssessmentId },
+					viewerRole: 'auditor'
+				});
+			}
+		);
+
+		expect(fetchFn).toHaveBeenCalledWith(selectEndpoint);
+		expect(consoleError).toHaveBeenCalledWith(
+			`Failed to fetch data from ${selectEndpoint}: Unavailable`
+		);
+		consoleError.mockRestore();
+	});
+});
 
 describe('requirement-assessment save-and-stay action', () => {
 	beforeEach(() => {
@@ -358,6 +419,8 @@ describe('requirement-assessment save-and-stay action', () => {
 describe('requirement-assessment governed nested creates', () => {
 	const evidenceId = 'c8ac9b69-5c9e-42d2-b74b-3f64fa53e276';
 	const securityExceptionId = '8722845f-a8f7-46bd-a13c-66af4f859598';
+	const taskTemplateId = 'cb928187-200a-4c21-82ee-a5d995af3b31';
+	const findingId = '09ce2e76-3abf-4d05-9a92-45a16dd490a4';
 	const folderId = '468fd310-197e-4763-87a1-f0f18a7ed8af';
 
 	beforeEach(() => {
@@ -396,7 +459,10 @@ describe('requirement-assessment governed nested creates', () => {
 			2,
 			`http://localhost:8000/api/evidences/${evidenceId}/upload/`,
 			{
-				headers: { 'Content-Disposition': 'attachment; filename=evidence.txt' },
+				headers: {
+					'Content-Disposition':
+						'attachment; filename="evidence.txt"; filename*=utf-8\'\'evidence.txt'
+				},
 				method: 'POST',
 				body: attachment
 			}
@@ -708,6 +774,133 @@ describe('requirement-assessment governed nested creates', () => {
 			expect.anything()
 		);
 	});
+
+	it.each([
+		{
+			label: 'task template',
+			action: 'createTaskTemplate' as const,
+			urlModel: 'task-templates',
+			createdId: taskTemplateId,
+			relationship: { requirement_assessments: [requirementAssessmentId] },
+			forgedRelationship: { requirement_assessments: [nextRequirementAssessmentId] },
+			resultField: 'newTaskTemplate'
+		},
+		{
+			label: 'finding',
+			action: 'createFinding' as const,
+			urlModel: 'findings',
+			createdId: findingId,
+			relationship: { requirement_assessment: requirementAssessmentId },
+			forgedRelationship: { requirement_assessment: nextRequirementAssessmentId },
+			resultField: 'newFinding'
+		}
+	])(
+		'creates a $label with the route-bound relationship shape',
+		async ({ action, urlModel, createdId, relationship, forgedRelationship, resultField }) => {
+			submittedForm.data = {
+				folder: folderId,
+				name: `New ${urlModel}`,
+				...forgedRelationship
+			};
+			const fetchFn = vi.fn().mockResolvedValueOnce(Response.json({ id: createdId }));
+
+			const result = await actions[action](nestedActionEvent(fetchFn, urlModel));
+
+			expect(fetchFn).toHaveBeenCalledWith(`http://localhost:8000/api/${urlModel}/`, {
+				method: 'POST',
+				body: JSON.stringify({
+					folder: folderId,
+					name: `New ${urlModel}`,
+					...relationship
+				})
+			});
+			expect(result).toMatchObject({
+				[resultField]: createdId,
+				form: { valid: true, data: relationship }
+			});
+		}
+	);
+
+	it.each([
+		['createTaskTemplate', 'task-templates'],
+		['createFinding', 'findings']
+	] as const)('rejects a forged urlmodel for %s before any fetch', async (action, urlModel) => {
+		submittedForm.data = { folder: folderId, name: 'Forged nested object' };
+		const fetchFn = vi.fn();
+
+		const result = await actions[action](nestedActionEvent(fetchFn, `${urlModel}-forged`));
+
+		expect(fetchFn).not.toHaveBeenCalled();
+		expect(result).toMatchObject({
+			status: 400,
+			data: { form: { valid: false, errors: { urlmodel: ['Error'] } } }
+		});
+		expect(result).not.toHaveProperty(
+			action === 'createFinding' ? 'newFinding' : 'newTaskTemplate'
+		);
+	});
+
+	it.each([
+		['createTaskTemplate', 'task-templates'],
+		['createFinding', 'findings']
+	] as const)(
+		'returns a bounded failure for a denied %s create without dereferencing an object',
+		async (action, urlModel) => {
+			submittedForm.data = { folder: folderId, name: 'Denied nested object' };
+			const fetchFn = vi
+				.fn()
+				.mockResolvedValueOnce(
+					Response.json({ detail: 'Create denied' }, { status: 403, statusText: 'Forbidden' })
+				);
+
+			const result = await actions[action](nestedActionEvent(fetchFn, urlModel));
+
+			expect(result).toMatchObject({
+				status: 400,
+				data: { form: { valid: false, message: { error: 'Create denied' } } }
+			});
+		}
+	);
+
+	it.each([
+		['createTaskTemplate', 'task-templates'],
+		['createFinding', 'findings']
+	] as const)(
+		'returns a bounded failure for a network error during %s creation',
+		async (action, urlModel) => {
+			submittedForm.data = { folder: folderId, name: 'Unavailable nested object' };
+			const fetchFn = vi.fn().mockRejectedValueOnce(new TypeError('connection closed'));
+
+			const result = await actions[action](nestedActionEvent(fetchFn, urlModel));
+
+			expect(result).toMatchObject({
+				status: 400,
+				data: { form: { valid: false, message: { error: 'Error' } } }
+			});
+			expect(setFlashMock).not.toHaveBeenCalledWith(
+				expect.objectContaining({ type: 'success' }),
+				expect.anything()
+			);
+		}
+	);
+
+	it.each([
+		['createTaskTemplate', 'task-templates'],
+		['createFinding', 'findings']
+	] as const)(
+		'returns a bounded failure for malformed successful %s responses',
+		async (action, urlModel) => {
+			submittedForm.data = { folder: folderId, name: 'Malformed nested object' };
+			const fetchFn = vi.fn().mockResolvedValueOnce(Response.json({ ok: true }));
+
+			const result = await actions[action](nestedActionEvent(fetchFn, urlModel));
+
+			expect(result).toMatchObject({
+				status: 400,
+				data: { form: { valid: false, message: { error: 'Error' } } }
+			});
+		}
+	);
 
 	it('cleans up and fails closed when file upload is denied with an empty body', async () => {
 		const attachment = new File(['evidence'], 'evidence.txt', { type: 'text/plain' });

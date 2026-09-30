@@ -1,3 +1,4 @@
+import copy
 import ipaddress
 import re
 import uuid
@@ -14,6 +15,8 @@ from core.net_safety import (
     DnsLookupError,
     assert_public_url_unless_dev,
 )
+from iam.models import User
+
 from .models import GlobalSettings
 
 
@@ -65,6 +68,7 @@ def validate_default_dashboard_value(value):
 
 GENERAL_SETTINGS_KEYS = [
     "security_objective_scale",
+    "organisation_score_scale",
     "ebios_radar_max",
     "ebios_radar_green_zone_radius",
     "ebios_radar_yellow_zone_radius",
@@ -84,6 +88,7 @@ GENERAL_SETTINGS_KEYS = [
     "allow_assignments_to_entities",
     "enforce_mfa",
     "default_language",
+    "default_date_format",
     "llm_provider",
     "ollama_base_url",
     "ollama_model",
@@ -112,6 +117,48 @@ LLM_URL_DEFAULTS = {
 }
 
 
+# Proposed on the audit form for frameworks without a scale of their own.
+DEFAULT_ORGANISATION_SCORE_SCALE = {
+    "score_scale_preset": "0-5",
+    "min_score": 0,
+    "max_score": 5,
+    "scores_definition": [],
+}
+
+
+def _normalize_organisation_score_scale(value):
+    from core.models import normalize_score_scale
+
+    if not isinstance(value, dict):
+        raise serializers.ValidationError(
+            {"organisation_score_scale": "scoreScaleErrorInvalid"}
+        )
+    levels = value.get("scores_definition")
+    if levels is not None and not isinstance(levels, list):
+        raise serializers.ValidationError(
+            {"organisation_score_scale": "scoreScaleErrorInvalid"}
+        )
+    try:
+        preset, min_score, max_score = normalize_score_scale(
+            value.get("score_scale_preset"),
+            value.get("min_score"),
+            value.get("max_score"),
+            levels,
+        )
+    except DjangoValidationError as e:
+        raise serializers.ValidationError({"organisation_score_scale": e.messages})
+    if min_score is None:
+        raise serializers.ValidationError(
+            {"organisation_score_scale": "scoreScaleErrorRangeRequired"}
+        )
+    return {
+        "score_scale_preset": preset,
+        "min_score": min_score,
+        "max_score": max_score,
+        "scores_definition": levels or [],
+    }
+
+
 class GeneralSettingsSerializer(serializers.ModelSerializer):
     conversion_rate = serializers.FloatField(
         write_only=True, required=False, default=1.0
@@ -122,6 +169,11 @@ class GeneralSettingsSerializer(serializers.ModelSerializer):
         ret = super().to_representation(instance)
         if "value" in ret and isinstance(ret["value"], dict):
             ret["value"].pop("openai_api_key", None)
+            # Always a value, so the audit form never re-implements the fallback.
+            if not ret["value"].get("organisation_score_scale"):
+                ret["value"]["organisation_score_scale"] = copy.deepcopy(
+                    DEFAULT_ORGANISATION_SCORE_SCALE
+                )
         return ret
 
     def update(self, instance, validated_data):
@@ -169,6 +221,10 @@ class GeneralSettingsSerializer(serializers.ModelSerializer):
                             {key: "URL hostname could not be resolved."}
                         )
             # Validate builtin_metrics_retention_days minimum value
+            if key == "organisation_score_scale":
+                validated_data["value"][key] = _normalize_organisation_score_scale(
+                    value
+                )
             if key == "builtin_metrics_retention_days":
                 if not isinstance(value, int) or value < 1:
                     raise serializers.ValidationError(
@@ -182,6 +238,15 @@ class GeneralSettingsSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError(
                         {
                             "default_language": f"Invalid language. Must be one of: {valid_codes}"
+                        }
+                    )
+            if key == "default_date_format":
+                # isinstance first: DATE_FORMATS is a set, so an unhashable JSON
+                # value (list/dict) would raise TypeError instead of a 400.
+                if not isinstance(value, str) or value not in User.DATE_FORMATS:
+                    raise serializers.ValidationError(
+                        {
+                            "default_date_format": f"Invalid date format. Must be one of: {sorted(User.DATE_FORMATS)}"
                         }
                     )
             if key == "default_packager":
@@ -310,7 +375,7 @@ class GeneralSettingsSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = GlobalSettings
-        exclude = ["is_published", "folder"]
+        exclude = ["folder"]
         read_only_fields = ["name"]
 
 
@@ -340,6 +405,9 @@ class FeatureFlagsSerializer(serializers.ModelSerializer):
     )
     ebiosrm = serializers.BooleanField(
         source="value.ebiosrm", required=False, default=True
+    )
+    risk_management = serializers.BooleanField(
+        source="value.risk_management", required=False, default=True
     )
     scoring_assistant = serializers.BooleanField(
         source="value.scoring_assistant", required=False, default=True
@@ -383,6 +451,20 @@ class FeatureFlagsSerializer(serializers.ModelSerializer):
     project_management = serializers.BooleanField(
         source="value.project_management", required=False, default=False
     )
+    # Per-entry switches inside the Project management menu, which
+    # `project_management` gates as a whole.
+    generic_collections = serializers.BooleanField(
+        source="value.generic_collections", required=False, default=True
+    )
+    accreditations = serializers.BooleanField(
+        source="value.accreditations", required=False, default=True
+    )
+    projects = serializers.BooleanField(
+        source="value.projects", required=False, default=True
+    )
+    responsibility_matrices = serializers.BooleanField(
+        source="value.responsibility_matrices", required=False, default=True
+    )
     contracts = serializers.BooleanField(
         source="value.contracts", required=False, default=False
     )
@@ -394,6 +476,9 @@ class FeatureFlagsSerializer(serializers.ModelSerializer):
     )
     outgoing_webhooks = serializers.BooleanField(
         source="value.outgoing_webhooks", required=False, default=False
+    )
+    workflows = serializers.BooleanField(
+        source="value.workflows", required=False, default=False
     )
     metrology = serializers.BooleanField(
         source="value.metrology", required=False, default=True
@@ -407,6 +492,11 @@ class FeatureFlagsSerializer(serializers.ModelSerializer):
     right_requests = serializers.BooleanField(
         source="value.right_requests", required=False, default=True
     )
+    # Default on: the inbox is the channel that works out of the box, where
+    # notifications_enable_mailing defaults off and most installs get nothing.
+    notification_center = serializers.BooleanField(
+        source="value.notification_center", required=False, default=True
+    )
     data_breaches = serializers.BooleanField(
         source="value.data_breaches", required=False, default=True
     )
@@ -418,6 +508,9 @@ class FeatureFlagsSerializer(serializers.ModelSerializer):
     )
     auditee_mode = serializers.BooleanField(
         source="value.auditee_mode", required=False, default=True
+    )
+    quick_forms = serializers.BooleanField(
+        source="value.quick_forms", required=False, default=False
     )
     advanced_analytics = serializers.BooleanField(
         source="value.advanced_analytics", required=False, default=True
@@ -444,6 +537,75 @@ class FeatureFlagsSerializer(serializers.ModelSerializer):
     posture_assessments = serializers.BooleanField(
         source="value.posture_assessments", required=False, default=False
     )
+    commitment_management = serializers.BooleanField(
+        source="value.commitment_management", required=False, default=False
+    )
+    findings_from_requirements = serializers.BooleanField(
+        source="value.findings_from_requirements", required=False, default=False
+    )
+    dora = serializers.BooleanField(source="value.dora", required=False, default=True)
+    external_ratings = serializers.BooleanField(
+        source="value.external_ratings", required=False, default=False
+    )
+    jit_provisioning = serializers.BooleanField(
+        source="value.jit_provisioning", required=False, default=False
+    )
+    relations_graph = serializers.BooleanField(
+        source="value.relations_graph", required=False, default=False
+    )
+
+    # Flags a user may switch off for themselves. Opt-in, like batch actions: a
+    # new flag is not hideable until listed. Eligible means it hides a navigation
+    # area and nothing else — a flag that also gates data rendering, a write path,
+    # role behaviour or IAM config would make two users read different data.
+    USER_HIDEABLE_FLAGS = frozenset(
+        {
+            "accreditations",
+            "bia",
+            "commitment_management",
+            "compliance",
+            "contracts",
+            "control_plan",
+            "custom_portals",
+            "data_breaches",
+            "document_management",
+            "ebiosrm",
+            "exceptions",
+            "experimental",
+            "follow_up",
+            "generic_collections",
+            "incidents",
+            "journeys",
+            "metrology",
+            "notification_center",
+            "organisation_issues",
+            "organisation_objectives",
+            "personal_data",
+            "posture_assessments",
+            "privacy",
+            "project_management",
+            "projects",
+            "purposes",
+            "quantitative_risk_studies",
+            "quick_forms",
+            "reports",
+            "responsibility_matrices",
+            "right_requests",
+            "risk_acceptances",
+            "risk_management",
+            "scoring_assistant",
+            "security_advisories",
+            "cwes",
+            "tasks",
+            "threat_modeling",
+            "tprm",
+            "ttps",
+            "validation_flows",
+            "vulnerabilities",
+            "workflows",
+            "xrays",
+        }
+    )
 
     class Meta:
         model = GlobalSettings
@@ -454,7 +616,6 @@ class FeatureFlagsSerializer(serializers.ModelSerializer):
             "name",
             "value",
             "folder",
-            "is_published",
         ]
         read_only_fields = ["name"]
 
@@ -548,7 +709,6 @@ class VulnerabilitySlaSerializer(serializers.ModelSerializer):
             "name",
             "value",
             "folder",
-            "is_published",
         ]
         read_only_fields = ["name"]
 
@@ -610,7 +770,6 @@ class InfraConfigSerializer(serializers.ModelSerializer):
             "name",
             "value",
             "folder",
-            "is_published",
         ]
         read_only_fields = ["name"]
 
@@ -699,7 +858,6 @@ class SecIntelFeedsSerializer(serializers.ModelSerializer):
             "name",
             "value",
             "folder",
-            "is_published",
         ]
         read_only_fields = ["name"]
 

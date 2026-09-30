@@ -566,7 +566,6 @@ def test_report_data_does_not_expand_authority_to_unrendered_risk_relations(
     threat = Threat.objects.create(
         name=f"Hidden report threat {uuid.uuid4().hex}",
         folder=world["hidden"],
-        is_published=False,
     )
     world["scenario"].threats.add(threat)
 

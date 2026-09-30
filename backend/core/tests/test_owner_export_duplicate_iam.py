@@ -46,8 +46,7 @@ def _user(name: str, folder: Folder) -> User:
         email=f"{name}-{uuid.uuid4().hex}@owner-export.tests"
     )
     user.folder = folder
-    user.is_published = False
-    user.save(update_fields=["folder", "is_published"])
+    user.save(update_fields=["folder"])
     return user
 
 

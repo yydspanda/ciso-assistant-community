@@ -35,7 +35,6 @@ def make_user_with_permissions(
 ) -> User:
     user = User.objects.create_user(
         email=f"{email_prefix}-{uuid.uuid4().hex[:8]}@example.test",
-        is_published=True,
     )
     role = Role.objects.create(
         name=f"reg-role-{uuid.uuid4().hex[:8]}",

@@ -7,6 +7,8 @@ import type { Locator } from '@playwright/test';
 let vars = TestContent.generateTestVars();
 let testObjectsData: { [k: string]: any } = TestContent.itemBuilder(vars);
 
+const BACKEND_API_URL = process.env.PUBLIC_BACKEND_API_URL ?? 'http://localhost:8000/api';
+
 test.describe.configure({ mode: 'serial' });
 
 test('compliance assessments scoring is working properly', async ({
@@ -212,6 +214,163 @@ test('compliance assessments scoring is working properly', async ({
 	// because enabling scoring_enabled bulk-sets is_scored=True on ALL requirement
 	// assessments in the framework (not just the 4 tested above). Score calculation
 	// correctness is covered by backend unit tests in test_compliance_assessment_scoring.py.
+});
+
+test('cloning an audit proposes and persists its same-framework custom score scale', async ({
+	logedPage,
+	complianceAssessmentsPage,
+	page,
+	context
+}) => {
+	test.setTimeout(5 * 60 * 1000);
+	expect(logedPage).toBeDefined();
+
+	await complianceAssessmentsPage.goto();
+	await complianceAssessmentsPage.hasUrl();
+	await complianceAssessmentsPage.viewItemDetail(
+		testObjectsData.complianceAssessmentsPage.build.name
+	);
+	await page.locator('body[data-hydrated="true"]').waitFor();
+
+	const baselineUrl = page.url();
+	const baselineId = new URL(baselineUrl).pathname.split('/').filter(Boolean).at(-1);
+	if (!baselineId) throw new Error(`Could not resolve baseline UUID from ${baselineUrl}`);
+	expect(baselineId).toMatch(/^[0-9a-f-]{36}$/i);
+
+	const token = (await context.cookies()).find((cookie) => cookie.name === 'token')?.value;
+	if (!token) throw new Error('The logged-in browser did not expose its API token cookie');
+	const headers = {
+		'Content-Type': 'application/json',
+		Authorization: `Token ${token}`
+	};
+	const customScale = {
+		score_scale_preset: null,
+		min_score: 1,
+		max_score: 3,
+		scores_definition: [
+			{ score: 1, name: 'Initial' },
+			{ score: 2, name: 'Managed' },
+			{ score: 3, name: 'Optimized' }
+		]
+	};
+	const everyone = { auditor: 'edit', respondent: 'edit' };
+
+	const seedResponse = await page.request.patch(
+		`${BACKEND_API_URL}/compliance-assessments/${baselineId}/`,
+		{
+			headers,
+			data: {
+				...customScale,
+				confirm_rescale: true,
+				field_visibility: { score: everyone, is_scored: everyone }
+			}
+		}
+	);
+	const baselineBody = await seedResponse.text();
+	expect(
+		seedResponse.ok(),
+		`baseline scale PATCH failed: ${seedResponse.status()} ${baselineBody}`
+	).toBeTruthy();
+	const baseline = JSON.parse(baselineBody);
+	expect(baseline).toMatchObject(customScale);
+	expect(baseline.field_visibility).toMatchObject({ score: everyone, is_scored: everyone });
+
+	const globalScoreResponse = await page.request.get(
+		`${BACKEND_API_URL}/compliance-assessments/${baselineId}/global_score/`,
+		{ headers }
+	);
+	const globalScoreBody = await globalScoreResponse.text();
+	expect(
+		globalScoreResponse.ok(),
+		`baseline global_score failed: ${globalScoreResponse.status()} ${globalScoreBody}`
+	).toBeTruthy();
+	const globalScore = JSON.parse(globalScoreBody);
+	expect(globalScore).toMatchObject({ scoring_enabled: true, ...customScale });
+
+	await page.goto(baselineUrl);
+	await page.locator('body[data-hydrated="true"]').waitFor();
+	await page.getByTestId('clone-audit-button').click();
+
+	const modal = page.getByTestId('modal-component');
+	await expect(modal.getByTestId('modal-title')).toHaveText(m.cloneAudit());
+	await expect(modal.getByTestId('form-input-framework')).toContainText(vars.framework.name);
+
+	const cloneName = `${vars.assessmentName} custom-scale clone`;
+	await modal.getByTestId('form-input-name').fill(cloneName);
+
+	const folderField = modal.getByTestId('form-input-folder');
+	if (!(await folderField.getByRole('button').first().innerText()).includes(vars.folderName)) {
+		await folderField.getByRole('button').first().click();
+		await folderField.getByRole('textbox').fill(vars.folderName);
+		await folderField.getByRole('option').filter({ hasText: vars.folderName }).first().click();
+	}
+
+	await modal
+		.locator('[data-scope="accordion"][data-part="item-trigger"]')
+		.filter({ hasText: m.more() })
+		.click();
+	const scoreEveryone = modal.getByTestId('visibility-score-everyone');
+	if ((await scoreEveryone.getAttribute('aria-checked')) !== 'true') await scoreEveryone.click();
+
+	await expect(modal.getByTestId('score-scale-scoring-hidden')).toHaveCount(0);
+	const baselineOption = modal.getByTestId('score-scale-baseline');
+	await expect(baselineOption).toBeVisible({ timeout: 30_000 });
+	await expect(baselineOption).toHaveAttribute('aria-checked', 'true');
+	await expect(modal.getByTestId('score-scale-preview')).toContainText(/1\s*Initial/);
+	await expect(modal.getByTestId('score-scale-preview')).toContainText(/2\s*Managed/);
+	await expect(modal.getByTestId('score-scale-preview')).toContainText(/3\s*Optimized/);
+
+	await Promise.all([
+		page.waitForURL(
+			(url) =>
+				/^\/compliance-assessments\/[0-9a-f-]+$/i.test(url.pathname) &&
+				!url.pathname.endsWith(`/${baselineId}`),
+			{ timeout: 60_000 }
+		),
+		modal.getByTestId('save-button').click()
+	]);
+
+	const cloneId = new URL(page.url()).pathname.split('/').filter(Boolean).at(-1);
+	if (!cloneId) throw new Error(`Could not resolve clone UUID from ${page.url()}`);
+	expect(cloneId).toMatch(/^[0-9a-f-]{36}$/i);
+	const cloneResponse = await page.request.get(
+		`${BACKEND_API_URL}/compliance-assessments/${cloneId}/`,
+		{ headers }
+	);
+	const cloneBody = await cloneResponse.text();
+	expect(
+		cloneResponse.ok(),
+		`clone detail failed: ${cloneResponse.status()} ${cloneBody}`
+	).toBeTruthy();
+	const clone = JSON.parse(cloneBody);
+	expect(clone.name).toBe(cloneName);
+	expect(clone.framework?.id).toBe(baseline.framework?.id);
+	expect(clone).toMatchObject(customScale);
+});
+
+// Regression test for CA-1843: clicking the status/result badges used to be a
+// dead zone, only the title/description text was clickable. Reuses the audit
+// created by the test above.
+test('clicking a requirement row status/result badges navigates to it', async ({
+	logedPage,
+	complianceAssessmentsPage,
+	page
+}) => {
+	await complianceAssessmentsPage.goto();
+	await complianceAssessmentsPage.hasUrl();
+	await complianceAssessmentsPage.viewItemDetail(
+		testObjectsData.complianceAssessmentsPage.build.name
+	);
+
+	const IDAM3TreeViewItem = await complianceAssessmentsPage.itemDetail.treeViewItem('ID.AM-3', [
+		'ID - Identify',
+		'ID.AM - Asset Management'
+	]);
+
+	await expect(IDAM3TreeViewItem.badges).toBeVisible();
+	await IDAM3TreeViewItem.badges.click();
+
+	await page.waitForURL('/requirement-assessments/**');
 });
 
 test.afterAll('cleanup', async ({ browser }) => {

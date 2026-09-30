@@ -9,7 +9,7 @@ import pytest
 from django.contrib.auth.models import Permission
 from rest_framework.test import APIClient
 
-from core.mappings.engine import engine
+from core.mappings.engine import MappingEngine
 from core.models import (
     ComplianceAssessment,
     Framework,
@@ -162,23 +162,6 @@ def _results(response) -> list[dict]:
     return body.get("results", []) if isinstance(body, dict) else body
 
 
-@pytest.fixture(autouse=True)
-def _restore_mapping_engine_cache():
-    saved = (
-        engine._all_rms,
-        engine._framework_mappings,
-        engine._frameworks,
-        engine._direct_mappings,
-    )
-    yield
-    (
-        engine._all_rms,
-        engine._framework_mappings,
-        engine._frameworks,
-        engine._direct_mappings,
-    ) = saved
-
-
 def test_hidden_intermediate_framework_cannot_bridge_any_mapping_endpoint():
     Folder._init_root_folder()
     source_folder = _domain("mapping-source")
@@ -210,8 +193,6 @@ def test_hidden_intermediate_framework_cannot_bridge_any_mapping_endpoint():
     source_ra.save()
     target_ra = target_audit.requirement_assessments.get(requirement=target_node)
     original_result = target_ra.result
-    engine.reload_cache()
-
     restricted = User.objects.create_user("hidden-middle@mapping-iam.test")
     _grant(restricted, "Mapping without middle", [source_folder, target_folder])
     client = _client(restricted)
@@ -310,8 +291,6 @@ def test_hidden_stored_library_owner_removes_direct_mapping_path():
     )
     source_audit = _assessment("OWNER-A", source_framework, source_folder)
     target_audit = _assessment("OWNER-C", target_framework, target_folder)
-    engine.reload_cache()
-
     user = User.objects.create_user("hidden-owner@mapping-iam.test")
     _grant(user, "Mapping without owner", [source_folder, target_folder])
     client = _client(user)
@@ -351,8 +330,6 @@ def test_map_apply_rolls_back_when_locked_source_projection_changes(monkeypatch)
     source_ra.save()
     target_ra = target_audit.requirement_assessments.get(requirement=target_node)
     original_result = target_ra.result
-    engine.reload_cache()
-
     user = User.objects.create_user("mapping-reproof@mapping-iam.test")
     _grant(user, "Mapping reproof", [source_folder, target_folder])
 
@@ -451,8 +428,6 @@ def test_cross_framework_baseline_create_uses_locked_authorized_mapping_snapshot
     target_perimeter = Perimeter.objects.create(
         name="Baseline target perimeter", folder=target_folder
     )
-    engine.reload_cache()
-
     user = User.objects.create_user("mapping-baseline@mapping-iam.test")
     _grant(user, "Mapping baseline create", [source_folder, target_folder])
     response = _client(user).post(
@@ -511,13 +486,12 @@ def test_provenance_uses_stored_library_owner_not_colliding_mapping_set_uuid():
     source_ra.is_scored = True
     source_ra.save()
     target_ra = target_audit.requirement_assessments.get(requirement=target_node)
-    engine.reload_cache()
-
     user = User.objects.create_user("provenance-owner@mapping-iam.test")
     _grant(user, "Mapping provenance reader", [source_folder, target_folder])
     from core.utils import get_mapping_authorization
 
     authorization = get_mapping_authorization(user)
+    engine = MappingEngine()
     mapped, path = engine.best_mapping_inferences(
         engine.load_audit_fields(source_audit, user=user),
         source_framework.urn,
@@ -619,8 +593,6 @@ def test_one_hidden_source_node_removes_entire_provenance_not_a_subset():
     }
     target_ra.mapping_inference = raw
     target_ra.save(update_fields=["mapping_inference"])
-    engine.reload_cache()
-
     user = User.objects.create_user("partial-lineage@mapping-iam.test")
     _grant(user, "Partial lineage reader", [source_folder, target_folder])
     response = _client(user).get(f"/api/requirement-assessments/{target_ra.id}/")

@@ -1,10 +1,10 @@
 """Authority boundary for inverse RequirementAssessment relationship writes.
 
-The generic Evidence, AppliedControl and SecurityException APIs expose the
-reverse side of RequirementAssessment many-to-many fields.  A plain DRF
-``set()`` on those reverse managers is not sufficient: it can remove rows that
-the caller could not see and it bypasses the audit's assignment, field policy
-and workflow state.
+The generic Evidence, AppliedControl, SecurityException and TaskTemplate APIs
+expose the reverse side of RequirementAssessment many-to-many fields.  A plain
+DRF ``set()`` on those reverse managers is not sufficient: it can remove rows
+that the caller could not see and it bypasses the audit's assignment, field
+policy and workflow state.
 
 This module is deliberately independent from ``core.serializers``.  Write
 serializers opt in by adding :class:`RequirementAssessmentRelationshipAuthorityMixin`
@@ -41,6 +41,7 @@ from core.models import (
     RequirementAssignment,
     RequirementNode,
     SecurityException,
+    TaskTemplate,
 )
 from core.utils import (
     get_full_view_compliance_assessment_ids,
@@ -105,6 +106,7 @@ _POLICY_FIELD_BY_MODEL: dict[type, str] = {
     Evidence: "evidences",
     AppliedControl: "applied_controls",
     SecurityException: "security_exceptions",
+    TaskTemplate: "task_templates",
 }
 
 
@@ -294,6 +296,106 @@ def visible_requirement_assessment_rows(
     )
 
 
+def assert_requirement_assessment_rows_editable(
+    *,
+    user,
+    rows: Iterable[RequirementAssessment],
+    policy_field: str,
+) -> None:
+    """Apply the governed RA write policy to a bounded singular-link change.
+
+    This is the validation boundary for models such as ``Finding`` whose link
+    to a requirement assessment is a nullable foreign key rather than the
+    inverse many-to-many relation managed by the authority mixin.  It reuses
+    the same direct-user assignment, parent-chain, generic IAM, field policy
+    and workflow rules.  Callers remain responsible for their host object's
+    transaction and locking protocol.
+    """
+
+    if user is None or not getattr(user, "is_authenticated", False):
+        raise NotAuthenticated(
+            "Authentication is required to change requirement-assessment links."
+        )
+
+    row_ids = frozenset(row.id for row in rows if row is not None)
+    if not row_ids:
+        return
+
+    actor_ids = _actor_ids_for_user(user)
+    try:
+        visible_rows = _visible_relationship_rows(
+            user=user,
+            ra_ids=row_ids,
+            policy_field=policy_field,
+            actor_ids=actor_ids,
+        )
+        changeable_ids = frozenset(
+            RequirementAssessment.objects.filter(id__in=row_ids)
+            .filter(
+                id__in=RoleAssignment.get_changeable_object_ids(
+                    user, RequirementAssessment
+                )
+            )
+            .values_list("id", flat=True)
+        )
+    except (NotImplementedError, Permission.DoesNotExist) as exc:
+        raise PermissionDenied(
+            "One or more requirement assessments are unavailable for this change."
+        ) from exc
+
+    if frozenset(visible_rows) != row_ids or changeable_ids != row_ids:
+        raise PermissionDenied(
+            "One or more requirement assessments are unavailable for this change."
+        )
+
+    assessment_ids = frozenset(
+        row.compliance_assessment_id for row in visible_rows.values()
+    )
+    try:
+        full_view_ids = frozenset(
+            ComplianceAssessment.objects.filter(id__in=assessment_ids)
+            .filter(id__in=get_full_view_compliance_assessment_ids(user))
+            .values_list("id", flat=True)
+        )
+    except (NotImplementedError, Permission.DoesNotExist) as exc:
+        raise PermissionDenied(
+            "One or more requirement assessments are unavailable for this change."
+        ) from exc
+
+    statuses_by_ra: dict[UUID, set[str]] = defaultdict(set)
+    for _assignment_id, status, row_id in _assignment_authority_snapshot(
+        actor_ids=actor_ids,
+        assessment_ids=assessment_ids,
+        ra_ids=row_ids,
+    ):
+        statuses_by_ra[row_id].add(status)
+
+    for row_id, row in visible_rows.items():
+        assessment = row.compliance_assessment
+        if assessment.is_locked or assessment.status == Assessment.Status.IN_REVIEW:
+            raise PermissionDenied(
+                "A linked compliance assessment does not accept changes."
+            )
+
+        is_full_viewer = assessment.id in full_view_ids
+        role = "auditor" if is_full_viewer else "respondent"
+        if not is_field_editable_by(assessment, policy_field, role):
+            raise PermissionDenied(
+                "The requirement-assessment relationship is not editable for this caller."
+            )
+
+        if not is_full_viewer:
+            statuses = statuses_by_ra.get(row_id)
+            if not statuses:
+                raise PermissionDenied(
+                    "One or more requirement assessments are unavailable for this change."
+                )
+            if statuses & TERMINAL_ASSIGNMENT_STATUSES:
+                raise PermissionDenied(
+                    "A linked requirement assignment no longer accepts changes."
+                )
+
+
 def project_requirement_assessment_relationship_ids(
     *,
     user,
@@ -361,7 +463,20 @@ def _batch_project_requirement_assessment_relationships(
         )
 
     relationship = target_model._meta.get_field(RELATION_FIELD)
-    through_model = relationship.through
+    # Reverse M2M descriptors (Evidence/AppliedControl/SecurityException)
+    # expose ``through`` directly on ManyToManyRel, while TaskTemplate owns
+    # this relation as a forward ManyToManyField and exposes it through its
+    # remote_field.  Normalize both metadata shapes before resolving the two
+    # foreign-key columns below.
+    through_model = getattr(relationship, "through", None)
+    if through_model is None:
+        through_model = getattr(
+            getattr(relationship, "remote_field", None), "through", None
+        )
+    if through_model is None:
+        raise ImproperlyConfigured(
+            f"{target_model._meta.label}.{RELATION_FIELD} is not a many-to-many relationship."
+        )
     target_fk = _through_target_fk_name(through_model, target_model)
     ra_fk = _through_target_fk_name(through_model, RequirementAssessment)
     links = tuple(
@@ -433,12 +548,16 @@ def assert_requirement_assessment_filter_visible(
 class GovernedRequirementAssessmentPrimaryKeyRelatedField(
     serializers.PrimaryKeyRelatedField
 ):
-    """Resolve inverse RA operands through the same fail-closed projection.
+    """Resolve RA operands through the same fail-closed projection.
 
     DRF's default field distinguishes a missing UUID (400) from an existing but
     hidden UUID (a later 403).  This field intentionally maps both cases to the
     same authority failure without calling ``RequirementAssessment.__str__``.
     """
+
+    def __init__(self, *args, policy_field: str | None = None, **kwargs):
+        self.policy_field = policy_field
+        super().__init__(*args, **kwargs)
 
     def to_internal_value(self, data):
         try:
@@ -448,7 +567,7 @@ class GovernedRequirementAssessmentPrimaryKeyRelatedField(
                 "One or more requirement assessments are unavailable for this change."
             )
         model = self.root.Meta.model
-        policy_field = _policy_field_for_model(model)
+        policy_field = self.policy_field or _policy_field_for_model(model)
         request = self.context.get("request")
         user = _authenticated_user(request)
         if policy_field is None:
@@ -466,6 +585,30 @@ class GovernedRequirementAssessmentPrimaryKeyRelatedField(
                 "One or more requirement assessments are unavailable for this change."
             )
         return row
+
+    def to_representation(self, value):
+        # An explicit policy field is used by singular relations such as
+        # Finding.requirement_assessment. DRF returns the write serializer after
+        # POST/PATCH, so the output path must enforce the same read projection as
+        # the dedicated read serializer; otherwise an unrelated Finding edit can
+        # echo a hidden RA UUID. Inverse plural serializers leave ``policy_field``
+        # unset and are projected in one batch by their serializer mixin.
+        if self.policy_field is None:
+            return super().to_representation(value)
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request is not None else None
+        if not getattr(user, "is_authenticated", False):
+            return None
+        row_id = getattr(value, "pk", value)
+        visible = _visible_relationship_rows(
+            user=user,
+            ra_ids=(row_id,),
+            policy_field=self.policy_field,
+        )
+        row = visible.get(row_id)
+        if row is None:
+            return None
+        return super().to_representation(row)
 
 
 def _snapshot_parent_links(
@@ -995,7 +1138,8 @@ class RequirementAssessmentRelationshipProjectionMixin:
             raise ImproperlyConfigured(
                 "RequirementAssessment relationship projection supports only "
                 "Evidence/evidences, AppliedControl/applied_controls and "
-                "SecurityException/security_exceptions."
+                "SecurityException/security_exceptions or "
+                "TaskTemplate/task_templates."
             )
         return configured or expected
 

@@ -108,7 +108,8 @@ When working on a **Requirement Assignment** inside an audit, notifications foll
 | ------------------------------------------------------------- | ----------------------------------------------------- |
 | Assignment activated (_Draft → In progress_)                  | Assignee                                              |
 | Assignment submitted for review                               | Reviewers (falls back to authors if none are defined) |
-| Assignment reviewed (approved / reopened / changes requested) | Assignee                                              |
+| Assignment reviewed (approved / reopened for review / changes requested) | Assignee                                    |
+| Assignment reopened for editing (sent back to _Draft_ from _In progress_ or _Changes requested_) | Assignee                          |
 
 Activation is committed before the invitation is delivered. The email is sent
 from a durable background queue, so an assignment can be **In progress** while

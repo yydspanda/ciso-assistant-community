@@ -106,8 +106,7 @@ def test_html_zip_rejects_unlink_then_hide_during_generation(
     def unlink_then_hide(*args, **kwargs):
         requirement_assessment.evidences.remove(evidence)
         evidence.folder = world["hidden_folder"]
-        evidence.is_published = False
-        evidence.save(update_fields=["folder", "is_published"])
+        evidence.save(update_fields=["folder"])
         return "<html>authorized-but-stale</html>", [evidence]
 
     monkeypatch.setattr(core_views, "generate_html", unlink_then_hide)

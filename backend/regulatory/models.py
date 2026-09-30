@@ -121,6 +121,12 @@ class RegulatoryFolderModel(AbstractBaseModel):
     # whose related-object and reviewer masking rules remain authoritative.
     workflow_internal_events_enabled = False
 
+    # Phase 1 regulatory records keep an extension-owned non-publication
+    # invariant.  Upstream no longer defines this field on AbstractBaseModel,
+    # while the regulatory migration history and database constraints still
+    # require it on every concrete regulatory record.
+    is_published = models.BooleanField(_("published"), default=False)
+
     folder = models.ForeignKey(
         Folder,
         on_delete=models.PROTECT,

@@ -140,6 +140,7 @@ class TestRequirementAssessmentsAuthenticated:
                 "requirement": {
                     "id": str(RequirementNode.objects.all()[0].id),
                     "urn": RequirementNode.objects.all()[0].urn,
+                    "parent_urn": RequirementNode.objects.all()[0].parent_urn,
                     "annotation": RequirementNode.objects.all()[0].annotation,
                     "name": RequirementNode.objects.all()[0].name,
                     "questions": None,
@@ -306,6 +307,7 @@ class TestRequirementAssessmentsAuthenticated:
                 "requirement": {
                     "id": str(RequirementNode.objects.all()[0].id),
                     "urn": RequirementNode.objects.all()[0].urn,
+                    "parent_urn": RequirementNode.objects.all()[0].parent_urn,
                     "annotation": RequirementNode.objects.all()[0].annotation,
                     "name": RequirementNode.objects.all()[0].name,
                     "questions": None,

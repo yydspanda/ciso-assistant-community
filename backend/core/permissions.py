@@ -71,10 +71,10 @@ class RBACPermissions(permissions.DjangoObjectPermissions):
         if obj == request.user and perm.codename == "view_user":
             return True
 
-        # for view, use is_object_readable to implement is_published correctly
+        # Default reads use the folder/default-role oracle. An action-specific
+        # permission still has to be checked explicitly below.
         if (
             request.method in ["GET", "OPTIONS", "HEAD"]
-            and getattr(obj, "is_published", False)
             and _codename == default_codename
         ):
             return RoleAssignment.is_object_readable(request.user, type(obj), obj.id)
@@ -103,4 +103,5 @@ class FeatureFlagRequired(permissions.BasePermission):
         flag = getattr(view, "feature_flag", None)
         if not flag:
             return True
-        return ff_is_enabled(flag)
+        flags = (flag,) if isinstance(flag, str) else flag
+        return any(ff_is_enabled(f) for f in flags)

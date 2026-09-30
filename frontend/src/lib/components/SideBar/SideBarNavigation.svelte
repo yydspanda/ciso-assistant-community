@@ -5,22 +5,17 @@
 	import SideBarCategory from '$lib/components/SideBar/SideBarCategory.svelte';
 	import { Accordion } from '@skeletonlabs/skeleton-svelte';
 	import { page } from '$app/state';
-	import { isNavigationItemVisible } from './navigationVisibility';
+	import { canSeeNavItem } from '$lib/components/SideBar/navVisibility';
 	import { driverInstance } from '$lib/utils/stores';
 
 	const user = page.data.user;
 
 	const items = navData.items
-		.map((item) => {
-			const filteredSubItems = item.items.filter((subItem) =>
-				isNavigationItemVisible(subItem, user)
-			);
-
-			return {
-				...item,
-				items: filteredSubItems
-			};
-		})
+		.map((item) => ({
+			...item,
+			// Shared with the command palette so the two cannot offer different sets of pages.
+			items: item.items.filter((subItem) => canSeeNavItem(subItem, user))
+		}))
 		.filter((item) => item.items.length > 0); // Filter out items with no sub-items
 
 	import { lastAccordionItem } from '$lib/utils/stores';
@@ -46,7 +41,7 @@
 		class="space-y-4"
 	>
 		{#each items as item}
-			{#if sideBarVisibleItems && sideBarVisibleItems[item.name] !== false}
+			{#if sideBarVisibleItems && sideBarVisibleItems[item.name] !== false && item.items.some((subItem) => sideBarVisibleItems[subItem.name] !== false)}
 				<Accordion.Item value={item.name} id={item.name.toLowerCase().replace(' ', '-')}>
 					<Accordion.ItemTrigger class="flex w-full items-center cursor-pointer">
 						<SideBarCategory {item} />

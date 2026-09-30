@@ -46,7 +46,7 @@ from core.models import (
     Threat,
 )
 from global_settings.models import GlobalSettings
-from iam.models import Folder, Role, RoleAssignment, User
+from iam.models import Folder, Role, RoleAssignment, User, UserGroup
 from tprm.models import Entity, Representative
 
 
@@ -77,6 +77,56 @@ def _grant(
         is_recursive=is_recursive,
     )
     assignment.perimeter_folders.add(*folders)
+
+
+def _replace_direct_read_with_default_role(
+    user: User,
+    codename: str,
+    *folders: Folder,
+) -> None:
+    """Model former ambient reads with the upstream default-role contract."""
+
+    permission = Permission.objects.get(codename=codename)
+    directly_granting_roles = Role.objects.filter(
+        roleassignment__user=user,
+        permissions=permission,
+    ).distinct()
+    for role in directly_granting_roles:
+        role.permissions.remove(permission)
+
+    root = Folder.get_root_folder()
+    for folder in folders:
+        default_role = Role.objects.create(
+            name=f"Default reader {codename} {uuid.uuid4().hex}",
+            folder=root,
+        )
+        default_role.permissions.add(permission)
+        folder.default_role = default_role
+        folder.save(update_fields=["default_role"])
+
+        membership_role = Role.objects.create(
+            name=f"Default-role audience {uuid.uuid4().hex}",
+            folder=root,
+        )
+        group = UserGroup.objects.create(
+            name=f"default-role-audience-{uuid.uuid4().hex}",
+            folder=folder,
+            builtin=True,
+        )
+        group.user_set.add(user)
+        assignment = RoleAssignment.objects.create(
+            user_group=group,
+            role=membership_role,
+            folder=root,
+            is_recursive=False,
+        )
+        assignment.perimeter_folders.add(folder)
+
+    stored, ambient = RoleAssignment._get_permission_grant_sources(user, permission)
+    assert not stored.exists()
+    assert set(ambient.values_list("id", flat=True)) >= {
+        folder.id for folder in folders
+    }
 
 
 def _client(user: User) -> APIClient:
@@ -1126,7 +1176,7 @@ def test_my_assignments_marks_incomplete_audit_progress_unavailable(
 
 
 def test_full_coverage_requires_full_view_and_fails_closed_on_hidden_links(
-    audit_iam_world, monkeypatch
+    audit_iam_world,
 ):
     world = audit_iam_world
     target = world["target"]
@@ -1135,9 +1185,12 @@ def test_full_coverage_requires_full_view_and_fails_closed_on_hidden_links(
     controls_url = f"/api/compliance-assessments/{target.id}/controls_coverage/"
     evidence_url = f"/api/compliance-assessments/{target.id}/evidence_coverage/"
 
-    # Simulate a model that gains a published flag in a future upstream change:
-    # the ordinary published-read shortcut must never bypass an action override.
-    monkeypatch.setattr(ComplianceAssessment, "is_published", True, raising=False)
+    # Ordinary ambient read authority must never bypass an action override.
+    _replace_direct_read_with_default_role(
+        world["respondent"],
+        "view_complianceassessment",
+        world["child_folder"],
+    )
 
     # Folder access to the audit is insufficient: advanced authorized-visible
     # aggregates are guarded by the full-view permission.
@@ -1170,13 +1223,18 @@ def test_full_coverage_requires_full_view_and_fails_closed_on_hidden_links(
 
 
 def test_respondent_cannot_reach_full_audit_exports_or_comparisons(
-    audit_iam_world, monkeypatch
+    audit_iam_world,
 ):
     world = audit_iam_world
     target = world["target"]
     ancestor = world["ancestor"]
     client = _client(world["respondent"])
-    monkeypatch.setattr(ComplianceAssessment, "is_published", True, raising=False)
+    _replace_direct_read_with_default_role(
+        world["respondent"],
+        "view_complianceassessment",
+        world["child_folder"],
+        world["ancestor"].folder,
+    )
 
     requests = (
         (
@@ -4560,8 +4618,7 @@ def test_word_report_independently_authorizes_actor_specific_object(
     if specific_type == "user":
         specific = User.objects.create_user(f"word-direct-user-{suffix}@example.test")
         specific.folder = world["child_folder"]
-        specific.is_published = False
-        specific.save(update_fields=["folder", "is_published"])
+        specific.save(update_fields=["folder"])
         model = User
         permission = "view_user"
         secret = specific.email
@@ -4578,7 +4635,6 @@ def test_word_report_independently_authorizes_actor_specific_object(
         specific = Entity.objects.create(
             name=f"Word direct entity {suffix}",
             folder=world["child_folder"],
-            is_published=False,
         )
         model = Entity
         permission = "view_entity"
@@ -4645,8 +4701,7 @@ def test_word_report_fails_closed_on_hidden_formal_report_input(
             f"hidden-word-author-{uuid.uuid4().hex}@example.test"
         )
         hidden_author.folder = world["hidden_folder"]
-        hidden_author.is_published = False
-        hidden_author.save(update_fields=["folder", "is_published"])
+        hidden_author.save(update_fields=["folder"])
         target.authors.add(hidden_author.actor)
 
     response = _client(world["auditor"]).get(
@@ -4664,8 +4719,7 @@ def test_word_report_rejects_visible_team_with_hidden_member(audit_iam_world):
         f"hidden-team-member-{uuid.uuid4().hex}@example.test"
     )
     hidden_member.folder = world["hidden_folder"]
-    hidden_member.is_published = False
-    hidden_member.save(update_fields=["folder", "is_published"])
+    hidden_member.save(update_fields=["folder"])
     team = Team.objects.create(
         name=f"Word report team {uuid.uuid4().hex}",
         folder=world["child_folder"],
@@ -4702,12 +4756,10 @@ def test_word_report_rejects_visible_entity_representative_with_hidden_user(
         f"hidden-representative-user-{uuid.uuid4().hex}@example.test"
     )
     hidden_user.folder = world["hidden_folder"]
-    hidden_user.is_published = False
-    hidden_user.save(update_fields=["folder", "is_published"])
+    hidden_user.save(update_fields=["folder"])
     entity = Entity.objects.create(
         name=f"Word report entity {uuid.uuid4().hex}",
         folder=world["child_folder"],
-        is_published=False,
     )
     representative = Representative.objects.create(
         entity=entity,
@@ -4746,7 +4798,6 @@ def test_word_report_rejects_hidden_entity_representative(audit_iam_world):
     entity = Entity.objects.create(
         name=f"Word report entity {suffix}",
         folder=world["child_folder"],
-        is_published=False,
     )
     representative = Representative.objects.create(
         entity=entity,

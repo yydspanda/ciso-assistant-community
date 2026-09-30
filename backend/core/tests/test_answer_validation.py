@@ -45,7 +45,6 @@ def validation_setup(db):
     fw = Framework.objects.create(
         name="Validation FW",
         folder=folder,
-        is_published=True,
     )
     rn1 = RequirementNode.objects.create(
         framework=fw,
@@ -53,7 +52,6 @@ def validation_setup(db):
         ref_id="REQ1",
         assessable=True,
         folder=folder,
-        is_published=True,
     )
     rn2 = RequirementNode.objects.create(
         framework=fw,
@@ -61,7 +59,6 @@ def validation_setup(db):
         ref_id="REQ2",
         assessable=True,
         folder=folder,
-        is_published=True,
     )
     q1 = Question.objects.create(
         requirement_node=rn1,
@@ -69,7 +66,6 @@ def validation_setup(db):
         ref_id="Q1",
         type=Question.Type.TEXT,
         folder=folder,
-        is_published=True,
     )
     q2 = Question.objects.create(
         requirement_node=rn2,
@@ -77,7 +73,6 @@ def validation_setup(db):
         ref_id="Q2",
         type=Question.Type.TEXT,
         folder=folder,
-        is_published=True,
     )
     ca = ComplianceAssessment.objects.create(
         name="Validation CA",

@@ -432,6 +432,13 @@ def queue_requirement_assignment_mails(
             )
         assert_complete_access(requester, assessment)
 
+        # Upstream can fill a missing assignment after a default assignee or
+        # representative is added. Keep that recovery in the same authorized,
+        # parent-locked transaction as durable delivery intents.
+        from core.utils import ensure_audit_assignment
+
+        ensure_audit_assignment(assessment)
+
         assignments = list(
             RequirementAssignment.objects.select_for_update(of=("self",))
             .filter(compliance_assessment=assessment)

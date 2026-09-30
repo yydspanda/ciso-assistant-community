@@ -135,6 +135,11 @@ class TestPolicysAuthenticated:
             },
             user_group=test.user_group,
             scope=str(test.folder),
+            # Policy inherits the caller-scoped AppliedControl read projection.
+            mutation_response_params={
+                "folder": {"id": str(test.folder.id), "str": test.folder.name},
+                "effort": POLICY_EFFORT[1],
+            },
         )
 
     def test_update_policies(self, test):
@@ -168,6 +173,10 @@ class TestPolicysAuthenticated:
                 "folder": {"id": str(test.folder.id), "str": test.folder.name},
                 "status": POLICY_STATUS._value_,
                 "effort": POLICY_EFFORT[1],
+            },
+            test_params={
+                "folder": {"id": str(folder.id), "str": folder.name},
+                "effort": POLICY_EFFORT2[1],
             },
             user_group=test.user_group,
         )
