@@ -150,10 +150,17 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 17. **Frontend upload compensation is best effort.** A rejected upload is
     surfaced as a form error, but a failed compensating DELETE may leave the
     newly created metadata object. No cross-request rollback guarantee is claimed.
+18. **GitHub credential rotation is required.** A diagnostic accidentally exposed
+    the current CLI OAuth credential in tool output. Owned remote downloads were
+    stopped and no credential is recorded here. Credential-owner revocation and
+    fresh authorization are required before further authenticated remote checks,
+    pushes, or protected-main delivery. Local checkpoint `fd27104e7` is unpushed;
+    its immutable full-backend test snapshot is still running, not a full pass.
 
 ## Current next action
 
-Reconcile freshly fetched canonical upstream in a separate two-parent
+First require credential-owner rotation and fresh GitHub authorization, then
+reconcile freshly fetched canonical upstream in a separate two-parent
 merge, preserving upstream interfaces and the existing authority protections.
 Verify the fresh and fork-upgrade migration paths on disposable PostgreSQL,
 run the proportional merged-tree backend/frontend/browser matrix, and monitor
