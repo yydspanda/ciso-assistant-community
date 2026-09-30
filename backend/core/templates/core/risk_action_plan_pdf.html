@@ -60,7 +60,7 @@
                             <td class="text-md p-2 text-center">{{ applied_control.get_effort_display|default:"--" }}</td>
                             <td class="text-md p-2 text-center">{{ applied_control.display_cost|default:"--" }}</td>
                             <td class="text-md p-2 text-center">
-                                {% for req in applied_control.risk_scenarios.all %}
+                                {% for req in applied_control.authorized_risk_scenarios %}
                                     {{ req }}<br>
                                 {% empty %}
                                     --

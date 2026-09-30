@@ -9,11 +9,16 @@ inaccessible sibling domain.
 from __future__ import annotations
 
 import uuid
+from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from django.contrib.auth.models import Permission
 from django.core.files.base import ContentFile
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.test import APIClient
 
 from core.audit_inheritance import AuditTreeAggregationStrategy
@@ -252,7 +257,6 @@ def _build_questionnaire_iam_fixture(world: dict) -> dict:
         value="Hidden write choice",
         folder=hidden,
     )
-
     return {
         "visible_choice_question": visible_choice_question,
         "visible_choice": visible_choice,
@@ -1332,6 +1336,213 @@ def test_direct_ra_api_scopes_assignments_and_filters_nested_related_data(
     }
 
 
+@pytest.mark.parametrize(
+    ("field_name", "model", "visible_key", "hidden_key"),
+    (
+        ("applied_controls", AppliedControl, "visible_control", "hidden_control"),
+        ("evidences", Evidence, "visible_evidence", "hidden_evidence"),
+        ("security_exceptions", SecurityException, None, None),
+    ),
+)
+def test_ra_m2m_patch_updates_visible_slice_without_dropping_hidden_links(
+    audit_iam_world,
+    field_name,
+    model,
+    visible_key,
+    hidden_key,
+):
+    world = audit_iam_world
+    ra = world["assigned_ra"]
+    if visible_key is None:
+        visible = model.objects.create(
+            name="Visible security exception", folder=world["child_folder"]
+        )
+        hidden = model.objects.create(
+            name="Hidden security exception", folder=world["hidden_folder"]
+        )
+    else:
+        visible = world[visible_key]
+        hidden = world[hidden_key]
+
+    manager = getattr(ra, field_name)
+    manager.add(visible, hidden)
+    response = _client(world["auditor"]).patch(
+        f"/api/requirement-assessments/{ra.id}/",
+        {field_name: []},
+        format="json",
+    )
+
+    assert response.status_code == 200, response.content
+    assert set(manager.values_list("id", flat=True)) == {hidden.id}
+    assert response.json()[field_name] == []
+    assert str(hidden.id).encode() not in response.content
+    assert hidden.name.encode() not in response.content
+
+    denied_existing = _client(world["auditor"]).patch(
+        f"/api/requirement-assessments/{ra.id}/",
+        {field_name: [str(hidden.id)]},
+        format="json",
+    )
+
+    assert denied_existing.status_code == 403, denied_existing.content
+    assert set(manager.values_list("id", flat=True)) == {hidden.id}
+    assert str(hidden.id).encode() not in denied_existing.content
+    assert hidden.name.encode() not in denied_existing.content
+
+    hidden_newcomer = model.objects.create(
+        name=f"Unlinked hidden {field_name}", folder=world["hidden_folder"]
+    )
+    denied = _client(world["auditor"]).patch(
+        f"/api/requirement-assessments/{ra.id}/",
+        {field_name: [str(hidden_newcomer.id)]},
+        format="json",
+    )
+
+    assert denied.status_code == 403, denied.content
+    assert set(manager.values_list("id", flat=True)) == {hidden.id}
+    for secret in (hidden, hidden_newcomer):
+        assert str(secret.id).encode() not in denied.content
+        assert secret.name.encode() not in denied.content
+
+
+def test_ra_m2m_patch_fails_closed_when_relationship_visibility_is_unavailable(
+    audit_iam_world,
+    monkeypatch,
+):
+    world = audit_iam_world
+    ra = world["assigned_ra"]
+    ra.evidences.add(world["visible_evidence"], world["hidden_evidence"])
+    original_get_viewable_ids = RoleAssignment.get_viewable_object_ids
+
+    def fail_evidence_visibility(user, model):
+        if model is Evidence:
+            raise Permission.DoesNotExist
+        return original_get_viewable_ids(user, model)
+
+    monkeypatch.setattr(
+        RoleAssignment,
+        "get_viewable_object_ids",
+        fail_evidence_visibility,
+    )
+    response = _client(world["auditor"]).patch(
+        f"/api/requirement-assessments/{ra.id}/",
+        {"evidences": []},
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert set(ra.evidences.values_list("id", flat=True)) == {
+        world["visible_evidence"].id,
+        world["hidden_evidence"].id,
+    }
+    assert b"could not be verified" in response.content
+    assert str(world["hidden_evidence"].id).encode() not in response.content
+    assert world["hidden_evidence"].name.encode() not in response.content
+
+
+def test_ra_m2m_update_without_authority_context_fails_closed(audit_iam_world):
+    from core.serializers import RequirementAssessmentWriteSerializer
+
+    world = audit_iam_world
+    ra = world["assigned_ra"]
+    ra.evidences.add(world["visible_evidence"], world["hidden_evidence"])
+    serializer = RequirementAssessmentWriteSerializer(
+        instance=ra,
+        data={"evidences": []},
+        partial=True,
+    )
+    assert serializer.is_valid(), serializer.errors
+
+    with pytest.raises(
+        PermissionDenied,
+        match="authenticated authority context",
+    ):
+        serializer.save()
+    assert set(ra.evidences.values_list("id", flat=True)) == {
+        world["visible_evidence"].id,
+        world["hidden_evidence"].id,
+    }
+
+
+def test_ra_visible_delta_does_not_resurrect_hidden_link_removed_during_update(
+    audit_iam_world, monkeypatch
+):
+    from core.serializers import RequirementAssessmentWriteSerializer
+
+    world = audit_iam_world
+    ra = world["assigned_ra"]
+    visible = world["visible_evidence"]
+    hidden = world["hidden_evidence"]
+    ra.evidences.add(visible, hidden)
+    original_apply = (
+        RequirementAssessmentWriteSerializer._apply_visible_relationship_updates
+    )
+
+    def remove_hidden_then_apply(instance, relationship_updates):
+        # Simulate a checker removing an object outside this caller's visible
+        # slice after the request has read its authority boundary.
+        instance.evidences.remove(hidden)
+        original_apply(instance, relationship_updates)
+
+    monkeypatch.setattr(
+        RequirementAssessmentWriteSerializer,
+        "_apply_visible_relationship_updates",
+        staticmethod(remove_hidden_then_apply),
+    )
+
+    response = _client(world["auditor"]).patch(
+        f"/api/requirement-assessments/{ra.id}/",
+        {"evidences": [str(visible.id)]},
+        format="json",
+    )
+
+    assert response.status_code == 200, response.content
+    assert set(ra.evidences.values_list("id", flat=True)) == {visible.id}
+
+
+def test_ra_m2m_delta_keeps_global_visibility_query_lazy_and_single_pass(
+    audit_iam_world,
+    monkeypatch,
+):
+    from core.serializers import RequirementAssessmentWriteSerializer
+
+    world = audit_iam_world
+    ra = world["assigned_ra"]
+    visible = world["visible_evidence"]
+    hidden = world["hidden_evidence"]
+    ra.evidences.add(visible, hidden)
+    original_get_viewable_ids = RoleAssignment.get_viewable_object_ids
+    evidence_visibility_queries = []
+
+    def track_visibility_query(user, model, folder=None):
+        queryset = original_get_viewable_ids(user, model, folder)
+        if model is Evidence:
+            evidence_visibility_queries.append(queryset)
+        return queryset
+
+    monkeypatch.setattr(
+        RoleAssignment,
+        "get_viewable_object_ids",
+        track_visibility_query,
+    )
+    serializer = RequirementAssessmentWriteSerializer(
+        instance=ra,
+        data={"evidences": [str(visible.id)]},
+        partial=True,
+        context={"request": SimpleNamespace(user=world["auditor"])},
+    )
+
+    assert serializer.is_valid(), serializer.errors
+    serializer.save()
+
+    # The generic BaseModelSerializer M2M scan is skipped for this controlled
+    # update field. The one custom authority query remains a lazy SQL subquery,
+    # intersected with only current/submitted IDs rather than copied into Python.
+    assert len(evidence_visibility_queries) == 1
+    assert evidence_visibility_queries[0]._result_cache is None
+    assert set(ra.evidences.values_list("id", flat=True)) == {visible.id, hidden.id}
+
+
 def test_mapping_inference_is_removed_for_respondent_and_canonical_for_auditor(
     audit_iam_world,
 ):
@@ -1555,6 +1766,57 @@ def test_plain_tree_and_requirement_lists_require_independent_framework_iam(
     assert client.get(score_url).status_code == 403
 
 
+def test_generic_requirement_assessment_api_requires_independent_framework_iam(
+    audit_iam_world,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Hidden framework answer writer {uuid.uuid4().hex}",
+        {"change_answer"},
+        world["child_folder"],
+    )
+    framework = world["target"].framework
+    framework.folder = world["hidden_folder"]
+    framework.save(update_fields=["folder"])
+    client = _client(world["respondent"])
+    url = f"/api/requirement-assessments/{world['assigned_ra'].id}/"
+
+    listing = client.get(
+        "/api/requirement-assessments/",
+        {"compliance_assessment": str(world["target"].id)},
+    )
+    assert listing.status_code == 200, listing.content
+    assert _list_results(listing) == []
+    assert client.get(url).status_code == 404
+
+    selected_before = set(
+        questionnaire["visible_answer"].selected_choices.values_list("id", flat=True)
+    )
+    rejected = client.patch(
+        url,
+        {
+            "answers": {
+                questionnaire["visible_choice_question"].urn: [
+                    questionnaire["visible_choice"].urn
+                ]
+            }
+        },
+        format="json",
+    )
+    assert rejected.status_code == 404, rejected.content
+    assert (
+        set(
+            questionnaire["visible_answer"].selected_choices.values_list(
+                "id", flat=True
+            )
+        )
+        == selected_before
+    )
+
+
 def test_cel_requirement_visibility_fails_closed_for_assignment_respondent(
     audit_iam_world,
 ):
@@ -1678,12 +1940,80 @@ def test_requirement_assessment_and_assignment_list_filter_questionnaire_iam(
 ):
     world = audit_iam_world
     questionnaire = _build_questionnaire_iam_fixture(world)
+    Answer.objects.create(
+        requirement_assessment=world["assigned_ra"],
+        question=questionnaire["hidden_choice_write_question"],
+        # Simulate legacy/corrupt data: authorized choice answers must never
+        # recover an IAM-hidden choice URN from this raw compatibility field.
+        value=questionnaire["hidden_write_choice"].urn,
+        folder=world["child_folder"],
+    )
+    hidden_value_dependent_question = Question.objects.create(
+        requirement_node=world["assigned_requirement"],
+        urn=f"urn:test:questionnaire:{uuid.uuid4().hex}:hidden-value-dependent",
+        ref_id="Q-HIDDEN-VALUE-DEPENDENT",
+        text="Question gated by a hidden legacy choice value",
+        type=Question.Type.TEXT,
+        depends_on={
+            "question": questionnaire["hidden_choice_write_question"].urn,
+            "condition": "any",
+            "answers": [questionnaire["hidden_write_choice"].urn],
+        },
+        folder=world["child_folder"],
+    )
+    unsafe_all_question = Question.objects.create(
+        requirement_node=world["assigned_requirement"],
+        urn=f"urn:test:questionnaire:{uuid.uuid4().hex}:unsafe-all-dependent",
+        ref_id="Q-UNSAFE-ALL",
+        text="Question requiring visible and hidden choices",
+        type=Question.Type.TEXT,
+        depends_on={
+            "question": questionnaire["visible_choice_question"].urn,
+            "condition": "all",
+            "answers": [
+                questionnaire["visible_choice"].urn,
+                questionnaire["hidden_choice"].urn,
+            ],
+        },
+        folder=world["child_folder"],
+    )
+    unsafe_all_descendant = Question.objects.create(
+        requirement_node=world["assigned_requirement"],
+        urn=f"urn:test:questionnaire:{uuid.uuid4().hex}:unsafe-all-descendant",
+        ref_id="Q-UNSAFE-ALL-DESCENDANT",
+        text="Descendant of an unsafe hidden dependency",
+        type=Question.Type.TEXT,
+        depends_on={
+            "question": unsafe_all_question.urn,
+            "condition": "any",
+            "answers": ["yes"],
+        },
+        folder=world["child_folder"],
+    )
+    non_choice_dependent_question = Question.objects.create(
+        requirement_node=world["assigned_requirement"],
+        urn=f"urn:test:questionnaire:{uuid.uuid4().hex}:text-dependent",
+        ref_id="Q-TEXT-DEPENDENT",
+        text="Question depending on text",
+        type=Question.Type.TEXT,
+        depends_on={
+            "question": questionnaire["unanswered_question"].urn,
+            "condition": "any",
+            "answers": ["yes"],
+        },
+        folder=world["child_folder"],
+    )
     _grant_questionnaire_read(world["respondent"], world["child_folder"])
     client = _client(world["respondent"])
 
     detail = client.get(f"/api/requirement-assessments/{world['assigned_ra'].id}/")
     assert detail.status_code == 200, detail.content
 
+    compliance_list = client.get(
+        f"/api/compliance-assessments/{world['target'].id}/requirements_list/"
+    )
+    assert compliance_list.status_code == 200, compliance_list.content
+    compliance_body = compliance_list.json()
     assignment_list = client.get(
         f"/api/requirement-assignments/{world['assignment'].id}/requirements_list/"
     )
@@ -1716,23 +2046,296 @@ def test_requirement_assessment_and_assignment_list_filter_questionnaire_iam(
         assert answers == {
             questionnaire["visible_choice_question"].urn: [
                 questionnaire["visible_choice"].urn
-            ]
+            ],
+            questionnaire["hidden_choice_write_question"].urn: None,
         }
+        assert questionnaire["hidden_write_choice"].urn not in str(requirement_data)
+        assert questionnaire["hidden_write_choice"].urn not in str(answers)
+        assert hidden_value_dependent_question.urn not in questions
+        assert unsafe_all_question.urn not in questions
+        assert unsafe_all_descendant.urn not in questions
+        assert questions[non_choice_dependent_question.urn]["depends_on"][
+            "answers"
+        ] == ["yes"]
 
     assert_filtered_projection(detail.json()["requirement"], detail.json()["answers"])
+    compliance_requirement = next(
+        item
+        for item in compliance_body["requirements"]
+        if item["id"] == str(world["assigned_requirement"].id)
+    )
+    compliance_ra = next(
+        item
+        for item in compliance_body["requirement_assessments"]
+        if item["id"] == str(world["assigned_ra"].id)
+    )
+    assert_filtered_projection(compliance_requirement, compliance_ra["answers"])
     assert_filtered_projection(listed_requirement, listed_ra["answers"])
-    # Aggregate progress must use the same authorized projection: four of the
-    # five questions are readable, and only the visible choice Answer is both
-    # non-empty and readable. Hidden rows must not leak through counts.
+    # Aggregate progress must use the same authorized projection: four base
+    # questions are readable, and only the visible choice Answer is both
+    # non-empty and readable. The dependent question gated solely by a stale
+    # raw hidden-choice value must not become count-visible as a side channel.
     assert listed_ra["visible_questions"] == 4
     assert listed_ra["answered_questions"] == 1
     assert assignment_body["total_visible_questions"] == 4
     assert assignment_body["total_answered_questions"] == 1
 
 
+def _build_batched_questionnaire_rows(world: dict, count: int):
+    nodes = []
+    assessments = []
+    for index in range(count):
+        suffix = uuid.uuid4().hex
+        node = RequirementNode.objects.create(
+            name=f"Batch requirement {index}",
+            urn=f"{world['target'].framework.urn}:batch-{suffix}",
+            ref_id=f"BATCH-{index}",
+            framework=world["target"].framework,
+            folder=Folder.get_root_folder(),
+            assessable=True,
+            order_id=100 + index,
+        )
+        assessment = RequirementAssessment.objects.create(
+            compliance_assessment=world["target"],
+            requirement=node,
+            folder=world["child_folder"],
+        )
+        question = Question.objects.create(
+            requirement_node=node,
+            urn=f"urn:test:batch-questionnaire:{suffix}:question",
+            ref_id=f"BATCH-Q-{index}",
+            text=f"Batch question {index}",
+            type=Question.Type.MULTIPLE_CHOICE,
+            folder=world["child_folder"],
+        )
+        choice = QuestionChoice.objects.create(
+            question=question,
+            urn=f"urn:test:batch-questionnaire:{suffix}:choice",
+            ref_id=f"BATCH-C-{index}",
+            value=f"Batch choice {index}",
+            folder=world["child_folder"],
+        )
+        answer = Answer.objects.create(
+            requirement_assessment=assessment,
+            question=question,
+            folder=world["child_folder"],
+        )
+        answer.selected_choices.add(choice)
+        world["assignment"].requirement_assessments.add(assessment)
+        nodes.append(node)
+        assessments.append(assessment)
+    return nodes, assessments
+
+
+def test_questionnaire_visibility_context_is_request_bound_scoped_and_batched(
+    audit_iam_world,
+):
+    from core.questionnaire_visibility import QuestionnaireVisibilityContext
+
+    world = audit_iam_world
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    nodes, assessments = _build_batched_questionnaire_rows(world, 8)
+    out_of_scope_question = Question.objects.create(
+        requirement_node=world["assigned_requirement"],
+        urn=f"urn:test:batch-questionnaire:{uuid.uuid4().hex}:out-of-scope",
+        ref_id="BATCH-Q-OUT-OF-SCOPE",
+        text="Visible but outside this projection",
+        type=Question.Type.MULTIPLE_CHOICE,
+        folder=world["child_folder"],
+    )
+    out_of_scope_choice = QuestionChoice.objects.create(
+        question=out_of_scope_question,
+        urn=f"{out_of_scope_question.urn}:choice",
+        ref_id="BATCH-C-OUT-OF-SCOPE",
+        value="Visible but outside this projection",
+        folder=world["child_folder"],
+    )
+    first_answer = Answer.objects.get(requirement_assessment=assessments[0])
+    second_answer = Answer.objects.get(requirement_assessment=assessments[1])
+    second_choice = second_answer.selected_choices.get()
+    first_answer.selected_choices.add(
+        out_of_scope_choice,
+        # Both rows are IAM-visible and inside the batch, but this choice is
+        # not owned by first_answer.question and must still be discarded.
+        second_choice,
+    )
+    cross_requirement_answer = Answer.objects.create(
+        requirement_assessment=assessments[0],
+        question=second_answer.question,
+        value="cross-requirement answer must stay absent",
+        folder=world["child_folder"],
+    )
+
+    def build_and_consume(rows, requirement_nodes):
+        request = SimpleNamespace(user=world["respondent"])
+        with CaptureQueriesContext(connection) as captured:
+            context = QuestionnaireVisibilityContext.build(
+                request=request,
+                requirement_assessments=rows,
+                requirement_nodes=requirement_nodes,
+            )
+            for assessment in rows:
+                assert context.answer_values_for(request, assessment)
+                assert context.counts_for(request, assessment) == (1, 1)
+                assert context.translated_questions_for(request, assessment.requirement)
+        return request, context, len(captured.captured_queries)
+
+    _, _, one_row_queries = build_and_consume(assessments[:1], nodes[:1])
+    request, context, eight_row_queries = build_and_consume(assessments, nodes)
+
+    # The fixed full-chain budget resolves permission and recursive folder scope
+    # once for each of Framework, RequirementNode, Question, QuestionChoice and
+    # Answer (10 queries), then executes six bounded row/prefetch queries.  The
+    # important invariant is that consuming 8 rows adds no query at all.
+    assert one_row_queries <= 16
+    assert eight_row_queries == one_row_queries
+
+    # A context cannot be replayed in another request, even for the same user,
+    # and a visible row outside its explicit RA/Requirement scope stays absent.
+    replay_request = SimpleNamespace(user=world["respondent"])
+    assert context.answer_values_for(replay_request, assessments[0]) == {}
+    assert context.questions_for(replay_request, nodes[0]) == ()
+    assert context.counts_for(replay_request, assessments[0]) == (0, 0)
+    assert context.answer_values_for(request, world["assigned_ra"]) == {}
+    assert context.questions_for(request, world["assigned_requirement"]) == ()
+    assert context.counts_for(request, world["assigned_ra"]) == (0, 0)
+    assert out_of_scope_choice.urn not in str(
+        context.answer_values_for(request, assessments[0])
+    )
+    first_projection = context.answer_values_for(request, assessments[0])
+    assert first_projection == {
+        first_answer.question.urn: [
+            first_answer.selected_choices.get(question=first_answer.question).urn
+        ]
+    }
+    assert second_choice.urn not in str(first_projection)
+    assert cross_requirement_answer.question.urn not in first_projection
+    assert cross_requirement_answer.value not in str(first_projection)
+
+    wrong_requirement_pair = SimpleNamespace(
+        id=assessments[0].id,
+        requirement_id=nodes[1].id,
+    )
+    assert not context.covers_requirement_assessments(
+        request, (wrong_requirement_pair,)
+    )
+    assert context.answer_values_for(request, wrong_requirement_pair) == {}
+    assert context.counts_for(request, wrong_requirement_pair) == (0, 0)
+
+
+def test_assignment_questionnaire_projection_resolves_each_iam_model_once(
+    audit_iam_world,
+    monkeypatch,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _build_batched_questionnaire_rows(world, 8)
+
+    original_get_viewable_ids = RoleAssignment.get_viewable_object_ids
+    calls = Counter()
+
+    def count_questionnaire_iam(user, model, folder=None):
+        if model in (Question, QuestionChoice, Answer):
+            calls[model] += 1
+        return original_get_viewable_ids(user, model, folder)
+
+    monkeypatch.setattr(
+        RoleAssignment,
+        "get_viewable_object_ids",
+        count_questionnaire_iam,
+    )
+    response = _client(world["respondent"]).get(
+        f"/api/requirement-assignments/{world['assignment'].id}/requirements_list/"
+    )
+
+    assert response.status_code == 200, response.content
+    assert calls == Counter({Question: 1, QuestionChoice: 1, Answer: 1})
+    body = response.json()
+    listed_ra = next(
+        row
+        for row in body["requirement_assessments"]
+        if row["id"] == str(world["assigned_ra"].id)
+    )
+    listed_requirement = next(
+        row
+        for row in body["requirements"]
+        if row["id"] == str(world["assigned_requirement"].id)
+    )
+    assert listed_ra["answers"] == {
+        questionnaire["visible_choice_question"].urn: [
+            questionnaire["visible_choice"].urn
+        ]
+    }
+    questions = listed_requirement["questions"]
+    assert questionnaire["hidden_question"].urn not in questions
+    assert questionnaire["hidden_choice"].urn not in {
+        choice["urn"]
+        for choice in questions[questionnaire["visible_choice_question"].urn]["choices"]
+    }
+    assert questionnaire["hidden_answer"].value not in str(listed_ra["answers"])
+
+
+def test_questionnaire_api_query_budget_does_not_grow_per_requirement(
+    audit_iam_world,
+):
+    world = audit_iam_world
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _, first_assessments = _build_batched_questionnaire_rows(world, 1)
+    client = _client(world["respondent"])
+    urls = {
+        "generic": (
+            f"/api/requirement-assessments/?compliance_assessment={world['target'].id}"
+        ),
+        "compliance": (
+            f"/api/compliance-assessments/{world['target'].id}/requirements_list/"
+        ),
+        "assignment": (
+            f"/api/requirement-assignments/{world['assignment'].id}/requirements_list/"
+        ),
+    }
+
+    def query_counts(expected_assessment_ids):
+        counts = {}
+        for name, url in urls.items():
+            with CaptureQueriesContext(connection) as captured:
+                response = client.get(url)
+            assert response.status_code == 200, response.content
+            body = response.json()
+            rows = (
+                _list_results(response)
+                if name == "generic"
+                else body["requirement_assessments"]
+            )
+            assert expected_assessment_ids <= {row["id"] for row in rows}
+            counts[name] = len(captured.captured_queries)
+        return counts
+
+    # Warm process-local Django/content-type caches before measuring both
+    # sides of the row-count comparison.
+    first_assessment_ids = {str(assessment.id) for assessment in first_assessments}
+    query_counts(first_assessment_ids)
+    one_row_counts = query_counts(first_assessment_ids)
+    _, additional_assessments = _build_batched_questionnaire_rows(world, 8)
+    nine_assessment_ids = first_assessment_ids | {
+        str(assessment.id) for assessment in additional_assessments
+    }
+    nine_row_counts = query_counts(nine_assessment_ids)
+
+    assert nine_row_counts == one_row_counts
+
+
 def test_answer_api_hides_answer_whose_question_is_not_viewable(audit_iam_world):
     world = audit_iam_world
     questionnaire = _build_questionnaire_iam_fixture(world)
+    crossed_choice = QuestionChoice.objects.create(
+        question=questionnaire["hidden_answer_question"],
+        urn=f"urn:test:cross-question-choice:{uuid.uuid4().hex}",
+        value="Visible choice attached to the wrong answer",
+        folder=world["child_folder"],
+    )
+    # Deliberately bypass serializer validation to model a corrupt M2M row.
+    questionnaire["visible_answer"].selected_choices.add(crossed_choice)
     _grant_questionnaire_read(world["respondent"], world["child_folder"])
     client = _client(world["respondent"])
 
@@ -1753,11 +2356,1655 @@ def test_answer_api_hides_answer_whose_question_is_not_viewable(audit_iam_world)
     assert _related_ids(visible_row["selected_choices"]) == {
         str(questionnaire["visible_choice"].id)
     }
+    assert str(crossed_choice.id) not in str(visible_row)
+    assert crossed_choice.value not in str(visible_row)
+
+    _grant(
+        world["respondent"],
+        f"Corrupt M2M answer editor {uuid.uuid4().hex}",
+        {"change_answer"},
+        world["child_folder"],
+    )
+    rejected_update = client.patch(
+        f"/api/answers/{questionnaire['visible_answer'].id}/",
+        {"selected_choices": [str(questionnaire["visible_choice"].id)]},
+        format="json",
+    )
+    assert rejected_update.status_code == 403, rejected_update.content
+    assert (
+        questionnaire["visible_answer"]
+        .selected_choices.filter(id=crossed_choice.id)
+        .exists()
+    )
 
     hidden_question_detail = client.get(
         f"/api/answers/{questionnaire['hidden_question_answer'].id}/"
     )
     assert hidden_question_detail.status_code == 404
+
+
+def test_direct_question_and_choice_apis_project_parent_and_dependency_iam(
+    audit_iam_world,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    crossed_choice = QuestionChoice.objects.create(
+        question=questionnaire["hidden_question"],
+        urn=f"{questionnaire['hidden_question'].urn}:visible-child",
+        ref_id="QC-VISIBLE-CHILD-HIDDEN-PARENT",
+        value="A visible child must not reveal its hidden parent",
+        folder=world["child_folder"],
+    )
+    hidden_parent_dependent = Question.objects.create(
+        requirement_node=world["assigned_requirement"],
+        urn=f"urn:test:questionnaire:{uuid.uuid4().hex}:hidden-parent-dependent",
+        ref_id="Q-HIDDEN-PARENT-DEPENDENT",
+        text="Depends on a hidden question",
+        type=Question.Type.TEXT,
+        depends_on={
+            "question": questionnaire["hidden_question"].urn,
+            "condition": "any",
+            "answers": ["secret-condition"],
+        },
+        folder=world["child_folder"],
+    )
+    mixed_choice_dependent = Question.objects.create(
+        requirement_node=world["assigned_requirement"],
+        urn=f"urn:test:questionnaire:{uuid.uuid4().hex}:mixed-choice-dependent",
+        ref_id="Q-MIXED-CHOICE-DEPENDENT",
+        text="Depends on a visible or hidden choice",
+        type=Question.Type.TEXT,
+        depends_on={
+            "question": questionnaire["visible_choice_question"].urn,
+            "condition": "any",
+            "answers": [
+                questionnaire["visible_choice"].urn,
+                questionnaire["hidden_choice"].urn,
+            ],
+        },
+        folder=world["child_folder"],
+    )
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    client = _client(world["respondent"])
+
+    response = client.get(
+        "/api/questions/",
+        {"requirement_node": str(world["assigned_requirement"].id)},
+    )
+    assert response.status_code == 200, response.content
+    rows = {row["id"]: row for row in _list_results(response)}
+
+    visible_question = rows[str(questionnaire["visible_choice_question"].id)]
+    assert _related_ids(visible_question["choices"]) == {
+        str(questionnaire["visible_choice"].id)
+    }
+    assert questionnaire["hidden_choice"].urn not in str(visible_question)
+
+    hidden_parent_projection = rows[str(hidden_parent_dependent.id)]["depends_on"]
+    assert hidden_parent_projection["question"] != questionnaire["hidden_question"].urn
+    assert questionnaire["hidden_question"].urn not in str(hidden_parent_projection)
+    assert "secret-condition" not in str(hidden_parent_projection)
+
+    mixed_projection = rows[str(mixed_choice_dependent.id)]["depends_on"]
+    assert mixed_projection["answers"] == [questionnaire["visible_choice"].urn]
+    assert questionnaire["hidden_choice"].urn not in str(mixed_projection)
+
+    crossed_listing = client.get(
+        "/api/question-choices/",
+        {"question": str(questionnaire["hidden_question"].id)},
+    )
+    assert crossed_listing.status_code == 200, crossed_listing.content
+    assert _list_results(crossed_listing) == []
+    if isinstance(crossed_listing.json(), dict):
+        assert crossed_listing.json()["count"] == 0
+    crossed_detail = client.get(f"/api/question-choices/{crossed_choice.id}/")
+    assert crossed_detail.status_code == 404
+
+
+def test_direct_question_and_choice_reads_require_the_complete_parent_chain(
+    audit_iam_world,
+):
+    world = audit_iam_world
+    hidden_framework = Framework.objects.create(
+        name="Hidden questionnaire framework",
+        urn=f"urn:test:hidden-questionnaire:{uuid.uuid4().hex}",
+        folder=world["hidden_folder"],
+    )
+    hidden_requirement = RequirementNode.objects.create(
+        name="Hidden questionnaire requirement",
+        urn=f"{hidden_framework.urn}:requirement",
+        framework=hidden_framework,
+        # The node itself is visible; only its Framework parent is hidden.
+        folder=world["child_folder"],
+        assessable=True,
+    )
+    crossed_question = Question.objects.create(
+        requirement_node=hidden_requirement,
+        urn=f"{hidden_framework.urn}:crossed-question",
+        text="Visible child with hidden requirement parent",
+        folder=world["child_folder"],
+    )
+    crossed_choice = QuestionChoice.objects.create(
+        question=crossed_question,
+        urn=f"{crossed_question.urn}:choice",
+        value="Visible grandchild with hidden requirement ancestor",
+        folder=world["child_folder"],
+    )
+    dependent = Question.objects.create(
+        requirement_node=world["assigned_requirement"],
+        urn=f"urn:test:visible-dependent:{uuid.uuid4().hex}",
+        text="Depends on a question whose framework parent is hidden",
+        depends_on={
+            "question": crossed_question.urn,
+            "condition": "any",
+            "answers": ["secret"],
+        },
+        folder=world["child_folder"],
+    )
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    client = _client(world["respondent"])
+
+    assert client.get(f"/api/questions/{crossed_question.id}/").status_code == 404
+    assert client.get(f"/api/question-choices/{crossed_choice.id}/").status_code == 404
+    dependent_response = client.get(f"/api/questions/{dependent.id}/")
+    assert dependent_response.status_code == 200, dependent_response.content
+    assert dependent_response.json()["depends_on"] == {
+        "question": "__iam_unavailable_question__",
+        "answers": [],
+        "condition": "any",
+    }
+
+
+def test_question_and_choice_writes_reject_hidden_or_changed_parent_chain(
+    audit_iam_world,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    hidden_framework = Framework.objects.create(
+        name="Hidden write target framework",
+        urn=f"urn:test:hidden-write-target:{uuid.uuid4().hex}",
+        folder=world["hidden_folder"],
+    )
+    hidden_requirement = RequirementNode.objects.create(
+        name="Hidden write target requirement",
+        urn=f"{hidden_framework.urn}:requirement",
+        framework=hidden_framework,
+        # The immediate parent is visible; its Framework parent is not.
+        folder=world["child_folder"],
+        assessable=True,
+    )
+    hidden_question = Question.objects.create(
+        requirement_node=hidden_requirement,
+        urn=f"{hidden_framework.urn}:question",
+        text="Hidden write target question",
+        folder=world["child_folder"],
+    )
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Questionnaire structure writer {uuid.uuid4().hex}",
+        {
+            "add_question",
+            "change_question",
+            "add_questionchoice",
+            "change_questionchoice",
+        },
+        world["child_folder"],
+    )
+    client = _client(world["respondent"])
+
+    create_question = client.post(
+        "/api/questions/",
+        {
+            "requirement_node": str(hidden_requirement.id),
+            "urn": f"urn:test:cross-parent:{uuid.uuid4().hex}",
+            "text": "Must not be injected",
+            "type": Question.Type.TEXT,
+            "folder": str(world["child_folder"].id),
+        },
+        format="json",
+    )
+    assert create_question.status_code == 403, create_question.content
+
+    create_choice = client.post(
+        "/api/question-choices/",
+        {
+            "question": str(hidden_question.id),
+            "urn": f"urn:test:cross-parent-choice:{uuid.uuid4().hex}",
+            "value": "Must not be injected",
+            "folder": str(world["child_folder"].id),
+        },
+        format="json",
+    )
+    assert create_choice.status_code == 403, create_choice.content
+
+    visible_question = questionnaire["visible_choice_question"]
+    visible_choice = questionnaire["visible_choice"]
+    for url, payload in (
+        (
+            f"/api/questions/{visible_question.id}/",
+            {"requirement_node": str(hidden_requirement.id)},
+        ),
+        (
+            f"/api/questions/{visible_question.id}/",
+            {"folder": str(world["hidden_folder"].id)},
+        ),
+        (
+            f"/api/question-choices/{visible_choice.id}/",
+            {"question": str(hidden_question.id)},
+        ),
+        (
+            f"/api/question-choices/{visible_choice.id}/",
+            {"folder": str(world["hidden_folder"].id)},
+        ),
+    ):
+        response = client.patch(url, payload, format="json")
+        assert response.status_code == 403, (payload, response.content)
+
+    visible_question.refresh_from_db()
+    visible_choice.refresh_from_db()
+    assert visible_question.requirement_node_id == world["assigned_requirement"].id
+    assert visible_question.folder_id == world["child_folder"].id
+    assert visible_choice.question_id == visible_question.id
+    assert visible_choice.folder_id == world["child_folder"].id
+
+
+def test_question_write_response_preserves_hidden_dependency_projection(
+    audit_iam_world,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    dependent = Question.objects.create(
+        requirement_node=world["assigned_requirement"],
+        urn=f"urn:test:hidden-write-response:{uuid.uuid4().hex}",
+        text="Visible dependent question",
+        type=Question.Type.TEXT,
+        depends_on={
+            "question": questionnaire["hidden_question"].urn,
+            "condition": "any",
+            "answers": ["secret-condition"],
+        },
+        folder=world["child_folder"],
+    )
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Question editor {uuid.uuid4().hex}",
+        {"change_question"},
+        world["child_folder"],
+    )
+
+    response = _client(world["respondent"]).patch(
+        f"/api/questions/{dependent.id}/",
+        {"weight": 2},
+        format="json",
+    )
+
+    assert response.status_code == 200, response.content
+    assert (
+        response.json()["depends_on"]["question"]
+        != questionnaire["hidden_question"].urn
+    )
+    assert questionnaire["hidden_question"].urn.encode() not in response.content
+    assert b"secret-condition" not in response.content
+
+
+def test_answer_api_applies_field_policy_and_never_echoes_raw_choice_value(
+    audit_iam_world,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    answer = questionnaire["visible_answer"]
+    answer.value = questionnaire["hidden_choice"].urn
+    answer.save(update_fields=["value"])
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Questionnaire answer writer {uuid.uuid4().hex}",
+        {"add_answer", "change_answer"},
+        world["child_folder"],
+    )
+    client = _client(world["respondent"])
+
+    visible = client.get(f"/api/answers/{answer.id}/")
+    assert visible.status_code == 200, visible.content
+    assert visible.json()["value"] is None
+    assert questionnaire["hidden_choice"].urn.encode() not in visible.content
+
+    target = world["target"]
+    target.field_visibility = {
+        **target.field_visibility,
+        "answers": {"auditor": "edit", "respondent": "hidden"},
+    }
+    target.save(update_fields=["field_visibility"])
+
+    listing = client.get(
+        "/api/answers/",
+        {"requirement_assessment": str(world["assigned_ra"].id)},
+    )
+    assert listing.status_code == 200, listing.content
+    assert _list_results(listing) == []
+    if isinstance(listing.json(), dict):
+        assert listing.json()["count"] == 0
+    assert client.get(f"/api/answers/{answer.id}/").status_code == 404
+    assert (
+        client.patch(
+            f"/api/answers/{answer.id}/", {"value": []}, format="json"
+        ).status_code
+        == 404
+    )
+
+    create = client.post(
+        "/api/answers/",
+        {
+            "requirement_assessment": str(world["assigned_ra"].id),
+            "question": str(questionnaire["unanswered_question"].id),
+            "value": "forbidden",
+        },
+        format="json",
+    )
+    assert create.status_code == 403, create.content
+    assert not Answer.objects.filter(
+        requirement_assessment=world["assigned_ra"],
+        question=questionnaire["unanswered_question"],
+    ).exists()
+
+    requirements = client.get(
+        f"/api/requirement-assignments/{world['assignment'].id}/requirements_list/"
+    )
+    assert requirements.status_code == 200, requirements.content
+    body = requirements.json()
+    assert "total_visible_questions" not in body
+    assert "total_answered_questions" not in body
+    assert all(
+        "visible_questions" not in row and "answered_questions" not in row
+        for row in body["requirement_assessments"]
+    )
+
+
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize(
+    ("guard", "expected_status"),
+    [
+        ("locked", 400),
+        ("in_review", 400),
+        ("read_only", 403),
+        ("terminal_assignment", 400),
+    ],
+)
+def test_answer_delete_rechecks_state_field_policy_and_assignment_after_lock(
+    audit_iam_world,
+    batch,
+    guard,
+    expected_status,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    answer = questionnaire["visible_answer"]
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Questionnaire answer deleter {uuid.uuid4().hex}",
+        {"delete_answer"},
+        world["child_folder"],
+    )
+
+    if guard == "locked":
+        world["target"].is_locked = True
+        world["target"].save(update_fields=["is_locked"])
+    elif guard == "in_review":
+        world["target"].status = ComplianceAssessment.Status.IN_REVIEW
+        world["target"].save(update_fields=["status"])
+    elif guard == "read_only":
+        world["target"].field_visibility = {
+            **world["target"].field_visibility,
+            "answers": {"auditor": "edit", "respondent": "read"},
+        }
+        world["target"].save(update_fields=["field_visibility"])
+    else:
+        world["assignment"].status = RequirementAssignment.Status.SUBMITTED
+        world["assignment"].save(update_fields=["status"])
+
+    client = _client(world["respondent"])
+    if batch:
+        response = client.post(
+            "/api/answers/batch-action/",
+            {"action": "delete", "ids": [str(answer.id)]},
+            format="json",
+        )
+        assert response.status_code == 200, response.content
+        assert response.json()["succeeded"] == []
+        assert response.json()["failed"][0]["id"] == str(answer.id)
+    else:
+        response = client.delete(f"/api/answers/{answer.id}/")
+        assert response.status_code == expected_status, response.content
+    assert Answer.objects.filter(id=answer.id).exists()
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_answer_delete_succeeds_only_for_open_editable_authorized_scope(
+    audit_iam_world,
+    batch,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    answer = questionnaire["visible_answer"]
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Authorized questionnaire answer deleter {uuid.uuid4().hex}",
+        {"delete_answer"},
+        world["child_folder"],
+    )
+    client = _client(world["respondent"])
+
+    if batch:
+        response = client.post(
+            "/api/answers/batch-action/",
+            {"action": "delete", "ids": [str(answer.id)]},
+            format="json",
+        )
+        assert response.status_code == 200, response.content
+        assert response.json()["succeeded"][0]["id"] == str(answer.id)
+    else:
+        response = client.delete(f"/api/answers/{answer.id}/")
+        assert response.status_code == 204, response.content
+    assert not Answer.objects.filter(id=answer.id).exists()
+
+
+def test_answer_api_excludes_cross_requirement_and_cross_audit_assignment_rows(
+    audit_iam_world,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+
+    cross_requirement_answer = Answer.objects.create(
+        requirement_assessment=world["assigned_ra"],
+        question=Question.objects.create(
+            requirement_node=world["unassigned_requirement"],
+            urn=f"urn:test:cross-requirement:{uuid.uuid4().hex}",
+            text="Cross requirement question",
+            folder=world["child_folder"],
+        ),
+        value="must not be returned",
+        folder=world["child_folder"],
+    )
+
+    foreign_audit = ComplianceAssessment.objects.create(
+        name="Foreign audit with corrupt assignment link",
+        framework=world["target"].framework,
+        folder=world["child_folder"],
+        status=ComplianceAssessment.Status.IN_PROGRESS,
+        field_visibility=world["target"].field_visibility,
+    )
+    foreign_audit.create_requirement_assessments()
+    foreign_ra = foreign_audit.requirement_assessments.get(
+        requirement=world["assigned_requirement"]
+    )
+    foreign_answer = foreign_ra.answers.get(
+        question=questionnaire["unanswered_question"]
+    )
+    Answer.objects.filter(id=foreign_answer.id).update(
+        value="cross-audit assignment must not authorize this"
+    )
+    # Deliberately bypass serializer validation to model legacy/corrupt data.
+    world["assignment"].requirement_assessments.add(foreign_ra)
+
+    client = _client(world["respondent"])
+    target_rows = _list_results(
+        client.get(
+            "/api/answers/",
+            {"requirement_assessment": str(world["assigned_ra"].id)},
+        )
+    )
+    foreign_rows = _list_results(
+        client.get(
+            "/api/answers/",
+            {"requirement_assessment": str(foreign_ra.id)},
+        )
+    )
+
+    assert str(questionnaire["visible_answer"].id) in {row["id"] for row in target_rows}
+    assert str(cross_requirement_answer.id) not in {row["id"] for row in target_rows}
+    assert str(foreign_answer.id) not in {row["id"] for row in foreign_rows}
+
+
+def test_answer_create_derives_folder_and_parent_fields_are_immutable(
+    audit_iam_world,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Questionnaire answer creator and editor {uuid.uuid4().hex}",
+        {"add_answer", "change_answer"},
+        world["child_folder"],
+    )
+    client = _client(world["respondent"])
+    response = client.post(
+        "/api/answers/",
+        {
+            "requirement_assessment": str(world["assigned_ra"].id),
+            "question": str(questionnaire["unanswered_question"].id),
+            "value": "created",
+            # The field is server-owned and ignored before related-field
+            # resolution, including for a UUID that does not exist.
+            "folder": str(uuid.uuid4()),
+        },
+        format="json",
+    )
+    assert response.status_code == 201, response.content
+    answer = Answer.objects.get(id=response.json()["id"])
+    assert answer.folder_id == world["assigned_ra"].folder_id
+
+    immutable_updates = (
+        {"requirement_assessment": str(world["unassigned_ra"].id)},
+        {"question": str(questionnaire["visible_choice_question"].id)},
+    )
+    for payload in immutable_updates:
+        rejected = client.patch(f"/api/answers/{answer.id}/", payload, format="json")
+        assert rejected.status_code == 403, (payload, rejected.content)
+
+    ignored_folder = client.patch(
+        f"/api/answers/{answer.id}/",
+        {"folder": str(uuid.uuid4())},
+        format="json",
+    )
+    assert ignored_folder.status_code == 200, ignored_folder.content
+
+    answer.refresh_from_db()
+    assert answer.requirement_assessment_id == world["assigned_ra"].id
+    assert answer.question_id == questionnaire["unanswered_question"].id
+    assert answer.folder_id == world["assigned_ra"].folder_id
+
+    for payload in (
+        {"compliance_assessment": str(world["ancestor"].id)},
+        {"folder": str(world["hidden_folder"].id)},
+    ):
+        rejected = client.patch(
+            f"/api/requirement-assessments/{world['assigned_ra'].id}/",
+            payload,
+            format="json",
+        )
+        assert rejected.status_code == 403, (payload, rejected.content)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "hidden_key"),
+    (
+        ("compliance_assessment", "ancestor"),
+        ("folder", "hidden_folder"),
+    ),
+)
+def test_ra_immutable_parent_uuid_oracle_is_closed_before_field_filtering(
+    audit_iam_world,
+    field_name,
+    hidden_key,
+):
+    world = audit_iam_world
+    ra = world["assigned_ra"]
+    client = _client(world["auditor"])
+    current_id = getattr(ra, f"{field_name}_id")
+
+    same_value = client.patch(
+        f"/api/requirement-assessments/{ra.id}/",
+        {field_name: str(current_id)},
+        format="json",
+    )
+    assert same_value.status_code == 200, same_value.content
+
+    # The raw immutable check must run before this policy removes the field.
+    visibility = dict(world["target"].field_visibility)
+    visibility[field_name] = {"auditor": "hidden", "respondent": "hidden"}
+    world["target"].field_visibility = visibility
+    world["target"].save(update_fields=["field_visibility"])
+    original_parent_ids = (ra.compliance_assessment_id, ra.folder_id)
+    original_row = RequirementAssessment.objects.values().get(id=ra.id)
+
+    responses = [
+        client.patch(
+            f"/api/requirement-assessments/{ra.id}/",
+            {field_name: value},
+            format="json",
+        )
+        for value in (
+            str(world[hidden_key].id),
+            str(uuid.uuid4()),
+            "not-a-uuid",
+        )
+    ]
+
+    signatures = [(response.status_code, response.json()) for response in responses]
+    assert signatures == [
+        (403, {"detail": "The requested relationship is unavailable."})
+    ] * len(responses)
+    ra.refresh_from_db()
+    assert (ra.compliance_assessment_id, ra.folder_id) == original_parent_ids
+    assert RequirementAssessment.objects.values().get(id=ra.id) == original_row
+
+
+def test_answer_update_parent_uuid_oracle_is_closed_and_same_values_work(
+    audit_iam_world,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Answer immutable parent editor {uuid.uuid4().hex}",
+        {"change_answer"},
+        world["child_folder"],
+    )
+    client = _client(world["respondent"])
+    answer = questionnaire["visible_answer"]
+    original_parent_ids = (answer.requirement_assessment_id, answer.question_id)
+    original_choices = set(answer.selected_choices.values_list("id", flat=True))
+
+    for field_name, current_id in (
+        ("requirement_assessment", answer.requirement_assessment_id),
+        ("question", answer.question_id),
+    ):
+        accepted = client.patch(
+            f"/api/answers/{answer.id}/",
+            {field_name: str(current_id)},
+            format="json",
+        )
+        assert accepted.status_code == 200, accepted.content
+
+    hidden_ca = ComplianceAssessment.objects.create(
+        name="Hidden answer parent audit",
+        framework=world["target"].framework,
+        folder=world["hidden_folder"],
+        status=ComplianceAssessment.Status.IN_PROGRESS,
+        field_visibility=world["target"].field_visibility,
+    )
+    hidden_ra = RequirementAssessment.objects.create(
+        compliance_assessment=hidden_ca,
+        requirement=world["assigned_requirement"],
+        folder=world["hidden_folder"],
+    )
+    hidden_ids = {
+        "requirement_assessment": hidden_ra.id,
+        "question": questionnaire["hidden_question"].id,
+    }
+    original_row = Answer.objects.values().get(id=answer.id)
+
+    for field_name in ("requirement_assessment", "question"):
+        responses = [
+            client.patch(
+                f"/api/answers/{answer.id}/",
+                {field_name: value},
+                format="json",
+            )
+            for value in (
+                str(hidden_ids[field_name]),
+                str(uuid.uuid4()),
+                "not-a-uuid",
+            )
+        ]
+        signatures = [(response.status_code, response.json()) for response in responses]
+        assert signatures == [
+            (403, {"detail": "One or more answer relationships are unavailable."})
+        ] * len(responses)
+
+    answer.refresh_from_db()
+    assert (answer.requirement_assessment_id, answer.question_id) == original_parent_ids
+    assert set(answer.selected_choices.values_list("id", flat=True)) == original_choices
+    assert Answer.objects.values().get(id=answer.id) == original_row
+
+
+@pytest.mark.parametrize(
+    ("relation_name", "hidden_value_key", "question_key"),
+    (
+        ("requirement_assessment", "hidden_ra", "unanswered_question"),
+        ("question", "hidden_question", "unanswered_question"),
+        ("selected_choices", "hidden_write_choice", "hidden_choice_write_question"),
+    ),
+)
+def test_answer_create_relation_uuid_oracle_is_closed(
+    audit_iam_world,
+    relation_name,
+    hidden_value_key,
+    question_key,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Answer relation oracle creator {uuid.uuid4().hex}",
+        {"add_answer"},
+        world["child_folder"],
+    )
+    hidden_ca = ComplianceAssessment.objects.create(
+        name="Hidden create parent audit",
+        framework=world["target"].framework,
+        folder=world["hidden_folder"],
+        status=ComplianceAssessment.Status.IN_PROGRESS,
+        field_visibility=world["target"].field_visibility,
+    )
+    hidden_ra = RequirementAssessment.objects.create(
+        compliance_assessment=hidden_ca,
+        requirement=world["assigned_requirement"],
+        folder=world["hidden_folder"],
+    )
+    hidden_values = {**questionnaire, "hidden_ra": hidden_ra}
+    hidden_id = hidden_values[hidden_value_key].id
+    client = _client(world["respondent"])
+    answer_count = Answer.objects.count()
+
+    def payload(value):
+        body = {
+            "requirement_assessment": str(world["assigned_ra"].id),
+            "question": str(questionnaire[question_key].id),
+            "value": "must not be created",
+        }
+        body[relation_name] = (
+            [str(value)] if relation_name == "selected_choices" else str(value)
+        )
+        if relation_name == "selected_choices":
+            body.pop("value")
+        return body
+
+    candidate_values = [hidden_id]
+    if relation_name == "requirement_assessment":
+        # Folder-level IAM alone can see this row, but the respondent product
+        # boundary cannot because it is not linked to their assignment.  It
+        # must be indistinguishable from hidden-folder and missing UUIDs.
+        candidate_values.append(world["unassigned_ra"].id)
+    candidate_values.append(uuid.uuid4())
+    responses = [
+        client.post("/api/answers/", payload(value), format="json")
+        for value in candidate_values
+    ]
+
+    signatures = [(response.status_code, response.json()) for response in responses]
+    assert signatures == [
+        (403, {"detail": "One or more answer relationships are unavailable."})
+    ] * len(candidate_values)
+    assert Answer.objects.count() == answer_count
+
+
+def test_answer_create_visible_wrong_parent_is_rejected_after_safe_resolution(
+    audit_iam_world,
+):
+    world = audit_iam_world
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Answer wrong-parent creator {uuid.uuid4().hex}",
+        {"add_answer"},
+        world["child_folder"],
+    )
+    wrong_parent_question = Question.objects.create(
+        requirement_node=world["unassigned_requirement"],
+        urn=f"urn:test:wrong-answer-parent:{uuid.uuid4().hex}",
+        type=Question.Type.TEXT,
+        text="Visible but attached to another requirement",
+        folder=world["child_folder"],
+    )
+
+    response = _client(world["respondent"]).post(
+        "/api/answers/",
+        {
+            "requirement_assessment": str(world["assigned_ra"].id),
+            "question": str(wrong_parent_question.id),
+            "value": "must not be created",
+        },
+        format="json",
+    )
+
+    assert response.status_code == 400, response.content
+    assert "does not belong" in str(response.json())
+    assert not Answer.objects.filter(
+        requirement_assessment=world["assigned_ra"],
+        question=wrong_parent_question,
+    ).exists()
+
+
+def test_answer_write_serializer_without_authenticated_request_fails_closed(
+    audit_iam_world,
+):
+    from core.serializers import AnswerWriteSerializer
+
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    serializer = AnswerWriteSerializer(
+        data={
+            "requirement_assessment": str(world["assigned_ra"].id),
+            "question": str(questionnaire["unanswered_question"].id),
+            "value": "must not validate",
+        }
+    )
+
+    with pytest.raises(
+        PermissionDenied,
+        match="One or more answer relationships are unavailable",
+    ):
+        serializer.is_valid(raise_exception=True)
+
+
+@pytest.mark.parametrize("action", ["create", "update"])
+def test_answer_write_rechecks_audit_state_after_lock(
+    audit_iam_world,
+    monkeypatch,
+    action,
+):
+    from core.serializers import AnswerWriteSerializer
+
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Answer TOCTOU writer {uuid.uuid4().hex}",
+        {"add_answer", "change_answer"},
+        world["child_folder"],
+    )
+    original_lock = AnswerWriteSerializer._lock_answer_scope
+
+    def lock_after_concurrent_state_change(serializer, **kwargs):
+        ComplianceAssessment.objects.filter(id=world["target"].id).update(
+            is_locked=True
+        )
+        return original_lock(serializer, **kwargs)
+
+    monkeypatch.setattr(
+        AnswerWriteSerializer,
+        "_lock_answer_scope",
+        lock_after_concurrent_state_change,
+    )
+    client = _client(world["respondent"])
+    if action == "create":
+        response = client.post(
+            "/api/answers/",
+            {
+                "requirement_assessment": str(world["assigned_ra"].id),
+                "question": str(questionnaire["unanswered_question"].id),
+                "value": "must roll back",
+            },
+            format="json",
+        )
+        assert not Answer.objects.filter(
+            requirement_assessment=world["assigned_ra"],
+            question=questionnaire["unanswered_question"],
+        ).exists()
+    else:
+        answer = questionnaire["visible_answer"]
+        original_choices = set(answer.selected_choices.values_list("id", flat=True))
+        response = client.patch(
+            f"/api/answers/{answer.id}/",
+            {"selected_choices": []},
+            format="json",
+        )
+        assert set(answer.selected_choices.values_list("id", flat=True)) == (
+            original_choices
+        )
+
+    assert response.status_code == 400, response.content
+    world["target"].refresh_from_db()
+    assert world["target"].is_locked is False
+
+
+def test_answer_batch_lock_boundary_has_one_static_lock_class_order():
+    """Static call-order guard only; it is not PostgreSQL concurrency proof."""
+    import inspect
+
+    from core.serializers import (
+        AnswerWriteSerializer,
+        RequirementAssessmentWriteSerializer,
+    )
+
+    source = inspect.getsource(AnswerWriteSerializer._lock_answer_scopes)
+    lock_calls = (
+        "Folder.objects.select_for_update",
+        "Framework.objects.select_for_update",
+        "ComplianceAssessment.objects.select_for_update",
+        "RequirementAssignment.objects.select_for_update",
+        "RequirementNode.objects.select_for_update",
+        "RequirementAssessment.objects.select_for_update",
+        "Question.objects.select_for_update",
+        "Answer.objects.select_for_update",
+        "QuestionChoice.objects.select_for_update",
+        "RequirementAssignment.requirement_assessments.through.objects.select_for_update",
+        "RequirementAssignment.actor.through.objects.select_for_update",
+        "choice_through.objects.select_for_update",
+        "Actor.objects.select_for_update",
+        "User.objects.select_for_update",
+    )
+    offsets = [source.index(call) for call in lock_calls]
+    assert offsets == sorted(offsets)
+    assert source.count("User.objects.select_for_update") == 1
+    assert (
+        "select_for_update"
+        not in source[
+            source.index("User.objects.select_for_update")
+            + len("User.objects.select_for_update") :
+        ]
+    )
+    legacy_source = inspect.getsource(
+        RequirementAssessmentWriteSerializer._prepare_locked_answer_updates
+    )
+    single_source = inspect.getsource(AnswerWriteSerializer._lock_answer_scope)
+    assert legacy_source.count("authority._lock_answer_scopes(") == 1
+    assert "authority._lock_answer_scope(" not in legacy_source
+    assert "return self._lock_answer_scopes(" in single_source
+
+
+def test_legacy_ra_batch_preserves_answer_values_and_score_recompute_semantics(
+    audit_iam_world,
+    monkeypatch,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Legacy batch answer writer {uuid.uuid4().hex}",
+        {"add_answer", "change_answer"},
+        world["child_folder"],
+    )
+    scored_choice = QuestionChoice.objects.create(
+        question=questionnaire["visible_choice_question"],
+        urn=f"urn:test:legacy-batch-score:{uuid.uuid4().hex}",
+        value="Scored batch choice",
+        add_score=1,
+        folder=world["child_folder"],
+    )
+    recomputed_ids = []
+    original_compute = RequirementAssessment.compute_score_and_result
+
+    def track_compute(requirement_assessment):
+        recomputed_ids.append(requirement_assessment.id)
+        return original_compute(requirement_assessment)
+
+    monkeypatch.setattr(
+        RequirementAssessment,
+        "compute_score_and_result",
+        track_compute,
+    )
+
+    response = _client(world["respondent"]).patch(
+        f"/api/requirement-assessments/{world['assigned_ra'].id}/",
+        {
+            "answers": {
+                questionnaire["visible_choice_question"].urn: [scored_choice.urn],
+                questionnaire["unanswered_question"].urn: "batch text value",
+            }
+        },
+        format="json",
+    )
+
+    assert response.status_code == 200, response.content
+    assert set(
+        questionnaire["visible_answer"].selected_choices.values_list("id", flat=True)
+    ) == {scored_choice.id, questionnaire["hidden_choice"].id}
+    assert (
+        Answer.objects.get(
+            requirement_assessment=world["assigned_ra"],
+            question=questionnaire["unanswered_question"],
+        ).value
+        == "batch text value"
+    )
+    assert recomputed_ids == [world["assigned_ra"].id]
+
+
+def test_legacy_ra_batch_authorizes_every_answer_before_the_first_write(
+    audit_iam_world,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Legacy batch existing-answer editor {uuid.uuid4().hex}",
+        {"change_answer"},
+        world["child_folder"],
+    )
+    replacement = QuestionChoice.objects.create(
+        question=questionnaire["visible_choice_question"],
+        urn=f"urn:test:legacy-batch-replacement:{uuid.uuid4().hex}",
+        value="Must roll back with the batch",
+        folder=world["child_folder"],
+    )
+    last_question = Question.objects.create(
+        id=uuid.UUID(int=(1 << 128) - 1),
+        requirement_node=world["assigned_requirement"],
+        urn=f"urn:test:legacy-batch-last:{uuid.uuid4().hex}",
+        type=Question.Type.TEXT,
+        text="Unauthorized create sorted after the existing answer",
+        folder=world["child_folder"],
+    )
+    answer = questionnaire["visible_answer"]
+    selected_before = set(answer.selected_choices.values_list("id", flat=True))
+
+    response = _client(world["respondent"]).patch(
+        f"/api/requirement-assessments/{world['assigned_ra'].id}/",
+        {
+            "answers": {
+                questionnaire["visible_choice_question"].urn: [replacement.urn],
+                last_question.urn: "must not be created",
+            }
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert set(answer.selected_choices.values_list("id", flat=True)) == selected_before
+    assert not Answer.objects.filter(
+        requirement_assessment=world["assigned_ra"],
+        question=last_question,
+    ).exists()
+
+
+@pytest.mark.parametrize("write_path", ("direct", "legacy"))
+def test_team_assignment_does_not_confer_answer_write_authority(
+    audit_iam_world,
+    write_path,
+):
+    """Compatibility: only a direct user Actor can authorize Answer writes."""
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Team-only answer editor {uuid.uuid4().hex}",
+        {"change_answer"},
+        world["child_folder"],
+    )
+    team = Team.objects.create(
+        name=f"Unlocked answer authority team {uuid.uuid4().hex}",
+        folder=world["child_folder"],
+    )
+    team.members.add(world["respondent"])
+    world["assignment"].actor.clear()
+    world["assignment"].actor.add(Actor.objects.get(team=team))
+    answer = questionnaire["visible_answer"]
+    selected_before = set(answer.selected_choices.values_list("id", flat=True))
+
+    client = _client(world["respondent"])
+    if write_path == "direct":
+        response = client.patch(
+            f"/api/answers/{answer.id}/",
+            {"selected_choices": []},
+            format="json",
+        )
+    else:
+        response = client.patch(
+            f"/api/requirement-assessments/{world['assigned_ra'].id}/",
+            {"answers": {questionnaire["visible_choice_question"].urn: []}},
+            format="json",
+        )
+
+    assert response.status_code == 403, response.content
+    assert set(answer.selected_choices.values_list("id", flat=True)) == selected_before
+
+
+@pytest.mark.parametrize("write_path", ("legacy_ra", "direct_value"))
+def test_legacy_choice_urn_is_reproved_after_parent_locks(
+    audit_iam_world,
+    monkeypatch,
+    write_path,
+):
+    from core.serializers import AnswerWriteSerializer
+
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Legacy choice URN writer {uuid.uuid4().hex}",
+        {"change_answer"},
+        world["child_folder"],
+    )
+    answer = questionnaire["visible_answer"]
+    selected_before = set(answer.selected_choices.values_list("id", flat=True))
+    choice = questionnaire["visible_choice"]
+    original_urn = choice.urn
+    original_lock = AnswerWriteSerializer._lock_answer_scopes
+
+    def rename_choice_before_locked_reproof(serializer, **kwargs):
+        QuestionChoice.objects.filter(id=choice.id).update(
+            urn=f"urn:test:renamed-choice:{uuid.uuid4().hex}"
+        )
+        return original_lock(serializer, **kwargs)
+
+    monkeypatch.setattr(
+        AnswerWriteSerializer,
+        "_lock_answer_scopes",
+        rename_choice_before_locked_reproof,
+    )
+    client = _client(world["respondent"])
+    if write_path == "legacy_ra":
+        response = client.patch(
+            f"/api/requirement-assessments/{world['assigned_ra'].id}/",
+            {"answers": {questionnaire["visible_choice_question"].urn: [original_urn]}},
+            format="json",
+        )
+    else:
+        response = client.patch(
+            f"/api/answers/{answer.id}/",
+            {"value": [original_urn]},
+            format="json",
+        )
+
+    assert response.status_code == 403, response.content
+    choice.refresh_from_db()
+    assert choice.urn == original_urn
+    assert set(answer.selected_choices.values_list("id", flat=True)) == selected_before
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(
+    connection.vendor != "postgresql",
+    reason="requires two real PostgreSQL connections and row-level locks",
+)
+def test_answer_batch_and_direct_write_complete_on_two_postgresql_connections(
+    audit_iam_world,
+):
+    """PostgreSQL acceptance: direct Q2 and legacy Q1+Q2 must not deadlock."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from django.db import close_old_connections
+
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    second_question = Question.objects.create(
+        requirement_node=world["assigned_requirement"],
+        urn=f"urn:test:postgres-lock-q2:{uuid.uuid4().hex}",
+        type=Question.Type.MULTIPLE_CHOICE,
+        text="Second concurrently updated question",
+        folder=world["child_folder"],
+    )
+    second_choice = QuestionChoice.objects.create(
+        question=second_question,
+        urn=f"{second_question.urn}:choice",
+        value="Second visible choice",
+        folder=world["child_folder"],
+    )
+    second_answer = Answer.objects.create(
+        requirement_assessment=world["assigned_ra"],
+        question=second_question,
+        folder=world["child_folder"],
+    )
+    second_answer.selected_choices.add(second_choice)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"PostgreSQL answer writer {uuid.uuid4().hex}",
+        {"change_answer"},
+        world["child_folder"],
+    )
+    barrier = Barrier(2)
+
+    def write(path):
+        close_old_connections()
+        try:
+            client = _client(world["respondent"])
+            barrier.wait(timeout=10)
+            if path == "legacy":
+                response = client.patch(
+                    f"/api/requirement-assessments/{world['assigned_ra'].id}/",
+                    {
+                        "answers": {
+                            questionnaire["visible_choice_question"].urn: [
+                                questionnaire["visible_choice"].urn
+                            ],
+                            second_question.urn: [second_choice.urn],
+                        }
+                    },
+                    format="json",
+                )
+            else:
+                response = client.patch(
+                    f"/api/answers/{second_answer.id}/",
+                    {"selected_choices": [str(second_choice.id)]},
+                    format="json",
+                )
+            return response.status_code, bytes(response.content)
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(write, path) for path in ("legacy", "direct")]
+        results = [future.result(timeout=30) for future in futures]
+
+    assert [status_code for status_code, _content in results] == [200, 200], results
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(
+    connection.vendor != "postgresql",
+    reason="requires two real PostgreSQL connections and row-level locks",
+)
+def test_answer_write_and_question_delete_complete_on_two_postgresql_connections(
+    audit_iam_world,
+):
+    """Acceptance only: a locked Question delete must not deadlock its Answer."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from django.db import close_old_connections, transaction
+
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"PostgreSQL delete-race answer writer {uuid.uuid4().hex}",
+        {"change_answer"},
+        world["child_folder"],
+    )
+    question = questionnaire["visible_choice_question"]
+    answer = questionnaire["visible_answer"]
+    barrier = Barrier(2)
+
+    def delete_question():
+        close_old_connections()
+        try:
+            with transaction.atomic():
+                locked_question = Question.objects.select_for_update().get(
+                    id=question.id
+                )
+                barrier.wait(timeout=10)
+                locked_question.delete()
+            return "deleted"
+        finally:
+            close_old_connections()
+
+    def write_answer():
+        close_old_connections()
+        try:
+            client = _client(world["respondent"])
+            barrier.wait(timeout=10)
+            response = client.patch(
+                f"/api/answers/{answer.id}/",
+                {"selected_choices": []},
+                format="json",
+            )
+            return response.status_code, bytes(response.content)
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        delete_future = executor.submit(delete_question)
+        write_future = executor.submit(write_answer)
+        delete_result = delete_future.result(timeout=30)
+        write_result = write_future.result(timeout=30)
+
+    assert delete_result == "deleted"
+    assert write_result[0] in (403, 404), write_result
+    assert not Question.objects.filter(id=question.id).exists()
+    assert not Answer.objects.filter(id=answer.id).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(
+    connection.vendor != "postgresql",
+    reason="requires two real PostgreSQL connections and row-level locks",
+)
+def test_answer_write_and_selected_choice_delete_complete_on_postgresql_connections(
+    audit_iam_world,
+):
+    """Acceptance only: Choice/through deletion must not deadlock Answer PATCH."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from django.db import close_old_connections, transaction
+
+    world = audit_iam_world
+    question = Question.objects.create(
+        requirement_node=world["assigned_requirement"],
+        urn=f"urn:test:postgres-choice-delete:{uuid.uuid4().hex}",
+        type=Question.Type.MULTIPLE_CHOICE,
+        text="Choice concurrently deleted during answer update",
+        folder=world["child_folder"],
+    )
+    choice = QuestionChoice.objects.create(
+        question=question,
+        urn=f"{question.urn}:choice",
+        value="Concurrently deleted choice",
+        folder=world["child_folder"],
+    )
+    answer = Answer.objects.create(
+        requirement_assessment=world["assigned_ra"],
+        question=question,
+        folder=world["child_folder"],
+    )
+    answer.selected_choices.add(choice)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"PostgreSQL choice-delete answer writer {uuid.uuid4().hex}",
+        {"change_answer"},
+        world["child_folder"],
+    )
+    barrier = Barrier(2)
+
+    def delete_choice():
+        close_old_connections()
+        try:
+            with transaction.atomic():
+                locked_choice = QuestionChoice.objects.select_for_update().get(
+                    id=choice.id
+                )
+                barrier.wait(timeout=10)
+                locked_choice.delete()
+            return "deleted"
+        finally:
+            close_old_connections()
+
+    def write_answer():
+        close_old_connections()
+        try:
+            client = _client(world["respondent"])
+            barrier.wait(timeout=10)
+            response = client.patch(
+                f"/api/answers/{answer.id}/",
+                {"selected_choices": []},
+                format="json",
+            )
+            return response.status_code, bytes(response.content)
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        delete_future = executor.submit(delete_choice)
+        write_future = executor.submit(write_answer)
+        delete_result = delete_future.result(timeout=30)
+        write_result = write_future.result(timeout=30)
+
+    assert delete_result == "deleted"
+    assert write_result[0] in (200, 400, 403, 404), write_result
+    assert not QuestionChoice.objects.filter(id=choice.id).exists()
+    through = Answer.selected_choices.through
+    assert not through.objects.filter(questionchoice_id=choice.id).exists()
+    assert Answer.objects.filter(id=answer.id).exists()
+
+
+@pytest.mark.parametrize(
+    ("guard", "expected_status"),
+    [
+        ("locked", 400),
+        ("in_review", 400),
+        ("terminal_assignment", 400),
+        ("read_only", 403),
+    ],
+)
+def test_legacy_ra_answers_recheck_locked_authority_before_any_write(
+    audit_iam_world,
+    monkeypatch,
+    guard,
+    expected_status,
+):
+    """Exercise a lock-boundary recheck, not PostgreSQL concurrency semantics."""
+    from core.serializers import AnswerWriteSerializer
+
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Legacy answer lock-boundary writer {uuid.uuid4().hex}",
+        {"change_answer"},
+        world["child_folder"],
+    )
+    replacement = QuestionChoice.objects.create(
+        question=questionnaire["visible_choice_question"],
+        urn=f"urn:test:legacy-lock-boundary:{uuid.uuid4().hex}",
+        value="Must not be committed",
+        folder=world["child_folder"],
+    )
+    original_lock = AnswerWriteSerializer._lock_answer_scopes
+
+    def change_guard_before_locked_reproof(serializer, **kwargs):
+        if guard == "locked":
+            ComplianceAssessment.objects.filter(id=world["target"].id).update(
+                is_locked=True
+            )
+        elif guard == "in_review":
+            ComplianceAssessment.objects.filter(id=world["target"].id).update(
+                status=ComplianceAssessment.Status.IN_REVIEW
+            )
+        elif guard == "terminal_assignment":
+            RequirementAssignment.objects.filter(id=world["assignment"].id).update(
+                status=RequirementAssignment.Status.SUBMITTED
+            )
+        else:
+            ComplianceAssessment.objects.filter(id=world["target"].id).update(
+                field_visibility={
+                    **world["target"].field_visibility,
+                    "answers": {"auditor": "edit", "respondent": "read"},
+                }
+            )
+        return original_lock(serializer, **kwargs)
+
+    monkeypatch.setattr(
+        AnswerWriteSerializer,
+        "_lock_answer_scopes",
+        change_guard_before_locked_reproof,
+    )
+    answer = questionnaire["visible_answer"]
+    selected_before = set(answer.selected_choices.values_list("id", flat=True))
+    response = _client(world["respondent"]).patch(
+        f"/api/requirement-assessments/{world['assigned_ra'].id}/",
+        {"answers": {questionnaire["visible_choice_question"].urn: [replacement.urn]}},
+        format="json",
+    )
+
+    assert response.status_code == expected_status, response.content
+    assert set(answer.selected_choices.values_list("id", flat=True)) == selected_before
+
+
+@pytest.mark.parametrize(
+    "write_path", ["legacy_update", "direct_update", "direct_delete"]
+)
+def test_answer_writes_reject_inverse_corrupt_child_folder_authority(
+    audit_iam_world,
+    write_path,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    answer = questionnaire["visible_answer"]
+    # Model the dangerous corruption direction: the parent moves to a protected
+    # domain while the child remains in a domain where the caller can write.
+    world["assigned_ra"].folder = world["hidden_folder"]
+    world["assigned_ra"].save(update_fields=["folder"])
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Protected RA reader and editor {uuid.uuid4().hex}",
+        {"view_requirementassessment", "change_requirementassessment"},
+        world["hidden_folder"],
+        is_recursive=False,
+    )
+    _grant(
+        world["respondent"],
+        f"Corrupt child answer writer {uuid.uuid4().hex}",
+        {"change_answer", "delete_answer"},
+        world["child_folder"],
+    )
+    client = _client(world["respondent"])
+    selected_before = set(answer.selected_choices.values_list("id", flat=True))
+
+    if write_path == "legacy_update":
+        response = client.patch(
+            f"/api/requirement-assessments/{world['assigned_ra'].id}/",
+            {
+                "answers": {
+                    questionnaire["visible_choice_question"].urn: [
+                        questionnaire["visible_choice"].urn
+                    ]
+                }
+            },
+            format="json",
+        )
+    elif write_path == "direct_update":
+        response = client.patch(
+            f"/api/answers/{answer.id}/",
+            {"selected_choices": []},
+            format="json",
+        )
+    else:
+        response = client.delete(f"/api/answers/{answer.id}/")
+
+    assert response.status_code == 403, response.content
+    assert Answer.objects.filter(id=answer.id).exists()
+    assert set(answer.selected_choices.values_list("id", flat=True)) == selected_before
+
+
+def test_legacy_ra_existing_answer_checks_the_answers_own_folder(
+    audit_iam_world,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Hidden answer reader {uuid.uuid4().hex}",
+        {"view_answer"},
+        world["hidden_folder"],
+        is_recursive=False,
+    )
+    _grant(
+        world["respondent"],
+        f"Child answer editor {uuid.uuid4().hex}",
+        {"change_answer"},
+        world["child_folder"],
+    )
+    hidden_answer = questionnaire["hidden_answer"]
+    response = _client(world["respondent"]).patch(
+        f"/api/requirement-assessments/{world['assigned_ra'].id}/",
+        {"answers": {questionnaire["hidden_answer_question"].urn: "changed"}},
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    hidden_answer.refresh_from_db()
+    assert hidden_answer.value == "hidden answer"
+
+
+@pytest.mark.parametrize("write_path", ["legacy_ra", "answer_api"])
+def test_multiple_choice_update_replaces_visible_slice_and_preserves_hidden_choice(
+    audit_iam_world,
+    write_path,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Questionnaire answer editor {uuid.uuid4().hex}",
+        {"change_answer"},
+        world["child_folder"],
+    )
+    replacement = QuestionChoice.objects.create(
+        question=questionnaire["visible_choice_question"],
+        urn=f"{questionnaire['visible_choice_question'].urn}:replacement",
+        ref_id="QC-VISIBLE-REPLACEMENT",
+        value="Visible replacement",
+        folder=world["child_folder"],
+    )
+    answer = questionnaire["visible_answer"]
+    client = _client(world["respondent"])
+
+    if write_path == "legacy_ra":
+        response = client.patch(
+            f"/api/requirement-assessments/{world['assigned_ra'].id}/",
+            {
+                "answers": {
+                    questionnaire["visible_choice_question"].urn: [replacement.urn]
+                }
+            },
+            format="json",
+        )
+    else:
+        response = client.patch(
+            f"/api/answers/{answer.id}/",
+            {"selected_choices": [str(replacement.id)]},
+            format="json",
+        )
+
+    assert response.status_code == 200, response.content
+    assert set(answer.selected_choices.values_list("id", flat=True)) == {
+        replacement.id,
+        questionnaire["hidden_choice"].id,
+    }
+    assert str(questionnaire["hidden_choice"].id).encode() not in response.content
+    assert questionnaire["hidden_choice"].value.encode() not in response.content
+    if write_path == "legacy_ra":
+        assert response.json()["answers"][
+            questionnaire["visible_choice_question"].urn
+        ] == [replacement.urn]
+        returned_choice_urns = {
+            choice["urn"]
+            for choice in response.json()["requirement"]["questions"][
+                questionnaire["visible_choice_question"].urn
+            ]["choices"]
+        }
+        assert questionnaire["hidden_choice"].urn not in returned_choice_urns
+    else:
+        assert _related_ids(response.json()["selected_choices"]) == {
+            str(replacement.id)
+        }
+
+
+@pytest.mark.parametrize("write_path", ["legacy_ra", "answer_api"])
+@pytest.mark.parametrize("clear_selection", [False, True])
+def test_unique_choice_update_fails_closed_when_existing_choice_is_hidden(
+    audit_iam_world,
+    write_path,
+    clear_selection,
+):
+    world = audit_iam_world
+    questionnaire = _build_questionnaire_iam_fixture(world)
+    _grant_questionnaire_read(world["respondent"], world["child_folder"])
+    _grant(
+        world["respondent"],
+        f"Questionnaire answer editor {uuid.uuid4().hex}",
+        {"change_answer"},
+        world["child_folder"],
+    )
+    question = questionnaire["hidden_choice_write_question"]
+    hidden_choice = questionnaire["hidden_write_choice"]
+    visible_choice = QuestionChoice.objects.create(
+        question=question,
+        urn=f"{question.urn}:visible-replacement",
+        ref_id="QC-UNIQUE-VISIBLE-REPLACEMENT",
+        value="Visible unique replacement",
+        folder=world["child_folder"],
+    )
+    answer = Answer.objects.create(
+        requirement_assessment=world["assigned_ra"],
+        question=question,
+        folder=world["child_folder"],
+    )
+    answer.selected_choices.add(hidden_choice)
+    client = _client(world["respondent"])
+
+    if write_path == "legacy_ra":
+        response = client.patch(
+            f"/api/requirement-assessments/{world['assigned_ra'].id}/",
+            {"answers": {question.urn: "" if clear_selection else visible_choice.urn}},
+            format="json",
+        )
+    else:
+        response = client.patch(
+            f"/api/answers/{answer.id}/",
+            {"selected_choices": ([] if clear_selection else [str(visible_choice.id)])},
+            format="json",
+        )
+
+    assert response.status_code == 403, response.content
+    assert set(answer.selected_choices.values_list("id", flat=True)) == {
+        hidden_choice.id
+    }
+    assert str(hidden_choice.id).encode() not in response.content
+    assert hidden_choice.urn.encode() not in response.content
+    assert hidden_choice.value.encode() not in response.content
 
 
 def test_legacy_ra_answers_patch_fails_closed_on_hidden_question_choice_and_answer(
@@ -1975,6 +4222,59 @@ def test_requirement_suggestions_filter_hidden_reference_and_applied_controls(
     assert set(linked_controls.values_list("reference_control_id", flat=True)) == {
         visible_reference.id
     }
+
+
+def test_requirement_suggestions_exclude_policy_reference_controls(
+    audit_iam_world,
+):
+    world = audit_iam_world
+    target = world["target"]
+    target.field_visibility = {
+        **target.field_visibility,
+        "applied_controls": {"auditor": "edit", "respondent": "edit"},
+    }
+    target.save(update_fields=["field_visibility"])
+    policy_reference = ReferenceControl.objects.create(
+        name="Policy suggestion reference",
+        ref_id="POLICY-SUGGESTION",
+        urn=f"urn:test:reference:{uuid.uuid4().hex}",
+        folder=world["child_folder"],
+        category="policy",
+        csf_function="govern",
+    )
+    world["assigned_requirement"].reference_controls.add(policy_reference)
+    _grant(
+        world["respondent"],
+        f"Non-policy suggestion creator {uuid.uuid4().hex}",
+        {"add_appliedcontrol"},
+        world["child_folder"],
+    )
+    client = _client(world["respondent"])
+    url = (
+        f"/api/requirement-assessments/{world['assigned_ra'].id}/"
+        "suggestions/applied-controls/"
+    )
+
+    preview = client.get(url, {"dry_run": "true"})
+    apply_response = client.post(
+        url,
+        {"selected_reference_control_ids": [str(policy_reference.id)]},
+        format="json",
+    )
+
+    assert preview.status_code == 200, preview.content
+    assert apply_response.status_code == 200, apply_response.content
+    assert preview.json() == []
+    assert apply_response.json() == []
+    assert not AppliedControl.objects.filter(
+        folder=world["child_folder"],
+        reference_control=policy_reference,
+    ).exists()
+    assert (
+        not world["assigned_ra"]
+        .applied_controls.filter(reference_control=policy_reference)
+        .exists()
+    )
 
 
 def test_quality_check_requires_full_view_and_emits_minimal_subjects(
@@ -2620,6 +4920,12 @@ def test_word_report_generation_does_not_print_sensitive_report_values(
 ):
     world = audit_iam_world
     _enable_complete_word_report(world)
+    _grant(
+        world["auditor"],
+        "word-report-policy-reader",
+        {"view_policy"},
+        world["child_folder"],
+    )
     category_secret = f"CATEGORY-SECRET-{uuid.uuid4().hex}"
     control_secret = f"CONTROL-SECRET-{uuid.uuid4().hex}"
     section = RequirementNode.objects.get(

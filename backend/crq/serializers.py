@@ -1,13 +1,18 @@
-from django.db import transaction
-from rest_framework import serializers
+import json
+
+from core.requirement_assessment_relationships import (
+    RequirementAssessmentRelationshipProjectionListSerializer,
+    RequirementAssessmentRelationshipProjectionMixin,
+)
 from core.serializer_fields import FieldsRelatedField
 from core.serializers import (
-    BaseModelSerializer,
     ActionPlanSerializer,
+    BaseModelSerializer,
 )
-from core.models import AppliedControl
 from core.utils import get_global_currency
+from django.db import transaction
 from pmbok.models import GenericCollection
+from rest_framework import serializers
 from threat_modeling.models import ThreatModel
 
 from .models import (
@@ -15,7 +20,6 @@ from .models import (
     QuantitativeRiskScenario,
     QuantitativeRiskStudy,
 )
-import json
 
 
 class ImpactField(serializers.Field):
@@ -440,49 +444,74 @@ class QuantitativeRiskHypothesisReadSerializer(BaseModelSerializer):
         fields = "__all__"
 
 
-class QuantitativeRiskStudyActionPlanSerializer(ActionPlanSerializer):
+_ACTION_PLAN_SCENARIOS_CONTEXT_KEY = "_visible_crq_action_plan_scenarios"
+
+
+def _prefetched_action_plan_scenarios(control, study_id):
+    """Read only the view's authorized hypothesis prefetch, never the raw M2M."""
+
+    scenarios = []
+    seen_scenario_ids = set()
+    for hypothesis in getattr(control, "action_plan_quantitative_hypotheses", ()):
+        scenario = hypothesis.quantitative_risk_scenario
+        if str(scenario.quantitative_risk_study_id) != str(study_id):
+            continue
+        if (
+            hypothesis.folder_id != scenario.folder_id
+            or scenario.folder_id != scenario.quantitative_risk_study.folder_id
+        ):
+            continue
+        if scenario.id in seen_scenario_ids:
+            continue
+        seen_scenario_ids.add(scenario.id)
+        scenarios.append(scenario)
+    return tuple(scenarios)
+
+
+class QuantitativeRiskStudyActionPlanListSerializer(
+    RequirementAssessmentRelationshipProjectionListSerializer
+):
+    """Batch the already-authorized scenario projection into child context."""
+
+    def to_representation(self, data):
+        iterable = data.all() if hasattr(data, "all") else data
+        instances = list(iterable)
+        study_id = self.context.get("pk")
+        self.context[_ACTION_PLAN_SCENARIOS_CONTEXT_KEY] = {
+            control.pk: _prefetched_action_plan_scenarios(control, study_id)
+            for control in instances
+        }
+        return super().to_representation(instances)
+
+
+class QuantitativeRiskStudyActionPlanSerializer(
+    RequirementAssessmentRelationshipProjectionMixin,
+    ActionPlanSerializer,
+):
     """
     Serializer for CRQ action plan that shows controls with the scenarios they affect.
     """
 
     quantitative_risk_scenarios = serializers.SerializerMethodField()
 
+    class Meta(ActionPlanSerializer.Meta):
+        list_serializer_class = QuantitativeRiskStudyActionPlanListSerializer
+
     def get_quantitative_risk_scenarios(self, obj):
-        """
-        Get the quantitative risk scenarios affected by this control.
-        """
+        """Return only scenarios pre-authorized by the action-plan view."""
         pk = self.context.get("pk")
         if pk is None:
             return []
-
-        # Find hypotheses in this study that have this control as added control
-        from .models import QuantitativeRiskStudy
-
-        try:
-            study = QuantitativeRiskStudy.objects.get(id=pk)
-            scenarios = study.risk_scenarios.all()
-
-            # Get hypotheses that have this control added
-            hypotheses_with_control = QuantitativeRiskHypothesis.objects.filter(
-                quantitative_risk_scenario__in=scenarios, added_applied_controls=obj
-            )
-
-            # Get unique scenarios from these hypotheses
-            affected_scenarios = []
-            seen_scenario_ids = set()
-
-            for hypothesis in hypotheses_with_control:
-                scenario = hypothesis.quantitative_risk_scenario
-                if scenario.id not in seen_scenario_ids:
-                    seen_scenario_ids.add(scenario.id)
-                    affected_scenarios.append(
-                        {
-                            "str": f"{scenario.ref_id} - {scenario.name}",
-                            "id": str(scenario.id),
-                        }
-                    )
-
-            return affected_scenarios
-
-        except Exception:
-            return []
+        scenarios_by_control = self.context.get(_ACTION_PLAN_SCENARIOS_CONTEXT_KEY)
+        scenarios = (
+            _prefetched_action_plan_scenarios(obj, pk)
+            if scenarios_by_control is None
+            else scenarios_by_control.get(obj.pk, ())
+        )
+        return [
+            {
+                "str": f"{scenario.ref_id} - {scenario.name}",
+                "id": str(scenario.id),
+            }
+            for scenario in scenarios
+        ]

@@ -17,8 +17,11 @@ from django.contrib.contenttypes.models import ContentType
 from django.db import close_old_connections, connection, connections
 from django.db.models import QuerySet
 from django.utils import timezone
+from global_settings.models import GlobalSettings
 from iam.models import Folder, Role, RoleAssignment, User
+from rest_framework.exceptions import PermissionDenied
 from structlog.testing import capture_logs
+from tprm.models import Entity
 
 from core.assignment_mailing import (
     CLAIM_TIMEOUT,
@@ -30,11 +33,15 @@ from core.assignment_mailing import (
 from core.models import (
     Actor,
     ComplianceAssessment,
+    Framework,
+    RequirementAssessment,
     RequirementAssignment,
     RequirementAssignmentEvent,
     RequirementAssignmentMailOutbox,
+    RequirementNode,
     Team,
 )
+from core.serializers import RequirementAssignmentWriteSerializer
 from core.tasks import (
     deliver_requirement_assignment_mail,
     sweep_requirement_assignment_mail_outbox,
@@ -46,6 +53,7 @@ from core.tests.test_compliance_assessment_tree_iam import (
 from core.tests.test_compliance_assessment_tree_iam import (
     audit_iam_world as _audit_iam_world_fixture,
 )
+from iam.service_accounts import provision_service_account
 
 pytestmark = pytest.mark.django_db
 audit_iam_world = _audit_iam_world_fixture
@@ -74,7 +82,12 @@ def mailing_world(audit_iam_world, settings):
     _grant(
         world["auditor"],
         f"Mail outbox authority {uuid.uuid4().hex}",
-        {"transition_requirementassignment", "view_user"},
+        {
+            "add_requirementassignment",
+            "transition_requirementassignment",
+            "view_entity",
+            "view_user",
+        },
         world["child_folder"],
     )
     return {
@@ -109,6 +122,542 @@ def _track_row_lock_models(monkeypatch) -> list[tuple[type, dict]]:
 
     monkeypatch.setattr(QuerySet, "select_for_update", tracked_select_for_update)
     return locked_models
+
+
+def test_requirement_assignment_parent_fields_accept_same_values_and_create(
+    mailing_world,
+):
+    assignment = mailing_world["assignment"]
+    serializer = RequirementAssignmentWriteSerializer(
+        assignment,
+        data={
+            "compliance_assessment": str(assignment.compliance_assessment_id),
+            "folder": str(assignment.folder_id),
+        },
+        partial=True,
+    )
+
+    serializer.is_valid(raise_exception=True)
+    assert serializer.validated_data["compliance_assessment"].id == (
+        assignment.compliance_assessment_id
+    )
+    assert "folder" not in serializer.validated_data
+    updated = serializer.save()
+    updated.refresh_from_db()
+    assert updated.compliance_assessment_id == mailing_world["target"].id
+    assert updated.folder_id == mailing_world["child_folder"].id
+
+    create_response = _client(mailing_world["auditor"]).post(
+        "/api/requirement-assignments/",
+        {
+            "compliance_assessment": str(mailing_world["target"].id),
+            "folder": str(mailing_world["child_folder"].id),
+            "actor": [str(mailing_world["author_actor"].id)],
+            "requirement_assessments": [str(mailing_world["unassigned_ra"].id)],
+        },
+        format="json",
+    )
+    assert create_response.status_code == 201, create_response.content
+    created = RequirementAssignment.objects.get(id=create_response.json()["id"])
+    assert created.compliance_assessment_id == mailing_world["target"].id
+    assert created.folder_id == mailing_world["child_folder"].id
+    assert set(created.requirement_assessments.values_list("id", flat=True)) == {
+        mailing_world["unassigned_ra"].id
+    }
+
+
+@pytest.mark.parametrize(
+    "assessment_value",
+    ("hidden", "missing", "malformed"),
+)
+def test_requirement_assignment_create_parent_oracle_and_blind_write_are_closed(
+    mailing_world,
+    assessment_value,
+):
+    values = {
+        "hidden": str(mailing_world["ancestor"].id),
+        "missing": str(uuid.uuid4()),
+        "malformed": "not-a-uuid",
+    }
+    assignment_count = RequirementAssignment.objects.count()
+
+    response = _client(mailing_world["auditor"]).post(
+        "/api/requirement-assignments/",
+        {
+            "compliance_assessment": values[assessment_value],
+            # The old boundary authorized only this caller-controlled folder,
+            # allowing a hidden CA to be linked across IAM domains.
+            "folder": str(mailing_world["child_folder"].id),
+            "actor": [str(mailing_world["author_actor"].id)],
+            "requirement_assessments": [],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert response.json() == {
+        "detail": "The requested assignment parent is unavailable."
+    }
+    assert RequirementAssignment.objects.count() == assignment_count
+
+
+@pytest.mark.parametrize(
+    "folder_value",
+    ("hidden", "missing", "malformed"),
+)
+def test_requirement_assignment_create_folder_is_bound_to_assessment(
+    mailing_world,
+    folder_value,
+):
+    values = {
+        "hidden": str(mailing_world["hidden_folder"].id),
+        "missing": str(uuid.uuid4()),
+        "malformed": "not-a-uuid",
+    }
+    assignment_count = RequirementAssignment.objects.count()
+
+    response = _client(mailing_world["auditor"]).post(
+        "/api/requirement-assignments/",
+        {
+            "compliance_assessment": str(mailing_world["target"].id),
+            "folder": values[folder_value],
+            "actor": [str(mailing_world["author_actor"].id)],
+            "requirement_assessments": [],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert response.json() == {
+        "detail": "The requested assignment parent is unavailable."
+    }
+    assert RequirementAssignment.objects.count() == assignment_count
+
+
+@pytest.mark.parametrize(
+    "actor_value",
+    ("hidden", "missing", "malformed"),
+)
+def test_requirement_assignment_create_actor_uuid_oracle_is_closed(
+    mailing_world,
+    actor_value,
+):
+    _, hidden_actor = _make_author("hidden-actor", mailing_world["hidden_folder"])
+    values = {
+        "hidden": str(hidden_actor.id),
+        "missing": str(uuid.uuid4()),
+        "malformed": "not-a-uuid",
+    }
+    assignment_count = RequirementAssignment.objects.count()
+
+    response = _client(mailing_world["auditor"]).post(
+        "/api/requirement-assignments/",
+        {
+            "compliance_assessment": str(mailing_world["target"].id),
+            "folder": str(mailing_world["child_folder"].id),
+            "actor": [values[actor_value]],
+            "requirement_assessments": [],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert response.json() == {
+        "detail": "One or more assignment relationships are unavailable."
+    }
+    assert RequirementAssignment.objects.count() == assignment_count
+
+
+@pytest.mark.parametrize(
+    "requirement_assessment_value",
+    ("hidden", "missing", "malformed"),
+)
+def test_requirement_assignment_create_ra_uuid_oracle_is_closed(
+    mailing_world,
+    requirement_assessment_value,
+):
+    values = {
+        "hidden": str(mailing_world["ancestor_ra"].id),
+        "missing": str(uuid.uuid4()),
+        "malformed": "not-a-uuid",
+    }
+    assignment_count = RequirementAssignment.objects.count()
+
+    response = _client(mailing_world["auditor"]).post(
+        "/api/requirement-assignments/",
+        {
+            "compliance_assessment": str(mailing_world["target"].id),
+            "folder": str(mailing_world["child_folder"].id),
+            "actor": [str(mailing_world["author_actor"].id)],
+            "requirement_assessments": [values[requirement_assessment_value]],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert response.json() == {
+        "detail": "One or more assignment relationships are unavailable."
+    }
+    assert RequirementAssignment.objects.count() == assignment_count
+
+
+@pytest.mark.parametrize(
+    "requirement_assessment_value",
+    ("product_hidden", "missing", "malformed"),
+)
+def test_requirement_assignment_create_product_hidden_ra_is_not_linked(
+    mailing_world,
+    requirement_assessment_value,
+):
+    delegator, delegator_actor = _make_author(
+        "assignment-delegator", mailing_world["child_folder"]
+    )
+    _grant(
+        delegator,
+        f"Restricted assignment creator {uuid.uuid4().hex}",
+        {
+            "add_requirementassignment",
+            "view_complianceassessment",
+            "view_requirementassessment",
+            "view_user",
+        },
+        mailing_world["child_folder"],
+    )
+    values = {
+        # Folder IAM can resolve this row, but the non-full viewer has no
+        # assignment that exposes it through the product's RA boundary.
+        "product_hidden": str(mailing_world["unassigned_ra"].id),
+        "missing": str(uuid.uuid4()),
+        "malformed": "not-a-uuid",
+    }
+    assignment_count = RequirementAssignment.objects.count()
+
+    response = _client(delegator).post(
+        "/api/requirement-assignments/",
+        {
+            "compliance_assessment": str(mailing_world["target"].id),
+            "folder": str(mailing_world["child_folder"].id),
+            "actor": [str(delegator_actor.id)],
+            "requirement_assessments": [values[requirement_assessment_value]],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert response.json() == {
+        "detail": "One or more assignment relationships are unavailable."
+    }
+    assert RequirementAssignment.objects.count() == assignment_count
+
+
+@pytest.mark.parametrize(
+    "requirement_assessment_value",
+    ("hidden_chain", "missing", "malformed"),
+)
+@pytest.mark.parametrize("hidden_parent", ("framework", "requirement_node"))
+def test_requirement_assignment_create_requires_complete_ra_parent_visibility(
+    mailing_world,
+    requirement_assessment_value,
+    hidden_parent,
+):
+    creator, creator_actor = _make_author(
+        f"assignment-{hidden_parent}-creator", mailing_world["child_folder"]
+    )
+    child_permissions = {
+        "add_requirementassignment",
+        "view_complianceassessment",
+        "view_compliance_assessment_full",
+        "view_requirementassessment",
+        "view_user",
+    }
+    if hidden_parent != "framework":
+        child_permissions.add("view_framework")
+    _grant(
+        creator,
+        f"Assignment {hidden_parent} parent authority {uuid.uuid4().hex}",
+        child_permissions,
+        mailing_world["child_folder"],
+    )
+    if hidden_parent != "requirement_node":
+        _grant(
+            creator,
+            f"Assignment node authority {uuid.uuid4().hex}",
+            {"view_requirementnode"},
+            Folder.get_root_folder(),
+            is_recursive=False,
+        )
+    values = {
+        "hidden_chain": str(mailing_world["unassigned_ra"].id),
+        "missing": str(uuid.uuid4()),
+        "malformed": "not-a-uuid",
+    }
+    assignment_count = RequirementAssignment.objects.count()
+
+    response = _client(creator).post(
+        "/api/requirement-assignments/",
+        {
+            "compliance_assessment": str(mailing_world["target"].id),
+            "folder": str(mailing_world["child_folder"].id),
+            "actor": [str(creator_actor.id)],
+            "requirement_assessments": [values[requirement_assessment_value]],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert response.json() == {
+        "detail": "One or more assignment relationships are unavailable."
+    }
+    assert RequirementAssignment.objects.count() == assignment_count
+
+
+@pytest.mark.parametrize(
+    "requirement_assessment_value",
+    ("mismatched_framework", "missing", "malformed"),
+)
+def test_requirement_assignment_create_rejects_mismatched_ra_framework(
+    mailing_world,
+    requirement_assessment_value,
+):
+    foreign_framework = Framework.objects.create(
+        name="Foreign assignment framework",
+        urn=f"urn:test:assignment-framework:{uuid.uuid4().hex}",
+        ref_id="ASSIGNMENT-FOREIGN",
+        folder=mailing_world["child_folder"],
+        min_score=0,
+        max_score=4,
+    )
+    foreign_requirement = RequirementNode.objects.create(
+        name="Foreign assignment requirement",
+        urn=f"{foreign_framework.urn}:requirement",
+        ref_id="ASSIGNMENT-FOREIGN-REQ",
+        framework=foreign_framework,
+        folder=Folder.get_root_folder(),
+        assessable=True,
+    )
+    corrupt_ra = RequirementAssessment.objects.create(
+        compliance_assessment=mailing_world["target"],
+        requirement=foreign_requirement,
+        folder=mailing_world["child_folder"],
+    )
+    values = {
+        "mismatched_framework": str(corrupt_ra.id),
+        "missing": str(uuid.uuid4()),
+        "malformed": "not-a-uuid",
+    }
+    assignment_count = RequirementAssignment.objects.count()
+
+    response = _client(mailing_world["auditor"]).post(
+        "/api/requirement-assignments/",
+        {
+            "compliance_assessment": str(mailing_world["target"].id),
+            "folder": str(mailing_world["child_folder"].id),
+            "actor": [str(mailing_world["author_actor"].id)],
+            "requirement_assessments": [values[requirement_assessment_value]],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert response.json() == {
+        "detail": "One or more assignment relationships are unavailable."
+    }
+    assert RequirementAssignment.objects.count() == assignment_count
+
+
+@pytest.mark.parametrize(
+    "actor_value",
+    ("service_account", "missing", "malformed"),
+)
+def test_requirement_assignment_create_rejects_service_account_actor(
+    mailing_world,
+    actor_value,
+):
+    service_account, _ = provision_service_account(
+        name=f"assignment-service-account-{uuid.uuid4().hex}",
+        description="Synthetic assignment boundary test",
+        permission_ids=[],
+        folder_ids=[mailing_world["child_folder"].id],
+        is_recursive=False,
+        created_by=mailing_world["auditor"],
+    )
+    service_account.user.folder = mailing_world["child_folder"]
+    service_account.user.save(update_fields=["folder"])
+    service_actor, _ = Actor.objects.get_or_create(user=service_account.user)
+    values = {
+        "service_account": str(service_actor.id),
+        "missing": str(uuid.uuid4()),
+        "malformed": "not-a-uuid",
+    }
+    assignment_count = RequirementAssignment.objects.count()
+
+    response = _client(mailing_world["auditor"]).post(
+        "/api/requirement-assignments/",
+        {
+            "compliance_assessment": str(mailing_world["target"].id),
+            "folder": str(mailing_world["child_folder"].id),
+            "actor": [values[actor_value]],
+            "requirement_assessments": [],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert response.json() == {
+        "detail": "One or more assignment relationships are unavailable."
+    }
+    assert RequirementAssignment.objects.count() == assignment_count
+
+
+@pytest.mark.parametrize(
+    "actor_value",
+    ("disabled_entity", "missing", "malformed"),
+)
+def test_requirement_assignment_create_hides_entity_actor_when_disabled(
+    mailing_world,
+    actor_value,
+):
+    general, _ = GlobalSettings.objects.get_or_create(
+        name=GlobalSettings.Names.GENERAL,
+        defaults={"value": {}},
+    )
+    general.value = {
+        **(general.value or {}),
+        "allow_assignments_to_entities": False,
+    }
+    general.save(update_fields=["value"])
+    entity = Entity.objects.create(
+        name=f"Disabled assignment entity {uuid.uuid4().hex}",
+        folder=mailing_world["child_folder"],
+    )
+    values = {
+        "disabled_entity": str(entity.actor.id),
+        "missing": str(uuid.uuid4()),
+        "malformed": "not-a-uuid",
+    }
+    assignment_count = RequirementAssignment.objects.count()
+
+    response = _client(mailing_world["auditor"]).post(
+        "/api/requirement-assignments/",
+        {
+            "compliance_assessment": str(mailing_world["target"].id),
+            "folder": str(mailing_world["child_folder"].id),
+            "actor": [values[actor_value]],
+            "requirement_assessments": [],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 403, response.content
+    assert response.json() == {
+        "detail": "One or more assignment relationships are unavailable."
+    }
+    assert RequirementAssignment.objects.count() == assignment_count
+
+
+def test_requirement_assignment_create_accepts_entity_actor_when_enabled(
+    mailing_world,
+):
+    general, _ = GlobalSettings.objects.get_or_create(
+        name=GlobalSettings.Names.GENERAL,
+        defaults={"value": {}},
+    )
+    general.value = {
+        **(general.value or {}),
+        "allow_assignments_to_entities": True,
+    }
+    general.save(update_fields=["value"])
+    entity = Entity.objects.create(
+        name=f"Enabled assignment entity {uuid.uuid4().hex}",
+        folder=mailing_world["child_folder"],
+    )
+
+    response = _client(mailing_world["auditor"]).post(
+        "/api/requirement-assignments/",
+        {
+            "compliance_assessment": str(mailing_world["target"].id),
+            "folder": str(mailing_world["child_folder"].id),
+            "actor": [str(entity.actor.id)],
+            "requirement_assessments": [],
+        },
+        format="json",
+    )
+
+    assert response.status_code == 201, response.content
+    assignment = RequirementAssignment.objects.get(id=response.json()["id"])
+    assert set(assignment.actor.values_list("id", flat=True)) == {entity.actor.id}
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement_key"),
+    (
+        ("compliance_assessment", "ancestor"),
+        ("folder", "hidden_folder"),
+    ),
+)
+def test_requirement_assignment_parent_fields_reject_reparenting(
+    mailing_world,
+    field_name,
+    replacement_key,
+):
+    assignment = mailing_world["assignment"]
+    original_assessment_id = assignment.compliance_assessment_id
+    original_folder_id = assignment.folder_id
+    serializer = RequirementAssignmentWriteSerializer(
+        assignment,
+        data={field_name: str(mailing_world[replacement_key].id)},
+        partial=True,
+    )
+
+    with pytest.raises(PermissionDenied):
+        serializer.is_valid(raise_exception=True)
+
+    assignment.refresh_from_db()
+    assert assignment.compliance_assessment_id == original_assessment_id
+    assert assignment.folder_id == original_folder_id
+
+
+@pytest.mark.parametrize(
+    ("field_name", "hidden_key"),
+    (
+        ("compliance_assessment", "ancestor"),
+        ("folder", "hidden_folder"),
+    ),
+)
+def test_requirement_assignment_parent_uuid_oracle_is_closed(
+    mailing_world,
+    field_name,
+    hidden_key,
+):
+    assignment = mailing_world["assignment"]
+    original_parent_ids = (
+        assignment.compliance_assessment_id,
+        assignment.folder_id,
+    )
+    original_row = RequirementAssignment.objects.values().get(id=assignment.id)
+    details = []
+
+    for value in (
+        str(mailing_world[hidden_key].id),
+        str(uuid.uuid4()),
+        "not-a-uuid",
+    ):
+        serializer = RequirementAssignmentWriteSerializer(
+            assignment,
+            data={field_name: value},
+            partial=True,
+        )
+        with pytest.raises(PermissionDenied) as exc_info:
+            serializer.is_valid(raise_exception=True)
+        details.append(exc_info.value.detail)
+
+    assert details == ["The requested relationship is unavailable."] * 3
+    assignment.refresh_from_db()
+    assert (
+        assignment.compliance_assessment_id,
+        assignment.folder_id,
+    ) == original_parent_ids
+    assert RequirementAssignment.objects.values().get(id=assignment.id) == original_row
 
 
 def test_queue_and_delivery_use_parent_first_lock_order_and_terminal_status(

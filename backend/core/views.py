@@ -65,6 +65,7 @@ from django.db.models.functions import Lower
 from docxtpl import DocxTemplate
 from jinja2.sandbox import SandboxedEnvironment
 from integrations.models import SyncMapping
+from integrations.settings_access import integration_sync_fingerprint
 from integrations.tasks import sync_object_to_integrations
 from webhooks.service import dispatch_webhook_event
 from .generators import gen_audit_context
@@ -80,6 +81,12 @@ from django.core.cache import cache
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from core.constants import LEGACY_TTP_LIBRARIES
 from core.permissions import FeatureFlagRequired
+from core.questionnaire_visibility import QuestionnaireVisibilityContext
+from core.risk_action_sync import (
+    RiskActionSyncInputSerializer,
+    sync_risk_assessment_actions,
+    sync_risk_scenario_actions,
+)
 from core.helpers import get_instance_metrics
 from core.instance_metrics import (
     nb_users_gauge,
@@ -143,6 +150,7 @@ from rest_framework.response import Response
 from rest_framework.utils.serializer_helpers import ReturnDict
 from rest_framework.views import APIView
 from rest_framework.exceptions import (
+    APIException,
     NotFound,
     PermissionDenied,
     ValidationError as DRFValidationError,
@@ -1348,6 +1356,61 @@ def actor_prefetch(field_name: str) -> Prefetch:
     )
 
 
+def _optimized_applied_control_action_queryset(queryset):
+    """Bound relation loading for the unpaginated todo/review actions."""
+
+    from custom_fields.models import CustomFieldValue
+
+    return queryset.select_related("folder", "reference_control").prefetch_related(
+        actor_prefetch("owner"),
+        "filtering_labels__folder",
+        "findings",
+        "evidences",
+        "objectives",
+        "assets",
+        "security_exceptions",
+        "incidents",
+        "stakeholders",
+        "task_templates",
+        Prefetch(
+            "custom_field_values",
+            queryset=CustomFieldValue.objects.select_related("definition"),
+            to_attr="_bulk_custom_field_values",
+        ),
+    )
+
+
+def filter_caller_visible_applied_controls(queryset, user):
+    """Apply the permission model that owns each concrete control row.
+
+    Policy is a permission-bearing proxy over the AppliedControl table. A
+    caller's generic applied-control permission must therefore never make a
+    policy row visible (and policy permission must not make ordinary controls
+    visible). Relationship-driven endpoints use this helper so they cannot
+    bypass that discriminator-aware authority boundary.
+    """
+
+    visible_control_ids = RoleAssignment.get_viewable_object_ids(user, AppliedControl)
+    visible_policy_ids = RoleAssignment.get_viewable_object_ids(user, Policy)
+    return queryset.filter(
+        Q(category="policy", id__in=visible_policy_ids)
+        | (~Q(category="policy") & Q(id__in=visible_control_ids))
+    )
+
+
+def filter_caller_changeable_applied_controls(queryset, user):
+    """Apply discriminator-aware change authority to control-table rows."""
+
+    changeable_control_ids = RoleAssignment.get_changeable_object_ids(
+        user, AppliedControl
+    )
+    changeable_policy_ids = RoleAssignment.get_changeable_object_ids(user, Policy)
+    return queryset.filter(
+        Q(category="policy", id__in=changeable_policy_ids)
+        | (~Q(category="policy") & Q(id__in=changeable_control_ids))
+    )
+
+
 class AutocompleteMixin:
     """Adds a lightweight, server-paginated ``autocomplete`` action for entity
     pickers (search/ordering/filtering come from the viewset's existing filter
@@ -1388,8 +1451,35 @@ class BaseModelViewSet(viewsets.ModelViewSet):
     search_fields = ["name", "description"]
     filterset_fields = []
     model: type[models.Model] | None = None
+    governed_requirement_assessment_filter_field: str | None = None
 
     serializers_module = "core.serializers"
+
+    def filter_queryset(self, queryset):
+        policy_field = self.governed_requirement_assessment_filter_field
+        raw_values = self.request.query_params.getlist("requirement_assessments")
+        if policy_field is not None and raw_values:
+            from core.requirement_assessment_relationships import (
+                assert_requirement_assessment_filter_visible,
+            )
+
+            try:
+                filter_ids = {
+                    UUID(token)
+                    for raw_value in raw_values
+                    for token in raw_value.split(",")
+                    if token
+                }
+            except TypeError, ValueError, AttributeError:
+                raise PermissionDenied(
+                    "One or more requirement assessments are unavailable for this filter."
+                )
+            assert_requirement_assessment_filter_visible(
+                user=self.request.user,
+                ra_ids=filter_ids,
+                policy_field=policy_field,
+            )
+        return super().filter_queryset(queryset)
 
     @property
     def filterset_class(self):
@@ -1584,6 +1674,21 @@ class BaseModelViewSet(viewsets.ModelViewSet):
             allowed[model] = {str(item_id) for item_id in ids}
         return allowed
 
+    def _get_visible_related_owners(self, relation_name: str):
+        """Return owners visible through both their source rows and Actor IAM."""
+
+        visible_actor_ids = RoleAssignment.get_viewable_object_ids(
+            self.request.user, Actor
+        )
+        return (
+            Actor.objects.filter(
+                id__in=visible_actor_ids,
+                **{f"{relation_name}__in": self.get_queryset()},
+            )
+            .select_related("user", "team", "entity")
+            .distinct()
+        )
+
     def _extract_related_id(self, item):
         """Extract a related object ID from a field payload."""
         if isinstance(item, dict):
@@ -1702,14 +1807,47 @@ class BaseModelViewSet(viewsets.ModelViewSet):
         return Response(data)
 
     def perform_create(self, serializer):
+        if getattr(serializer, "_relationship_plan", None) is not None:
+            with transaction.atomic():
+                instance = serializer.save()
+                transaction.on_commit(
+                    lambda: self._dispatch_governed_webhook(
+                        instance, "created", serializer
+                    )
+                )
+                return instance
         instance = serializer.save()
         dispatch_webhook_event(instance, "created", serializer=serializer)
         return instance
 
     def perform_update(self, serializer):
+        if getattr(serializer, "_relationship_plan", None) is not None:
+            with transaction.atomic():
+                instance = serializer.save()
+                transaction.on_commit(
+                    lambda: self._dispatch_governed_webhook(
+                        instance, "updated", serializer
+                    )
+                )
+                return instance
         instance = serializer.save()
         dispatch_webhook_event(instance, "updated", serializer=serializer)
         return instance
+
+    @staticmethod
+    def _dispatch_governed_webhook(instance, event_type, serializer):
+        try:
+            dispatch_webhook_event(instance, event_type, serializer=serializer)
+        except Exception:
+            # The database transaction is authoritative.  A post-commit
+            # delivery failure must not turn a committed API mutation into a
+            # false failure response that encourages a duplicate retry.
+            logger.error(
+                "Governed relationship webhook dispatch failed",
+                event_type=event_type,
+                model=instance._meta.label,
+                exc_info=True,
+            )
 
     def perform_destroy(self, instance):
         # resolve for "destroy" explicitly so batch_action can call this too
@@ -1908,15 +2046,40 @@ class BaseModelViewSet(viewsets.ModelViewSet):
 
                 else:
                     # Build data dict for the serializer
+                    serializer_context = self.get_serializer_context()
                     if action_type == "change_folder":
                         data = {"folder": value}
                     elif action_type in ("change_m2m", "add_m2m", "remove_m2m"):
-                        # read-modify-write is racy vs concurrent writers, accepted: serializer validation (IAM/lock) outweighs cbe008798's atomic .add()/.remove()
                         target = {
                             str(i)
                             for i in (value if isinstance(value, list) else [value])
                         }
-                        if action_type != "change_m2m":
+                        governed_delta = action_type in (
+                            "add_m2m",
+                            "remove_m2m",
+                        ) and field_name in getattr(
+                            serializer_class,
+                            "governed_batch_delta_fields",
+                            frozenset(),
+                        )
+                        if governed_delta:
+                            # The opted-in serializer consumes this as an operand
+                            # set after it has locked and re-read the target.  Do
+                            # not reconstruct an absolute relation here: doing so
+                            # would both lose concurrent visible links and copy
+                            # hidden relationship IDs into caller-controlled data.
+                            from core.requirement_assessment_relationships import (
+                                BATCH_RELATION_OPERATION_CONTEXT_KEY,
+                            )
+
+                            serializer_context[BATCH_RELATION_OPERATION_CONTEXT_KEY] = (
+                                "add" if action_type == "add_m2m" else "remove"
+                            )
+                        elif action_type != "change_m2m":
+                            # Legacy M2M serializers still receive their existing
+                            # absolute-set behavior.  Governed fields must opt in
+                            # explicitly above so this change cannot alter generic
+                            # CISO Assistant relationship semantics.
                             current = {
                                 str(pk)
                                 for pk in getattr(obj, field_name).values_list(
@@ -1938,7 +2101,7 @@ class BaseModelViewSet(viewsets.ModelViewSet):
                         obj,
                         data=data,
                         partial=True,
-                        context=self.get_serializer_context(),
+                        context=serializer_context,
                     )
                     if not serializer.is_valid():
                         failed.append(
@@ -1965,6 +2128,15 @@ class BaseModelViewSet(viewsets.ModelViewSet):
                 )
             except DRFValidationError as e:
                 failed.append({"id": str(obj_id), "name": str(obj), "error": e.detail})
+            except APIException as e:
+                failed.append(
+                    {
+                        "id": str(obj_id),
+                        "name": str(obj),
+                        "error": e.detail,
+                        "code": e.get_codes(),
+                    }
+                )
             except Exception:
                 logger.error("Batch action failed for %s", obj_id, exc_info=True)
                 failed.append(
@@ -2293,15 +2465,16 @@ class BaseModelViewSet(viewsets.ModelViewSet):
             while queue:
                 folder_id = queue.popleft()
                 folder = folders[folder_id]
-                if folder.parent_folder:
+                parent_folder_id = folder.parent_folder_id
+                if parent_folder_id:
                     path.append(
                         {
                             "str": str(folder),
                             "id": folder.id,
-                            "parent_id": folder.parent_folder.id,
+                            "parent_id": parent_folder_id,
                         }
                     )
-                    queue.append(folder.parent_folder.id)
+                    queue.append(parent_folder_id)
             path_results[obj.id] = path[::-1]  # Reverse to get root to leaf order
 
         return {
@@ -2315,7 +2488,12 @@ class BaseModelViewSet(viewsets.ModelViewSet):
     def object(self, request, pk):
         serializer_class = self.get_serializer_class(action="update")
 
-        return Response(serializer_class(super().get_object()).data)
+        return Response(
+            serializer_class(
+                super().get_object(),
+                context=self.get_serializer_context(),
+            ).data
+        )
 
 
 # Content types
@@ -2660,6 +2838,12 @@ class IntegrationLinkViewSetMixin:
                         serializer.instance.id,
                         [integration_config.id],
                         self._integration_initial_fields(),
+                        {
+                            str(integration_config.id): integration_sync_fingerprint(
+                                integration_config,
+                                self.model.INTEGRATION_MODEL_KEY,
+                            )
+                        },
                     ),
                     delay=1,
                 )
@@ -2703,6 +2887,12 @@ class IntegrationLinkViewSetMixin:
                     serializer.instance.id,
                     [integration_config.id],
                     [],
+                    {
+                        str(integration_config.id): integration_sync_fingerprint(
+                            integration_config,
+                            self.model.INTEGRATION_MODEL_KEY,
+                        )
+                    },
                 ),
                 delay=1,
             )
@@ -3528,20 +3718,35 @@ class ReferenceControlViewSet(BaseModelViewSet):
 
     @staticmethod
     def _get_syncable_applied_controls(
-        reference_control: ReferenceControl, user: AbstractBaseUser | AnonymousUser
+        reference_control: ReferenceControl,
+        user: AbstractBaseUser | AnonymousUser,
+        *,
+        lock: bool = False,
     ) -> list[AppliedControl]:
-        """Return the list of syncable `AppliedControl` objects (meaning they are currently unsynced) the `User` can synchronize (based on his permissions)."""
+        """Return unsynced controls writable through their exact IAM model.
 
-        changeable_applied_controls = RoleAssignment.get_changeable_object_ids(
-            user, AppliedControl
+        ``Policy`` is a permission-bearing proxy over the AppliedControl table.
+        Its discriminator must never be synchronized by this generic bulk
+        endpoint, and generic AppliedControl permission must not authorize a
+        policy row.
+        """
+
+        candidates = reference_control.appliedcontrol_set.all()
+        if lock:
+            candidates = candidates.select_for_update()
+        candidates = filter_caller_visible_applied_controls(
+            filter_caller_changeable_applied_controls(candidates, user),
+            user,
         )
-
-        syncable_applied_controls = (
-            reference_control.get_unsynced_applied_controls_queryset().filter(
-                id__in=changeable_applied_controls,
+        syncable_query = Q(category="policy") & ~Q(
+            csf_function=reference_control.csf_function
+        )
+        if reference_control.category != "policy":
+            syncable_query |= ~Q(category="policy") & ~Q(
+                category=reference_control.category,
+                csf_function=reference_control.csf_function,
             )
-        )
-        return list(syncable_applied_controls)
+        return list(candidates.filter(syncable_query).order_by("id"))
 
     @action(detail=True, methods=["get"], url_path="syncable-applied-controls")
     def syncable_applied_controls(self, request, pk):
@@ -3560,33 +3765,34 @@ class ReferenceControlViewSet(BaseModelViewSet):
     @action(detail=True, methods=["post"], url_path="sync-applied-controls")
     def sync_applied_controls(self, request, pk):
         reference_control = self.get_object()
-        syncable_applied_controls = self._get_syncable_applied_controls(
-            reference_control, request.user
-        )
 
-        FIELDS_TO_SYNC: Final[list[str]] = [
-            "category",
-            "csf_function",
-        ]
-
-        for syncable_applied_control in syncable_applied_controls:
-            for field_to_sync in FIELDS_TO_SYNC:
-                reference_control_value = getattr(reference_control, field_to_sync)
-
-                setattr(
-                    syncable_applied_control, field_to_sync, reference_control_value
+        with transaction.atomic():
+            syncable_applied_controls = self._get_syncable_applied_controls(
+                reference_control,
+                request.user,
+                lock=True,
+            )
+            for applied_control in syncable_applied_controls:
+                fields_to_sync = (
+                    ["csf_function"]
+                    if applied_control.category == "policy"
+                    else ["category", "csf_function"]
                 )
+                for field_to_sync in fields_to_sync:
+                    setattr(
+                        applied_control,
+                        field_to_sync,
+                        getattr(reference_control, field_to_sync),
+                    )
 
-        AppliedControl.objects.bulk_update(
-            syncable_applied_controls, FIELDS_TO_SYNC, batch_size=100
-        )
-
-        skip_sync = all(
-            field_to_sync not in AppliedControl.INTEGRATION_SYNCABLE_FIELDS
-            for field_to_sync in FIELDS_TO_SYNC
-        )
-        for applied_control in syncable_applied_controls:
-            applied_control.save(skip_sync=skip_sync)
+                skip_sync = all(
+                    field_to_sync not in AppliedControl.INTEGRATION_SYNCABLE_FIELDS
+                    for field_to_sync in fields_to_sync
+                )
+                applied_control.save(
+                    update_fields=fields_to_sync,
+                    skip_sync=skip_sync,
+                )
 
         return Response(
             [
@@ -4372,13 +4578,20 @@ class RiskAssessmentViewSet(BaseModelViewSet):
             )
 
         risk_assessment = RiskAssessment.objects.get(id=pk)
-        risk_scenarios = risk_assessment.risk_scenarios.all()
-        queryset = AppliedControl.objects.filter(
-            risk_scenarios__in=risk_scenarios
-        ).distinct()
+        risk_scenarios = risk_assessment.risk_scenarios.filter(
+            id__in=RoleAssignment.get_viewable_object_ids(request.user, RiskScenario)
+        )
+        queryset = filter_caller_visible_applied_controls(
+            AppliedControl.objects.filter(
+                risk_scenarios__in=risk_scenarios,
+            ).distinct(),
+            request.user,
+        )
 
         serializer = RiskAssessmentActionPlanSerializer(
-            queryset, many=True, context={"pk": pk}
+            queryset,
+            many=True,
+            context={"pk": pk, "request": request},
         )
 
         wb = Workbook()
@@ -4730,50 +4943,155 @@ class RiskAssessmentViewSet(BaseModelViewSet):
 
     @action(detail=True, name="Get action plan PDF")
     def action_plan_pdf(self, request, pk):
-        object_ids_view = RoleAssignment.get_viewable_object_ids(
-            request.user, RiskAssessment
+        if not RoleAssignment.is_object_readable(request.user, RiskAssessment, pk):
+            raise PermissionDenied()
+
+        risk_assessment_object = RiskAssessment.objects.select_related(
+            "folder", "perimeter"
+        ).get(id=pk)
+        visible_folder_ids = RoleAssignment.get_viewable_object_ids(
+            request.user, Folder
         )
-        if UUID(pk) in object_ids_view:
-            context = {
-                "to_do": list(),
-                "in_progress": list(),
-                "on_hold": list(),
-                "active": list(),
-                "deprecated": list(),
-                "--": list(),
-            }
-            color_map = {
-                "to_do": "#FFF8F0",
-                "in_progress": "#392F5A",
-                "on_hold": "#F4D06F",
-                "active": "#9DD9D2",
-                "deprecated": "#ff8811",
-                "--": "#e5e7eb",
-            }
-            status = AppliedControl.Status.choices
-            risk_assessment_object: RiskAssessment = self.get_object()
-            risk_scenarios_objects = risk_assessment_object.risk_scenarios.all()
-            applied_controls = (
-                AppliedControl.objects.filter(risk_scenarios__in=risk_scenarios_objects)
-                .distinct()
-                .order_by("eta")
+        if risk_assessment_object.folder_id not in visible_folder_ids:
+            raise PermissionDenied()
+        if risk_assessment_object.perimeter_id is not None:
+            visible_perimeter_ids = RoleAssignment.get_viewable_object_ids(
+                request.user, Perimeter
             )
-            for applied_control in applied_controls:
-                context[applied_control.status].append(
-                    applied_control
-                ) if applied_control.status else context["--"].append(applied_control)
-            data = {
-                "status_text": status,
+            if risk_assessment_object.perimeter_id not in visible_perimeter_ids:
+                raise PermissionDenied()
+
+        def get_authorized_projection(assessment):
+            scenario_ids = tuple(
+                assessment.risk_scenarios.filter(
+                    id__in=RoleAssignment.get_viewable_object_ids(
+                        request.user, RiskScenario
+                    )
+                )
+                .order_by("id")
+                .values_list("id", flat=True)
+            )
+            authorized_scenarios = RiskScenario.objects.filter(
+                id__in=scenario_ids
+            ).order_by("ref_id", "id")
+            controls = list(
+                filter_caller_visible_applied_controls(
+                    AppliedControl.objects.filter(
+                        Q(risk_scenarios__id__in=scenario_ids)
+                        | Q(risk_scenarios_e__id__in=scenario_ids)
+                    ).distinct(),
+                    request.user,
+                )
+                .prefetch_related(
+                    Prefetch(
+                        "risk_scenarios",
+                        queryset=authorized_scenarios,
+                        to_attr="authorized_added_risk_scenarios",
+                    ),
+                    Prefetch(
+                        "risk_scenarios_e",
+                        queryset=authorized_scenarios,
+                        to_attr="authorized_existing_risk_scenarios",
+                    ),
+                )
+                .order_by("eta", "id")
+            )
+            relation_projection = []
+            for control in controls:
+                matching_scenarios = {
+                    scenario.id: scenario
+                    for scenario in (
+                        control.authorized_added_risk_scenarios
+                        + control.authorized_existing_risk_scenarios
+                    )
+                }
+                control.authorized_risk_scenarios = sorted(
+                    matching_scenarios.values(),
+                    key=lambda scenario: (scenario.ref_id, scenario.id),
+                )
+                relation_projection.append(
+                    (
+                        control.id,
+                        tuple(
+                            scenario.id
+                            for scenario in control.authorized_risk_scenarios
+                        ),
+                    )
+                )
+            return scenario_ids, controls, tuple(relation_projection)
+
+        scenario_ids, applied_controls, relation_projection = get_authorized_projection(
+            risk_assessment_object
+        )
+
+        color_map = {
+            "to_do": "#FFF8F0",
+            "in_progress": "#392F5A",
+            "on_hold": "#F4D06F",
+            "active": "#9DD9D2",
+            "degraded": "#F59E0B",
+            "deprecated": "#ff8811",
+            "--": "#e5e7eb",
+        }
+
+        def build_render_data(assessment, controls):
+            context = {
+                status_value: [] for status_value, _ in AppliedControl.Status.choices
+            }
+            for control in controls:
+                context.setdefault(control.status or "--", []).append(control)
+            return {
+                "status_text": AppliedControl.Status.choices,
                 "color_map": color_map,
                 "context": context,
-                "risk_assessment": risk_assessment_object,
+                "risk_assessment": assessment,
             }
-            html = render_to_string("core/risk_action_plan_pdf.html", data)
-            pdf_file = HTML(string=html).write_pdf()
-            response = HttpResponse(pdf_file, content_type="application/pdf")
-            return response
-        else:
-            return Response({"error": "Permission denied"})
+
+        data = build_render_data(risk_assessment_object, applied_controls)
+        html = render_to_string("core/risk_action_plan_pdf.html", data)
+
+        # Re-prove every authority boundary after template evaluation so a
+        # concurrent permission revocation cannot release a stale projection.
+        if not RoleAssignment.is_object_readable(request.user, RiskAssessment, pk):
+            raise PermissionDenied()
+        current_assessment = RiskAssessment.objects.get(id=pk)
+        if (
+            current_assessment.folder_id != risk_assessment_object.folder_id
+            or current_assessment.perimeter_id != risk_assessment_object.perimeter_id
+        ):
+            raise PermissionDenied()
+        if current_assessment.folder_id not in set(
+            RoleAssignment.get_viewable_object_ids(request.user, Folder)
+        ):
+            raise PermissionDenied()
+        if (
+            current_assessment.perimeter_id is not None
+            and current_assessment.perimeter_id
+            not in set(RoleAssignment.get_viewable_object_ids(request.user, Perimeter))
+        ):
+            raise PermissionDenied()
+        current_scenario_ids, current_controls, current_relation_projection = (
+            get_authorized_projection(current_assessment)
+        )
+        if (
+            scenario_ids != current_scenario_ids
+            or relation_projection != current_relation_projection
+        ):
+            raise PermissionDenied()
+        current_html = render_to_string(
+            "core/risk_action_plan_pdf.html",
+            build_render_data(current_assessment, current_controls),
+        )
+        if not hmac.compare_digest(
+            hashlib.sha256(html.encode("utf-8")).digest(),
+            hashlib.sha256(current_html.encode("utf-8")).digest(),
+        ):
+            # Bind release of the PDF to every scalar and relationship that the
+            # template actually rendered, not merely the object ID set.
+            raise PermissionDenied()
+
+        pdf_file = HTML(string=html).write_pdf()
+        return HttpResponse(pdf_file, content_type="application/pdf")
 
     @action(
         detail=True,
@@ -4864,26 +5182,38 @@ class RiskAssessmentViewSet(BaseModelViewSet):
         url_path="sync-to-actions",
     )
     def sync_to_applied_controls(self, request, pk):
-        dry_run = (
-            request.method == "GET"
-            or str(request.query_params.get("dry_run", "true")).lower() != "false"
+        options = RiskActionSyncInputSerializer(
+            data={
+                "dry_run": request.query_params.get("dry_run", True),
+                "reset_residual": request.data.get("reset_residual", False),
+            }
         )
-        reset_residual = request.data.get("reset_residual", False)
-        risk_assessment = RiskAssessment.objects.get(id=pk)
-
-        if not RoleAssignment.is_access_allowed(
-            user=request.user,
-            perm=Permission.objects.get(codename="change_riskassessment"),
-            folder=Folder.get_folder(risk_assessment),
-        ):
-            return Response(status=status.HTTP_403_FORBIDDEN)
-
-        changes = risk_assessment.sync_to_applied_controls(
-            reset_residual=reset_residual, dry_run=dry_run
-        )
-        return Response(
-            {"changes": RiskScenarioReadSerializer(changes, many=True).data}
-        )
+        options.is_valid(raise_exception=True)
+        # Keep the service's row locks through response projection so a related
+        # object cannot change after authorization but before it is rendered.
+        with transaction.atomic():
+            sync_result = sync_risk_assessment_actions(
+                user=request.user,
+                risk_assessment_id=pk,
+                reset_residual=options.validated_data["reset_residual"],
+                dry_run=options.validated_data["dry_run"],
+            )
+            # This action only needs the fields rendered by the confirmation
+            # modal.  Returning the generic scenario serializer would expose
+            # unrelated existing controls, including Policy proxy rows whose
+            # permission model differs from AppliedControl.
+            data = [
+                {
+                    "id": str(scenario.id),
+                    "ref_id": scenario.ref_id,
+                    "name": scenario.name,
+                    "current_level": scenario.get_current_risk(),
+                    "residual_level": scenario.get_residual_risk(),
+                }
+                for scenario in sync_result.changed_scenarios
+            ]
+            sync_result.reprove(user=request.user)
+        return Response({"changes": data})
 
     @action(
         detail=True,
@@ -5388,65 +5718,105 @@ class AppliedControlFilterSet(TimestampRangeFilterMixin, GenericFilterSet):
     effort = NullableChoiceFilter(choices=AppliedControl.EFFORT)
     control_impact = NullableChoiceFilter(choices=AppliedControl.IMPACT)
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        user = getattr(getattr(self, "request", None), "user", None)
+        requested_filters = set(getattr(self, "data", {}) or {})
+        for filter_name, bound_filter in self.filters.items():
+            if filter_name not in requested_filters:
+                continue
+            queryset = getattr(bound_filter, "queryset", None)
+            model = getattr(queryset, "model", None)
+            if model is None:
+                continue
+            if user is None or not getattr(user, "is_authenticated", False):
+                bound_filter.queryset = model.objects.none()
+                continue
+            try:
+                visible_ids = RoleAssignment.get_viewable_object_ids(user, model)
+            except NotImplementedError, Permission.DoesNotExist:
+                continue
+            if model is RiskScenario:
+                visible_ids = RiskScenario.objects.filter(
+                    id__in=visible_ids,
+                    risk_assessment_id__in=RoleAssignment.get_viewable_object_ids(
+                        user, RiskAssessment
+                    ),
+                ).values_list("id", flat=True)
+            elif model is RequirementAssessment:
+                from core.requirement_assessment_relationships import (
+                    visible_requirement_assessment_rows,
+                )
+
+                visible_ids = visible_requirement_assessment_rows(
+                    user=user,
+                    ra_ids=visible_ids,
+                    policy_field="applied_controls",
+                ).keys()
+            # Hidden and nonexistent UUID operands now fail through the same
+            # ModelChoice validation path before a custom filter can traverse
+            # related rows.
+            bound_filter.queryset = model.objects.filter(id__in=visible_ids)
+
     def filter_findings_assessments(self, queryset, name, value):
         if value:
-            findings_assessments = FindingsAssessment.objects.filter(
-                id__in=[x.id for x in value]
+            visible_finding_ids = RoleAssignment.get_viewable_object_ids(
+                self.request.user, Finding
             )
-            if len(findings_assessments) == 0:
-                return queryset
-            findings = chain.from_iterable(
-                [fa.findings.all() for fa in findings_assessments]
-            )
-            return queryset.filter(findings__in=findings).distinct()
+            return queryset.filter(
+                findings__findings_assessment_id__in=[item.id for item in value],
+                findings__id__in=visible_finding_ids,
+            ).distinct()
         return queryset
 
     def filter_risk_assessments(self, queryset, name, value):
         if value:
-            risk_assessments = RiskAssessment.objects.filter(
-                id__in=[x.id for x in value]
+            visible_scenario_ids = RoleAssignment.get_viewable_object_ids(
+                self.request.user, RiskScenario
             )
-            if len(risk_assessments) == 0:
-                return queryset
-            risk_scenarios = chain.from_iterable(
-                [ra.risk_scenarios.all() for ra in risk_assessments]
-            )
-            return queryset.filter(risk_scenarios__in=risk_scenarios).distinct()
+            return queryset.filter(
+                risk_scenarios__risk_assessment_id__in=[item.id for item in value],
+                risk_scenarios__id__in=visible_scenario_ids,
+            ).distinct()
         return queryset
 
     def filter_compliance_assessments(self, queryset, name, value):
         if not value:
             return queryset
 
-        # Fetch compliance assessments with related requirements to prevent N+1 queries.
-        # We need the requirement's implementation_groups for the filtering logic.
-        compliance_assessments = ComplianceAssessment.objects.filter(
-            id__in=[x.id for x in value]
-        ).prefetch_related("requirement_assessments__requirement")
+        from core.requirement_assessment_relationships import (
+            visible_requirement_assessment_rows,
+        )
 
-        if not compliance_assessments.exists():
-            return queryset
-
+        assessment_ids = [item.id for item in value]
+        compliance_assessments = {
+            assessment.id: assessment
+            for assessment in ComplianceAssessment.objects.filter(id__in=assessment_ids)
+        }
+        candidate_ids = RequirementAssessment.objects.filter(
+            compliance_assessment_id__in=assessment_ids
+        ).values_list("id", flat=True)
+        visible_rows = visible_requirement_assessment_rows(
+            user=self.request.user,
+            ra_ids=candidate_ids,
+            policy_field="applied_controls",
+        )
         valid_ra_ids = set()
-
-        for ca in compliance_assessments:
-            selected_groups = ca.selected_implementation_groups
-            current_ras = ca.requirement_assessments.all()
+        for row in visible_rows.values():
+            assessment = compliance_assessments.get(row.compliance_assessment_id)
+            if assessment is None:
+                continue
+            selected_groups = assessment.selected_implementation_groups
 
             # If no groups are selected in the audit, current behavior applies (show all)
             if not selected_groups:
-                valid_ra_ids.update(ra.id for ra in current_ras)
+                valid_ra_ids.add(row.id)
                 continue
 
-            # Convert selected groups to a set for O(1) lookup
             selected_set = set(selected_groups)
-
-            for ra in current_ras:
-                req_groups = ra.requirement.implementation_groups or []
-
-                # Check for intersection: Keep if ANY requirement group matches ANY selected group
-                if not selected_set.isdisjoint(req_groups):
-                    valid_ra_ids.add(ra.id)
+            requirement_groups = row.requirement.implementation_groups or []
+            if not selected_set.isdisjoint(requirement_groups):
+                valid_ra_ids.add(row.id)
 
         return queryset.filter(requirement_assessments__in=valid_ra_ids).distinct()
 
@@ -5468,10 +5838,12 @@ class AppliedControlFilterSet(TimestampRangeFilterMixin, GenericFilterSet):
         return queryset
 
     def filter_is_assigned(self, queryset, name, value):
+        visible_actor_ids = RoleAssignment.get_viewable_object_ids(
+            self.request.user, Actor
+        )
         if value:
-            return queryset.filter(owner__isnull=False).distinct()
-        else:
-            return queryset.filter(owner__isnull=True)
+            return queryset.filter(owner__id__in=visible_actor_ids).distinct()
+        return queryset.exclude(owner__id__in=visible_actor_ids).distinct()
 
     def filter_linked_models(self, queryset, name, value):
         """
@@ -5482,17 +5854,34 @@ class AppliedControlFilterSet(TimestampRangeFilterMixin, GenericFilterSet):
             return queryset
 
         has_orphan = "--" in value
-        real_types = [v for v in value if v != "--"]
+        requested_types = set(value) - {"--"}
+        from core.applied_control_visibility import (
+            LINKED_RELATION_NAMES,
+            build_applied_control_visible_link_queries,
+        )
 
-        q = Q()
-        for model_type in real_types:
-            q |= Q(**{f"{model_type}__isnull": False})
-        if has_orphan:
-            has_any = Q()
-            for field in APPLIED_CONTROL_LINKED_FIELD_NAMES:
-                has_any |= Q(**{f"{field}__isnull": False})
-            q |= ~has_any
-        return queryset.filter(q).distinct()
+        predicates = build_applied_control_visible_link_queries(
+            user=self.request.user,
+            control_ids=queryset.values("id"),
+        )
+        empty = Q(pk__in=())
+        requested_predicate = empty
+        for relation_name in requested_types:
+            requested_predicate |= predicates[relation_name]
+        any_visible_predicate = empty
+        for relation_name in LINKED_RELATION_NAMES:
+            any_visible_predicate |= predicates[relation_name]
+
+        requested_ids = queryset.filter(requested_predicate).values("id")
+        if not has_orphan:
+            return queryset.filter(id__in=Subquery(requested_ids)).distinct()
+
+        orphan_ids = queryset.exclude(any_visible_predicate).values("id")
+        if not requested_types:
+            return queryset.filter(id__in=Subquery(orphan_ids)).distinct()
+        return queryset.filter(
+            Q(id__in=Subquery(requested_ids)) | Q(id__in=Subquery(orphan_ids))
+        ).distinct()
 
     class Meta:
         model = AppliedControl
@@ -5530,6 +5919,7 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
     """
 
     model = AppliedControl
+    governed_requirement_assessment_filter_field = "applied_controls"
     filterset_class = AppliedControlFilterSet
     filter_backends = [
         CustomFieldSearchFilter if b is filters.SearchFilter else b
@@ -5653,10 +6043,79 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
         "prefetch_related": ["owner", "filtering_labels", "evidences__revisions"],
     }
 
+    def _get_export_queryset(self):
+        queryset = super()._get_export_queryset()
+        if self.model is AppliedControl:
+            queryset = queryset.exclude(category="policy")
+        if self.action in {"export_csv", "export_xlsx"}:
+            self._export_visible_folder_ids = set(
+                RoleAssignment.get_viewable_object_ids(self.request.user, Folder)
+            )
+            self._export_visible_reference_control_ids = set(
+                RoleAssignment.get_viewable_object_ids(
+                    self.request.user, ReferenceControl
+                )
+            )
+            visible_actor_ids = RoleAssignment.get_viewable_object_ids(
+                self.request.user, Actor
+            )
+            visible_label_ids = RoleAssignment.get_viewable_object_ids(
+                self.request.user, FilteringLabel
+            )
+            visible_evidence_ids = RoleAssignment.get_viewable_object_ids(
+                self.request.user, Evidence
+            )
+            visible_revision_ids = RoleAssignment.get_viewable_object_ids(
+                self.request.user, EvidenceRevision
+            )
+            visible_evidences = Evidence.objects.filter(
+                id__in=visible_evidence_ids
+            ).prefetch_related(
+                Prefetch(
+                    "revisions",
+                    queryset=EvidenceRevision.objects.filter(
+                        id__in=visible_revision_ids
+                    ),
+                )
+            )
+
+            # ExportMixin applies the static prefetch declarations before this
+            # request-scoped projection is known. Replace those declarations
+            # for the two metadata-bearing exports; MSS consumes no related
+            # metadata and intentionally keeps its existing path.
+            queryset = queryset.prefetch_related(None).prefetch_related(
+                Prefetch(
+                    "owner",
+                    queryset=Actor.objects.filter(
+                        id__in=visible_actor_ids
+                    ).select_related("user", "team", "entity"),
+                ),
+                Prefetch(
+                    "filtering_labels",
+                    queryset=FilteringLabel.objects.filter(id__in=visible_label_ids),
+                ),
+                Prefetch("evidences", queryset=visible_evidences),
+            )
+        return queryset
+
+    def _resolve_field_value(self, obj, field_config):
+        """Mask singular export relations through the caller's own IAM."""
+
+        source = field_config.get("source")
+        if source == "folder.name" and obj.folder_id not in getattr(
+            self, "_export_visible_folder_ids", set()
+        ):
+            return ""
+        if source in {"reference_control.name", "reference_control.ref_id"} and (
+            obj.reference_control_id is None
+            or obj.reference_control_id
+            not in getattr(self, "_export_visible_reference_control_ids", set())
+        ):
+            return ""
+        return super()._resolve_field_value(obj, field_config)
+
     def get_queryset(self):
         """Optimize queries by prefetching related objects used in the table view and serializer"""
-        from crq.models import QuantitativeRiskHypothesis
-
         qs = (
             super()
             .get_queryset()
@@ -5665,36 +6124,14 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
                 "folder__parent_folder",  # For get_folder_full_path() optimization
             )
         )
+        if self.model is AppliedControl:
+            # Policy is a permission-bearing proxy over the same table. Never
+            # let the concrete route bypass the proxy's IAM/content type.
+            qs = qs.exclude(category="policy")
         if self.action == "autocomplete":
             return qs
 
-        # Annotate with Exists() for each reverse relation to power linked_models
-        m2m_through_fields = {
-            "has_requirement_assessments": RequirementAssessment.applied_controls.through,
-            "has_risk_scenarios": RiskScenario.applied_controls.through,
-            "has_risk_scenarios_e": RiskScenario.existing_applied_controls.through,
-            "has_findings": Finding.applied_controls.through,
-            "has_vulnerabilities": Vulnerability.applied_controls.through,
-            "has_stakeholders": Stakeholder.applied_controls.through,
-            "has_processings": Processing.associated_controls.through,
-            "has_data_breaches_remediated": DataBreach.remediation_measures.through,
-            "has_quantitative_risk_hypotheses_existing": QuantitativeRiskHypothesis.existing_applied_controls.through,
-            "has_quantitative_risk_hypotheses_added": QuantitativeRiskHypothesis.added_applied_controls.through,
-            "has_quantitative_risk_hypotheses_removed": QuantitativeRiskHypothesis.removed_applied_controls.through,
-            "has_assetassessment": AssetAssessment.associated_controls.through,
-            "has_task_templates": TaskTemplate.applied_controls.through,
-            "has_incidents": Incident.applied_controls.through,
-        }
-        annotations = {
-            alias: Exists(through.objects.filter(appliedcontrol_id=OuterRef("pk")))
-            for alias, through in m2m_through_fields.items()
-        }
-        # Comment uses a ForeignKey, not M2M
-        annotations["has_comments"] = Exists(
-            Comment.objects.filter(applied_control_id=OuterRef("pk"))
-        )
-
-        qs = qs.select_related("reference_control").annotate(**annotations)
+        qs = qs.select_related("reference_control")
 
         # The list serializer doesn't render findings/evidences/objectives/
         # security_exceptions, so skip those prefetches on the list path.
@@ -5715,6 +6152,8 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
             "assets",  # ManyToManyField used in table
             "security_exceptions",  # Serialized as FieldsRelatedField
             "incidents",  # Serialized as FieldsRelatedField
+            "stakeholders",  # Read serializer keeps the UUID-array contract
+            "task_templates",  # Read serializer keeps the UUID-array contract
         )
 
     def get_serializer_class(self, **kwargs):
@@ -5724,6 +6163,31 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
 
             return AppliedControlListSerializer
         return super().get_serializer_class(**kwargs)
+
+    def _project_mutation_response(self, response):
+        """Replace write-serializer output with the caller-scoped read shape."""
+
+        instance = getattr(self, "_applied_control_mutation_instance", None)
+        if instance is None or not 200 <= response.status_code < 300:
+            return response
+        serializer_class = self.get_serializer_class(action="retrieve")
+        serializer = serializer_class(
+            instance,
+            context=self.get_serializer_context(),
+        )
+        data = serializer.data
+        field_models = self._get_fieldsrelated_map(serializer)
+        if field_models:
+            allowed_ids = self._get_accessible_ids_map(set(field_models.values()))
+            data = self._filter_related_fields(data, field_models, allowed_ids)
+        response.data = data
+        return response
+
+    def create(self, request, *args, **kwargs):
+        return self._project_mutation_response(super().create(request, *args, **kwargs))
+
+    def update(self, request, *args, **kwargs):
+        return self._project_mutation_response(super().update(request, *args, **kwargs))
 
     @action(detail=False, name="Lightweight autocomplete search")
     def autocomplete(self, request):
@@ -5749,9 +6213,7 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
         (AppliedControlReadSerializer), avoiding N+1 per-id detail fetches."""
         from core.serializers import AppliedControlBulkReadSerializer
 
-        qs = self.filter_queryset(self.get_queryset()).prefetch_related(
-            "risk_scenarios"
-        )
+        qs = self.filter_queryset(self.get_queryset())
         page = self.paginate_queryset(qs)
         objects = page if page is not None else qs
 
@@ -5781,6 +6243,23 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
         serializer.is_valid(raise_exception=True)
         target = serializer.validated_data["target"]
 
+        if (
+            self.model is AppliedControl
+            and target["type"] == "new"
+            and (target.get("fields") or {}).get("category") == "policy"
+        ):
+            raise DRFValidationError(
+                {
+                    "target": {
+                        "fields": {
+                            "category": (
+                                "Policies must be created through the policy API."
+                            )
+                        }
+                    }
+                }
+            )
+
         # Force category='policy' on /policies/merge/ so the created row stays
         # classified as a policy even if the caller supplied a different value.
         if self.model is Policy and target["type"] == "new":
@@ -5794,6 +6273,12 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
             user=request.user,
             request=request,
             lookup_queryset=self.get_queryset(),
+            authority_model=self.model,
+            write_serializer_class=(
+                PolicyWriteSerializer
+                if self.model is Policy
+                else AppliedControlWriteSerializer
+            ),
             dry_run=serializer.validated_data.get("dry_run", False),
         )
         return Response(result)
@@ -5808,6 +6293,7 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
         # Create the local object first
         super().perform_create(serializer)
         instance = serializer.instance
+        self._applied_control_mutation_instance = instance
 
         if create_remote_object and integration_config:
             try:
@@ -5822,6 +6308,12 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
                         serializer.instance.id,
                         [integration_config.id],
                         ["name", "description", "status", "priority"],
+                        {
+                            str(integration_config.id): integration_sync_fingerprint(
+                                integration_config,
+                                self.model.INTEGRATION_MODEL_KEY,
+                            )
+                        },
                     ),
                     delay=1,  # Small delay to ensure transaction is committed
                 )
@@ -5839,6 +6331,7 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
         serializer.validated_data.pop("create_remote_object", None)  # Remove if present
 
         super().perform_update(serializer)
+        self._applied_control_mutation_instance = serializer.instance
         if not integration_config or not remote_object_id:
             return
         try:
@@ -5866,6 +6359,12 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
                         serializer.instance.id,
                         [integration_config.id],
                         ["status"],
+                        {
+                            str(integration_config.id): integration_sync_fingerprint(
+                                integration_config,
+                                self.model.INTEGRATION_MODEL_KEY,
+                            )
+                        },
                     ),
                     delay=1,  # Small delay to ensure transaction is committed
                 )
@@ -5918,7 +6417,7 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
     def owner(self, request):
         return Response(
             ActorReadSerializer(
-                Actor.objects.filter(applied_controls__isnull=False).distinct(),
+                self._get_visible_related_owners("applied_controls"),
                 many=True,
             ).data
         )
@@ -5926,10 +6425,10 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
     @action(detail=False, name="Get updatable measures")
     def updatables(self, request):
         object_ids_change = RoleAssignment.get_changeable_object_ids(
-            request.user, AppliedControl
+            request.user, self.model
         )
-
-        return Response({"results": list(object_ids_change)})
+        queryset = self.get_queryset().filter(id__in=object_ids_change)
+        return Response({"results": list(queryset.values_list("id", flat=True))})
 
     @action(detail=False, methods=["get"], name="Get applied controls analytics")
     def analytics(self, request):
@@ -5939,38 +6438,81 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
         can carry the table's current filters through verbatim.
         """
         qs = self.filter_queryset(self.get_queryset())
-        return Response(ActionPlanBudgetOverview.compute_budget_overview(qs))
+        return Response(
+            ActionPlanBudgetOverview.compute_budget_overview(qs, user=request.user)
+        )
 
     @action(
         detail=False, name="Something"
     )  # Write a good name for the "name" keyword argument
     def per_status(self, request):
-        data = applied_control_per_status(request.user)
+        data = applied_control_per_status(request.user, self.model)
         return Response({"results": data})
+
+    def _serialize_action_controls(self, controls, request, projections=None):
+        from core.applied_control_visibility import (
+            build_applied_control_request_projections,
+        )
+
+        if projections is None:
+            projections = build_applied_control_request_projections(
+                user=request.user,
+                controls=controls,
+            )
+        context = {
+            "request": request,
+            "daily_rate": GlobalSettings.get_daily_rate(),
+            "optimized_data": self._get_optimized_object_data(controls),
+            "_applied_control_request_projections": {
+                (request.user.pk, control_id): projection
+                for control_id, projection in projections.items()
+            },
+        }
+        serializer = AppliedControlBulkReadSerializer(
+            controls,
+            many=True,
+            context=context,
+        )
+        data = serializer.data
+        field_models = self._get_fieldsrelated_map(serializer)
+        if field_models:
+            allowed_ids = self._get_accessible_ids_map(set(field_models.values()))
+            data = self._filter_related_fields(data, field_models, allowed_ids)
+        return data
 
     @action(detail=False, name="Get the ordered todo applied controls")
     def todo(self, request):
         object_ids_view = RoleAssignment.get_viewable_object_ids(
-            request.user, AppliedControl
+            request.user, self.model
         )
 
-        measures = sorted(
-            AppliedControl.objects.filter(id__in=object_ids_view)
+        measures_queryset = (
+            self.model.objects.filter(id__in=object_ids_view)
             .filter(eta__lte=date.today() + timedelta(days=30))
             .exclude(status="active")
-            .order_by("eta"),
-            key=lambda mtg: mtg.get_ranking_score(),
-            reverse=True,
+            .order_by("eta")
+        )
+        if self.model is AppliedControl:
+            measures_queryset = measures_queryset.exclude(category="policy")
+        measures = list(_optimized_applied_control_action_queryset(measures_queryset))
+        from core.applied_control_visibility import (
+            build_applied_control_request_projections,
         )
 
-        ranking_scores = {str(mtg.id): mtg.get_ranking_score() for mtg in measures}
-
-        measures = [AppliedControlReadSerializer(mtg).data for mtg in measures]
-
-        # How to add ranking_score directly in the serializer ?
-
-        for i in range(len(measures)):
-            measures[i]["ranking_score"] = ranking_scores[measures[i]["id"]]
+        projections = build_applied_control_request_projections(
+            user=request.user,
+            controls=measures,
+        )
+        measures = sorted(
+            measures,
+            key=lambda measure: projections[measure.id].ranking_score,
+            reverse=True,
+        )
+        measures = self._serialize_action_controls(
+            measures,
+            request,
+            projections=projections,
+        )
 
         """
         The serializer of AppliedControl isn't applied automatically for this function
@@ -5980,9 +6522,13 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
 
     @action(detail=False, name="Get the secuity measures to review")
     def to_review(self, request):
-        measures = measures_to_review(request.user)
+        measures = list(
+            _optimized_applied_control_action_queryset(
+                measures_to_review(request.user, self.model)
+            )
+        )
 
-        measures = [AppliedControlReadSerializer(mtg).data for mtg in measures]
+        measures = self._serialize_action_controls(measures, request)
 
         """
         The serializer of AppliedControl isn't applied automatically for this function
@@ -5992,13 +6538,17 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
 
     @action(detail=False, methods=["get"])
     def get_controls_info(self, request):
+        from core.requirement_assessment_relationships import (
+            visible_requirement_assessment_rows,
+        )
+
         folder_id = request.query_params.get("folder", None)
         scoped_folder = (
             Folder.objects.get(id=folder_id) if folder_id else Folder.get_root_folder()
         )
 
         view_ac_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, AppliedControl, scoped_folder
+            request.user, self.model, scoped_folder
         )
         view_ca_ids = RoleAssignment.get_viewable_object_ids(
             request.user, ComplianceAssessment, scoped_folder
@@ -6006,8 +6556,14 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
         view_ra_ids = RoleAssignment.get_viewable_object_ids(
             request.user, RiskAssessment, scoped_folder
         )
+        view_rs_ids = RoleAssignment.get_viewable_object_ids(
+            request.user, RiskScenario, scoped_folder
+        )
 
-        ac_qs = AppliedControl.objects.filter(id__in=view_ac_ids).only("id", "name")
+        ac_qs = self.model.objects.filter(id__in=view_ac_ids)
+        if self.model is AppliedControl:
+            ac_qs = ac_qs.exclude(category="policy")
+        ac_qs = ac_qs.only("id", "name")
         ca_qs = ComplianceAssessment.objects.filter(id__in=view_ca_ids).only(
             "id", "name"
         )
@@ -6016,10 +6572,21 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
         ac_ids = list(ac_qs.values_list("id", flat=True))
         ca_ids = set(ca_qs.values_list("id", flat=True))
         ra_ids = set(ra_qs.values_list("id", flat=True))
+        candidate_requirement_ids = RequirementAssessment.objects.filter(
+            compliance_assessment_id__in=ca_ids,
+            applied_controls__id__in=ac_ids,
+        ).values_list("id", flat=True)
+        visible_requirement_ids = visible_requirement_assessment_rows(
+            user=request.user,
+            ra_ids=candidate_requirement_ids,
+            policy_field="applied_controls",
+        ).keys()
 
         audit_rows = (
             RequirementAssessment.objects.filter(
-                compliance_assessment_id__in=ca_ids, applied_controls__id__in=ac_ids
+                id__in=visible_requirement_ids,
+                compliance_assessment_id__in=ca_ids,
+                applied_controls__id__in=ac_ids,
             )
             .values("compliance_assessment_id", "applied_controls")
             .annotate(coverage=Count("id"))
@@ -6027,7 +6594,9 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
 
         risk_rows = (
             RiskScenario.objects.filter(
-                risk_assessment_id__in=ra_ids, applied_controls__id__in=ac_ids
+                id__in=view_rs_ids,
+                risk_assessment_id__in=ra_ids,
+                applied_controls__id__in=ac_ids,
             )
             .values("risk_assessment_id", "applied_controls")
             .annotate(coverage=Count("id"))
@@ -6087,12 +6656,7 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
 
     @action(detail=False, name="Get priority chart data")
     def priority_chart_data(self, request):
-        viewable_controls_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, self.model
-        )
-        qs = self.model.objects.filter(id__in=viewable_controls_ids).exclude(
-            status="active"
-        )
+        qs = self.get_queryset().exclude(status="active")
 
         data = {
             "--": [],
@@ -6118,14 +6682,23 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
             p3=Count("priority", filter=Q(priority=3)),
             p4=Count("priority", filter=Q(priority=4)),
         )
-        for ac in qs:
+        controls = list(qs)
+        from core.applied_control_visibility import (
+            build_applied_control_request_projections,
+        )
+
+        projections = build_applied_control_request_projections(
+            user=request.user,
+            controls=controls,
+        )
+        for ac in controls:
             if ac.priority:
                 if ac.eta:
                     days_countdown = min(100, ac.days_until_eta)
                     # how many days until the ETA
                 else:
                     days_countdown = 100
-                impact_factor = 5 + ac.links_count
+                impact_factor = 5 + projections[ac.id].links_count
 
                 # angle = angle_offsets[str(ac.priority)]+ (next(offsets) % 80) + random.randint(1,4)
                 angle = (
@@ -6162,13 +6735,7 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
             return datetime.strftime(input, "%Y-%m-%d")
 
         entries = []
-        viewable_controls_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, AppliedControl
-        )
-
-        applied_controls = AppliedControl.objects.filter(
-            id__in=viewable_controls_ids
-        ).select_related("folder")
+        applied_controls = self.get_queryset().select_related("folder")
 
         for ac in applied_controls:
             if ac.eta:
@@ -6196,10 +6763,8 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
     @action(detail=False, methods=["get"])
     def impact_effort(self, request):
         # TODO consider the case of passing the domain as a filter
-        viewable_controls_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, AppliedControl
-        )
-        viewable_controls_set = set(viewable_controls_ids)
+        visible_controls = self.get_queryset()
+        viewable_controls_set = set(visible_controls.values_list("id", flat=True))
 
         output = [
             [[], [], [], [], []],
@@ -6209,8 +6774,7 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
             [[], [], [], [], []],
         ]
 
-        assessed_controls = AppliedControl.objects.filter(
-            id__in=viewable_controls_set,
+        assessed_controls = visible_controls.filter(
             control_impact__isnull=False,
             effort__isnull=False,
         ).values_list(
@@ -6262,13 +6826,7 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
             "#A698DC",
         ]
         colorMap = {}
-        viewable_controls_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, AppliedControl
-        )
-
-        applied_controls = AppliedControl.objects.filter(
-            id__in=viewable_controls_ids
-        ).select_related("folder")
+        applied_controls = self.get_queryset().select_related("folder")
 
         for ac in applied_controls:
             if ac.eta:
@@ -6290,7 +6848,10 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
                     }
                 )
         color_cycle = cycle(COLORS_PALETTE)
-        for domain in Folder.objects.all():
+        visible_folder_ids = RoleAssignment.get_viewable_object_ids(
+            request.user, Folder
+        )
+        for domain in Folder.objects.filter(id__in=visible_folder_ids):
             colorMap[domain.name] = next(color_cycle)
         return Response({"entries": entries, "colorMap": colorMap})
 
@@ -6305,56 +6866,237 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        if not RoleAssignment.is_object_accessible(
-            request.user, "view", AppliedControl, UUID(pk)
-        ):
-            return Response(
-                {"results": "applied control not found"},
-                status=status.HTTP_404_NOT_FOUND,
+        source = get_object_or_404(self.get_queryset(), id=UUID(pk))
+        target_folder_id = data["folder"]
+        new_folder = Folder.objects.filter(id=target_folder_id).first()
+        if new_folder is None:
+            raise PermissionDenied("The target folder is unavailable.")
+        try:
+            add_permission = Permission.objects.get(
+                codename=f"add_{self.model._meta.model_name}",
+                content_type__app_label=self.model._meta.app_label,
+                content_type__model=self.model._meta.model_name,
             )
-
-        applied_control = self.get_object()
-        new_folder = data["folder"]
-        duplicate_applied_control = AppliedControl.objects.create(
-            reference_control=applied_control.reference_control,
-            name=data["name"],
-            description=data["description"],
+        except Permission.DoesNotExist, Permission.MultipleObjectsReturned:
+            raise PermissionDenied(
+                "The target model has no unambiguous add permission."
+            )
+        if not RoleAssignment.is_access_allowed(
+            user=request.user,
+            perm=add_permission,
             folder=new_folder,
-            ref_id=applied_control.ref_id,
-            category=applied_control.category,
-            csf_function=applied_control.csf_function,
-            priority=applied_control.priority,
-            status=applied_control.status,
-            start_date=applied_control.start_date,
-            eta=applied_control.eta,
-            expiry_date=applied_control.expiry_date,
-            link=applied_control.link,
-            effort=applied_control.effort,
-            cost=applied_control.cost,
-            progress_field=applied_control.progress_field,
-        )
-        duplicate_applied_control.owner.set(applied_control.owner.all())
-        duplicate_applied_control.filtering_labels.set(
-            applied_control.filtering_labels.all()
-        )
-        if data["duplicate_evidences"]:
-            duplicate_related_objects(
-                applied_control, duplicate_applied_control, new_folder, "evidences"
-            )
-            duplicate_applied_control.save()
+        ):
+            raise PermissionDenied("The target folder is unavailable.")
 
-        return Response(
-            {"results": AppliedControlReadSerializer(duplicate_applied_control).data}
-        )
+        with transaction.atomic():
+            applied_control = self.model.objects.select_for_update().get(id=source.id)
+            # Evidence name uniqueness is enforced in application code rather
+            # than by a database constraint.  Serialize duplicate operations
+            # for the target folder before checking or creating evidence rows.
+            new_folder = (
+                Folder.objects.select_for_update().filter(id=target_folder_id).first()
+            )
+            if new_folder is None:
+                raise PermissionDenied("The target folder is unavailable.")
+            if self.model is AppliedControl and applied_control.category == "policy":
+                raise NotFound()
+            if not RoleAssignment.is_object_readable(
+                request.user, self.model, applied_control.id
+            ):
+                raise PermissionDenied("The source object is no longer available.")
+            if not RoleAssignment.is_access_allowed(
+                user=request.user,
+                perm=add_permission,
+                folder=new_folder,
+            ):
+                raise PermissionDenied("The target folder is unavailable.")
+
+            visible_actor_ids = RoleAssignment.get_viewable_object_ids(
+                request.user, Actor
+            )
+            visible_label_ids = RoleAssignment.get_viewable_object_ids(
+                request.user, FilteringLabel
+            )
+            visible_owners = applied_control.owner.filter(id__in=visible_actor_ids)
+            visible_labels = applied_control.filtering_labels.filter(
+                id__in=visible_label_ids
+            )
+
+            locked_reference_control = None
+            if applied_control.reference_control_id is not None:
+                locked_reference_control = (
+                    ReferenceControl.objects.select_for_update()
+                    .filter(id=applied_control.reference_control_id)
+                    .first()
+                )
+                visible_reference_control_ids = set(
+                    RoleAssignment.get_viewable_object_ids(
+                        request.user, ReferenceControl
+                    )
+                )
+                if (
+                    locked_reference_control is None
+                    or locked_reference_control.id not in visible_reference_control_ids
+                ):
+                    raise PermissionDenied(
+                        "The source control contains an unavailable reference."
+                    )
+
+            evidences = []
+            visible_target_evidence_by_name = {}
+            target_parent_ids = {
+                folder.id for folder in new_folder.get_parent_folders()
+            }
+            target_subfolder_ids = set(
+                new_folder.get_sub_folders().values_list("id", flat=True)
+            )
+            if data["duplicate_evidences"]:
+                source_evidence_ids = set(
+                    applied_control.evidences.values_list("id", flat=True)
+                )
+                evidences = list(
+                    Evidence.objects.select_for_update()
+                    .filter(id__in=source_evidence_ids)
+                    .select_related("folder")
+                    .order_by("id")
+                )
+                visible_evidence_ids = set(
+                    RoleAssignment.get_viewable_object_ids(request.user, Evidence)
+                )
+                if source_evidence_ids != {
+                    evidence.id
+                    for evidence in evidences
+                    if evidence.id in visible_evidence_ids
+                }:
+                    raise PermissionDenied(
+                        "All source evidences must be visible before duplication."
+                    )
+
+                target_evidences = []
+                if evidences:
+                    target_name_filter = Q()
+                    for evidence in evidences:
+                        target_name_filter |= Q(name__iexact=evidence.name)
+                    target_evidences = list(
+                        Evidence.objects.select_for_update()
+                        .filter(target_name_filter, folder=new_folder)
+                        .order_by("id")
+                    )
+                hidden_target_evidence_exists = any(
+                    evidence.id not in visible_evidence_ids
+                    for evidence in target_evidences
+                )
+                if hidden_target_evidence_exists:
+                    # Reusing a hidden row would disclose and attach it, while
+                    # cloning it would violate Evidence's folder-scoped name
+                    # invariant.  Fail before creating the control and do not
+                    # expose which target evidence caused the denial.
+                    raise PermissionDenied(
+                        "The target folder cannot accept the requested evidence copies."
+                    )
+                for target_evidence in target_evidences:
+                    visible_target_evidence_by_name.setdefault(
+                        target_evidence.name.casefold(), target_evidence
+                    )
+
+                clone_needed = any(
+                    evidence.name.casefold() not in visible_target_evidence_by_name
+                    and not (
+                        evidence.folder_id in target_parent_ids
+                        and evidence.is_published
+                    )
+                    and evidence.folder_id not in target_subfolder_ids
+                    for evidence in evidences
+                )
+                if clone_needed:
+                    try:
+                        add_evidence_permission = Permission.objects.get(
+                            codename="add_evidence",
+                            content_type__app_label=Evidence._meta.app_label,
+                            content_type__model=Evidence._meta.model_name,
+                        )
+                    except (
+                        Permission.DoesNotExist,
+                        Permission.MultipleObjectsReturned,
+                    ):
+                        raise PermissionDenied(
+                            "Evidence has no unambiguous add permission."
+                        )
+                    if not RoleAssignment.is_access_allowed(
+                        user=request.user,
+                        perm=add_evidence_permission,
+                        folder=new_folder,
+                    ):
+                        raise PermissionDenied(
+                            "Missing add evidence permission on the target folder."
+                        )
+
+            duplicate_applied_control = self.model.objects.create(
+                reference_control=(
+                    locked_reference_control
+                    if applied_control.reference_control_id is not None
+                    else None
+                ),
+                name=data["name"],
+                description=data["description"],
+                folder=new_folder,
+                ref_id=applied_control.ref_id,
+                category=applied_control.category,
+                csf_function=applied_control.csf_function,
+                priority=applied_control.priority,
+                status=applied_control.status,
+                start_date=applied_control.start_date,
+                eta=applied_control.eta,
+                expiry_date=applied_control.expiry_date,
+                link=applied_control.link,
+                effort=applied_control.effort,
+                cost=applied_control.cost,
+                progress_field=applied_control.progress_field,
+            )
+            duplicate_applied_control.owner.set(visible_owners)
+            duplicate_applied_control.filtering_labels.set(visible_labels)
+
+            for evidence in evidences:
+                target_evidence = visible_target_evidence_by_name.get(
+                    evidence.name.casefold()
+                )
+                if target_evidence is None and (
+                    (evidence.folder_id in target_parent_ids and evidence.is_published)
+                    or evidence.folder_id in target_subfolder_ids
+                ):
+                    target_evidence = evidence
+                if target_evidence is None:
+                    field_values = {
+                        field.name: getattr(evidence, field.name)
+                        for field in evidence._meta.fields
+                        if not field.primary_key and not field.auto_created
+                    }
+                    field_values["folder"] = new_folder
+                    target_evidence = Evidence.objects.create(**field_values)
+                    visible_target_evidence_by_name[evidence.name.casefold()] = (
+                        target_evidence
+                    )
+                duplicate_applied_control.evidences.add(target_evidence)
+
+            response_serializer = self.get_serializer_class(action="retrieve")(
+                duplicate_applied_control,
+                context=self.get_serializer_context(),
+            )
+            response_data = response_serializer.data
+            field_models = self._get_fieldsrelated_map(response_serializer)
+            if field_models:
+                allowed_ids = self._get_accessible_ids_map(set(field_models.values()))
+                response_data = self._filter_related_fields(
+                    response_data, field_models, allowed_ids
+                )
+
+        return Response({"results": response_data})
 
     @action(detail=False, methods=["get"])
     def ids(self, request):
         my_map = dict()
 
-        viewable_items = RoleAssignment.get_viewable_object_ids(
-            request.user, AppliedControl
-        )
-        for item in AppliedControl.objects.filter(id__in=viewable_items):
+        for item in self.get_queryset():
             if my_map.get(item.folder.name) is None:
                 my_map[item.folder.name] = {}
             my_map[item.folder.name].update({item.name: item.id})
@@ -6363,9 +7105,80 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
 
     @action(detail=False, name="Generate data for applied controls impact graph")
     def impact_graph(self, request):
-        viewable_controls_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, AppliedControl
+        from core.requirement_assessment_relationships import (
+            visible_requirement_assessment_rows,
         )
+
+        control_ids = list(self.get_queryset().values_list("id", flat=True))
+        controls = list(
+            self.model.objects.filter(id__in=control_ids).only(
+                "id", "name", "csf_function"
+            )
+        )
+
+        candidate_requirement_ids = RequirementAssessment.objects.filter(
+            applied_controls__id__in=control_ids
+        ).values_list("id", flat=True)
+        visible_requirements = visible_requirement_assessment_rows(
+            user=request.user,
+            ra_ids=candidate_requirement_ids,
+            policy_field="applied_controls",
+        )
+
+        visible_scenarios = {
+            scenario.id: scenario
+            for scenario in RiskScenario.objects.select_related("risk_assessment")
+            .filter(
+                id__in=RoleAssignment.get_viewable_object_ids(
+                    request.user, RiskScenario
+                ),
+                risk_assessment_id__in=RoleAssignment.get_viewable_object_ids(
+                    request.user, RiskAssessment
+                ),
+                applied_controls__id__in=control_ids,
+            )
+            .distinct()
+        }
+
+        def through_pairs(through, related_model, related_ids):
+            control_fk = next(
+                field
+                for field in through._meta.fields
+                if field.related_model is AppliedControl
+            )
+            related_fk = next(
+                field
+                for field in through._meta.fields
+                if field.related_model is related_model
+            )
+            return through.objects.filter(
+                **{
+                    f"{control_fk.name}_id__in": control_ids,
+                    f"{related_fk.name}_id__in": related_ids,
+                }
+            ).values_list(
+                f"{control_fk.name}_id",
+                f"{related_fk.name}_id",
+            )
+
+        requirements_by_control = defaultdict(list)
+        for control_id, requirement_id in through_pairs(
+            RequirementAssessment.applied_controls.through,
+            RequirementAssessment,
+            visible_requirements,
+        ):
+            requirements_by_control[control_id].append(
+                visible_requirements[requirement_id]
+            )
+
+        scenarios_by_control = defaultdict(list)
+        for control_id, scenario_id in through_pairs(
+            RiskScenario.applied_controls.through,
+            RiskScenario,
+            visible_scenarios,
+        ):
+            scenarios_by_control[control_id].append(visible_scenarios[scenario_id])
+
         csf_functions_map = dict()
         categories = [{"name": "--"}]
         for i, option in enumerate(ReferenceControl.CSF_FUNCTION, 1):
@@ -6380,7 +7193,7 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
         links = list()
         indexes = dict()
         idx_cnt = 0
-        for ac in AppliedControl.objects.filter(id__in=viewable_controls_ids):
+        for ac in controls:
             ac_key = f"ac-{ac.id}"
             nodes.append(
                 {
@@ -6392,7 +7205,7 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
             indexes[ac_key] = idx_cnt
             idx_cnt += 1
             # attached requirement_assessments
-            for req in RequirementAssessment.objects.filter(applied_controls__id=ac.id):
+            for req in requirements_by_control[ac.id]:
                 req_key = f"req-{req.id}"
                 if req_key not in indexes:
                     # Add RequirementAssessment node only if it doesn't exist
@@ -6425,7 +7238,7 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
                 links.append({"source": indexes[audit_key], "target": indexes[req_key]})
                 links.append({"source": indexes[ac_key], "target": indexes[req_key]})
 
-            for sc in RiskScenario.objects.filter(applied_controls__id=ac.id):
+            for sc in scenarios_by_control[ac.id]:
                 sc_key = f"sc-{sc.id}"
                 if sc_key not in indexes:
                     nodes.append(
@@ -6459,10 +7272,7 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
 
     @action(detail=False, name="Get applied controls sunburst data")
     def sunburst_data(self, request):
-        viewable_objects = RoleAssignment.get_viewable_object_ids(
-            request.user, AppliedControl
-        )
-        queryset = AppliedControl.objects.filter(id__in=viewable_objects)
+        queryset = self.get_queryset()
 
         # Build hierarchical structure: csf_function -> category -> priority -> status
         hierarchy = {}
@@ -6563,34 +7373,60 @@ class AppliedControlViewSet(ExportMixin, BaseModelViewSet):
         if dry_run == "false":
             dry_run = False
 
-        applied_control = self.get_object()
-        reference_control = applied_control.reference_control
-        changes: list[tuple[str, str]] = []  # List of (old_value, new_value) tuples.
+        with transaction.atomic():
+            applied_control = get_object_or_404(
+                self.get_queryset().select_for_update(),
+                id=UUID(pk),
+            )
+            if not RoleAssignment.is_object_accessible(
+                request.user, "change", self.model, applied_control.id
+            ):
+                raise PermissionDenied("Missing change permission for this object.")
+            reference_control = applied_control.reference_control
+            if reference_control is None:
+                raise DRFValidationError(
+                    {
+                        "reference_control": (
+                            "This control has no reference control to sync."
+                        )
+                    }
+                )
+            if self.model is AppliedControl and reference_control.category == "policy":
+                raise DRFValidationError(
+                    {
+                        "reference_control": (
+                            "A policy reference control cannot change a generic applied "
+                            "control into a policy; use the policy API."
+                        )
+                    }
+                )
+            changes: list[tuple[str, str]] = []
 
-        FIELDS_TO_SYNC: Final[list[str]] = [
-            "category",
-            "csf_function",
-        ]
+            fields_to_sync: Final[list[str]] = (
+                ["csf_function"]
+                if self.model is Policy
+                else ["category", "csf_function"]
+            )
 
-        for field_to_sync in FIELDS_TO_SYNC:
-            reference_control_value = getattr(reference_control, field_to_sync)
+            for field_to_sync in fields_to_sync:
+                reference_control_value = getattr(reference_control, field_to_sync)
 
-            applied_control_value = getattr(applied_control, field_to_sync)
-            if reference_control_value != applied_control_value:
-                changes.append((reference_control_value, applied_control_value))
+                applied_control_value = getattr(applied_control, field_to_sync)
+                if reference_control_value != applied_control_value:
+                    changes.append((reference_control_value, applied_control_value))
 
-            setattr(applied_control, field_to_sync, reference_control_value)
+                setattr(applied_control, field_to_sync, reference_control_value)
 
-        if dry_run:
+            if dry_run:
+                return Response(changes)
+
+            skip_sync = all(
+                field_to_sync not in AppliedControl.INTEGRATION_SYNCABLE_FIELDS
+                for field_to_sync in fields_to_sync
+            )
+            applied_control.save(update_fields=fields_to_sync, skip_sync=skip_sync)
+
             return Response(changes)
-
-        skip_sync = all(
-            field_to_sync not in AppliedControl.INTEGRATION_SYNCABLE_FIELDS
-            for field_to_sync in FIELDS_TO_SYNC
-        )
-        applied_control.save(update_fields=FIELDS_TO_SYNC, skip_sync=skip_sync)
-
-        return Response(changes)
 
     @action(detail=False, methods=["get"], name="MSS Excel Export")
     def mss_xlsx(self, request):
@@ -6768,7 +7604,7 @@ class ActionPlanBudgetOverview:
         return annual_cost
 
     @staticmethod
-    def compute_budget_overview(queryset):
+    def compute_budget_overview(queryset, *, user):
         from core.utils import get_global_currency, format_currency
         from global_settings.models import GlobalSettings
         from django.utils import timezone
@@ -6781,9 +7617,20 @@ class ActionPlanBudgetOverview:
         fmt = lambda v: format_currency(v, currency)
         today = timezone.localdate()
 
-        # Defensive prefetch: top-owner/top-folder iteration touches M2M + FK
-        if hasattr(queryset, "prefetch_related"):
-            queryset = queryset.prefetch_related("owner").select_related("folder")
+        visible_actor_ids = RoleAssignment.get_viewable_object_ids(user, Actor)
+        visible_folder_ids = set(RoleAssignment.get_viewable_object_ids(user, Folder))
+
+        # Keep this authorization projection separate from any broader prefetch
+        # installed by a caller for a different serializer.
+        queryset = queryset.prefetch_related(
+            Prefetch(
+                "owner",
+                queryset=Actor.objects.filter(id__in=visible_actor_ids).select_related(
+                    "user", "team", "entity"
+                ),
+                to_attr="budget_visible_owners",
+            )
+        ).select_related("folder")
 
         controls = list(queryset)
         count = len(controls)
@@ -6894,7 +7741,7 @@ class ActionPlanBudgetOverview:
                 eta_buckets[key]["total"] += cost
 
             # top owners (M2M) — key by pk so homonyms don't collapse into one bucket
-            for owner in ctrl.owner.all():
+            for owner in ctrl.budget_visible_owners:
                 owner_key = str(owner.pk)
                 bucket = owner_counts.setdefault(
                     owner_key,
@@ -6917,14 +7764,22 @@ class ActionPlanBudgetOverview:
                 sb_entry["count"] += 1
 
             # top folders — same: key by folder_id so two folders sharing a name don't merge
-            folder_key = str(ctrl.folder_id) if ctrl.folder_id else "_unset"
-            folder_label = ctrl.folder.name if ctrl.folder_id else "not_set"
-            bucket = folder_counts.setdefault(
-                folder_key,
-                {"key": folder_key, "label": folder_label, "count": 0, "total": 0.0},
-            )
-            bucket["count"] += 1
-            bucket["total"] += cost
+            # A hidden folder is omitted completely: even an anonymized bucket
+            # would disclose its existence and control count.
+            if ctrl.folder_id is None or ctrl.folder_id in visible_folder_ids:
+                folder_key = str(ctrl.folder_id) if ctrl.folder_id else "_unset"
+                folder_label = ctrl.folder.name if ctrl.folder_id else "not_set"
+                bucket = folder_counts.setdefault(
+                    folder_key,
+                    {
+                        "key": folder_key,
+                        "label": folder_label,
+                        "count": 0,
+                        "total": 0.0,
+                    },
+                )
+                bucket["count"] += 1
+                bucket["total"] += cost
 
         # Pre-format totals with proper currency position
         for bucket in by_status.values():
@@ -7200,17 +8055,18 @@ class RiskAssessmentActionPlanList(ActionPlanList):
             raise PermissionDenied()
 
         assessment = RiskAssessment.objects.get(id=risk_id)
-        risk_scenarios = assessment.risk_scenarios.all()
+        risk_scenarios = assessment.risk_scenarios.filter(
+            id__in=RoleAssignment.get_viewable_object_ids(
+                self.request.user, RiskScenario
+            )
+        )
 
         qs = AppliedControl.objects.filter(
             Q(risk_scenarios__in=risk_scenarios)
             | Q(risk_scenarios_e__in=risk_scenarios)
         ).distinct()
 
-        viewable_controls = RoleAssignment.get_viewable_object_ids(
-            self.request.user, AppliedControl
-        )
-        return qs.filter(id__in=viewable_controls)
+        return filter_caller_visible_applied_controls(qs, self.request.user)
 
 
 class ComplianceAssessmentActionPlanBudgetOverview(
@@ -7218,7 +8074,7 @@ class ComplianceAssessmentActionPlanBudgetOverview(
 ):
     def get(self, request, *args, **kwargs):
         qs = self.filter_queryset(self.get_queryset())
-        payload = self.compute_budget_overview(qs)
+        payload = self.compute_budget_overview(qs, user=request.user)
         _, _, current_signature = (
             ComplianceAssessmentViewSet._get_action_plan_export_projection(
                 request.user,
@@ -7241,7 +8097,7 @@ class RiskAssessmentActionPlanBudgetOverview(
 ):
     def get(self, request, *args, **kwargs):
         qs = self.filter_queryset(self.get_queryset())
-        return Response(self.compute_budget_overview(qs))
+        return Response(self.compute_budget_overview(qs, user=request.user))
 
 
 class PolicyViewSet(AppliedControlViewSet):
@@ -7644,25 +8500,29 @@ class RiskScenarioViewSet(ExportMixin, BaseModelViewSet):
         url_path="sync-to-actions",
     )
     def sync_to_applied_controls(self, request, pk):
-        dry_run = request.query_params.get("dry_run", True)
-        if dry_run == "false":
-            dry_run = False
-        reset_residual = request.data.get("reset_residual", False)
-        risk_scenario = RiskScenario.objects.get(id=pk)
-
-        if not RoleAssignment.is_access_allowed(
-            user=request.user,
-            perm=Permission.objects.get(codename="change_riskscenario"),
-            folder=Folder.get_folder(risk_scenario),
-        ):
-            return Response(status=status.HTTP_403_FORBIDDEN)
-
-        changes = risk_scenario.sync_to_applied_controls(
-            reset_residual=reset_residual, dry_run=dry_run
+        options = RiskActionSyncInputSerializer(
+            data={
+                "dry_run": request.query_params.get("dry_run", True),
+                "reset_residual": request.data.get("reset_residual", False),
+            }
         )
-        return Response(
-            {"changes": AppliedControlReadSerializer(changes, many=True).data}
-        )
+        options.is_valid(raise_exception=True)
+        with transaction.atomic():
+            sync_result = sync_risk_scenario_actions(
+                user=request.user,
+                risk_scenario_id=pk,
+                reset_residual=options.validated_data["reset_residual"],
+                dry_run=options.validated_data["dry_run"],
+            )
+            # Avoid the generic AppliedControl serializer here: it includes
+            # integration SyncMapping metadata that is unrelated to this
+            # operation and governed by a different authority boundary.
+            payload = [
+                {"id": str(control.id), "name": control.name}
+                for control in sync_result.changed_controls
+            ]
+            sync_result.reprove(user=request.user)
+        return Response({"changes": payload})
 
 
 class RiskAcceptanceFilterSet(GenericFilterSet):
@@ -10434,6 +11294,7 @@ class EvidenceViewSet(BaseModelViewSet):
     """
 
     model = Evidence
+    governed_requirement_assessment_filter_field = "evidences"
     filterset_class = EvidenceFilterSet
 
     def get_queryset(self):
@@ -10455,7 +11316,7 @@ class EvidenceViewSet(BaseModelViewSet):
     def owner(self, request):
         return Response(
             ActorReadSerializer(
-                Actor.objects.filter(evidences__isnull=False).distinct(),
+                self._get_visible_related_owners("evidences"),
                 many=True,
             ).data
         )
@@ -11409,7 +12270,7 @@ def _preview_suggestions_for_compliance_assessment(
         ref_ctrls = [
             rc
             for rc in ra.requirement.reference_controls.all()
-            if rc.id in visible_reference_control_ids
+            if rc.id in visible_reference_control_ids and rc.category != "policy"
         ]
         if selected_ids_set is not None:
             ref_ctrls = [rc for rc in ref_ctrls if str(rc.id) in selected_ids_set]
@@ -11585,10 +12446,14 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
         control_links = RequirementAssessment.applied_controls.through.objects.filter(
             requirementassessment_id__in=ra_ids
         )
-        visible_control_ids = RoleAssignment.get_viewable_object_ids(
-            user, AppliedControl
+        control_scope = AppliedControl.objects.filter(
+            id__in=control_links.values("appliedcontrol_id")
         )
-        if control_links.exclude(appliedcontrol_id__in=visible_control_ids).exists():
+        authorized_control_scope = filter_caller_visible_applied_controls(
+            control_scope,
+            user,
+        )
+        if control_scope.exclude(id__in=authorized_control_scope.values("id")).exists():
             raise PermissionDenied(
                 "Complete audit data is unavailable for this caller."
             )
@@ -11596,9 +12461,7 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
         direct_evidence_links = RequirementAssessment.evidences.through.objects.filter(
             requirementassessment_id__in=ra_ids
         )
-        control_ids = control_links.filter(
-            appliedcontrol_id__in=visible_control_ids
-        ).values_list("appliedcontrol_id", flat=True)
+        control_ids = authorized_control_scope.values_list("id", flat=True)
         control_evidence_links = AppliedControl.evidences.through.objects.filter(
             appliedcontrol_id__in=control_ids
         )
@@ -12380,18 +13243,15 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
         control_scope = AppliedControl.objects.filter(
             requirement_assessments__id__in=requirement_assessment_ids
         ).distinct()
-        visible_control_ids = RoleAssignment.get_viewable_object_ids(
-            user, AppliedControl
+        authorized_control_scope = filter_caller_visible_applied_controls(
+            control_scope,
+            user,
         )
-        if control_scope.exclude(id__in=visible_control_ids).exists():
+        if control_scope.exclude(id__in=authorized_control_scope.values("id")).exists():
             raise PermissionDenied(
                 "Complete action-plan data is unavailable for this caller."
             )
-        control_ids = list(
-            control_scope.filter(id__in=visible_control_ids).values_list(
-                "id", flat=True
-            )
-        )
+        control_ids = list(authorized_control_scope.values_list("id", flat=True))
 
         visible_control_folder_ids = None
         if include_control_folder:
@@ -12484,8 +13344,9 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
             compliance_assessment=compliance_assessment,
             id__in=RoleAssignment.get_viewable_object_ids(user, RequirementAssessment),
         ).select_related("requirement")
-        controls = AppliedControl.objects.filter(id__in=control_ids).filter(
-            id__in=visible_control_ids
+        controls = filter_caller_visible_applied_controls(
+            AppliedControl.objects.filter(id__in=control_ids),
+            user,
         )
         if visible_control_folder_ids is not None:
             controls = controls.filter(folder_id__in=visible_control_folder_ids)
@@ -15485,9 +16346,10 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
             self.request.query_params.get("assessable", "false")
         ).lower() in {"true", "1", "yes"}
         compliance_assessment = self.get_object()
-        if compliance_assessment.framework_id not in set(
-            RoleAssignment.get_viewable_object_ids(request.user, Framework)
-        ):
+        if not Framework.objects.filter(
+            id=compliance_assessment.framework_id,
+            id__in=RoleAssignment.get_viewable_object_ids(request.user, Framework),
+        ).exists():
             raise PermissionDenied(
                 "Complete audit data is unavailable for this caller."
             )
@@ -15561,14 +16423,25 @@ class ComplianceAssessmentViewSet(BaseModelViewSet):
         # Viewer role: respondent unless the user holds the full auditor view
         # (view_compliance_assessment_full) on the CA's folder.
         viewer_role = "respondent" if is_respondent else "auditor"
+        serializer_context = {
+            "viewer_role": viewer_role,
+            "request": request,
+        }
+        serializer_context["_questionnaire_visibility_context"] = (
+            QuestionnaireVisibilityContext.build(
+                request=request,
+                requirement_assessments=requirement_assessments_objects,
+                requirement_nodes=requirements_objects,
+            )
+        )
 
         requirement_assessments = RequirementAssessmentReadSerializer(
             requirement_assessments_objects,
             many=True,
-            context={"viewer_role": viewer_role, "request": request},
+            context=serializer_context,
         ).data
         requirements = RequirementNodeReadSerializer(
-            requirements_objects, many=True, context={"request": request}
+            requirements_objects, many=True, context=serializer_context
         ).data
         requirements_list = {
             "requirements": requirements,
@@ -18101,16 +18974,24 @@ class RequirementAssessmentViewSet(BaseModelViewSet):
                 "answers__selected_choices",  # Needed by build_answers_dict() to get choice ref_ids
                 "requirement__questions",  # Needed by FilteredNodeSerializer.questions
                 "requirement__questions__choices",  # Needed by get_questions_translated
+                "requirement__reference_controls",
+                "requirement__threats",
             )
         )
         user_actors = Actor.get_all_for_user(self.request.user)
         visible_requirement_node_ids = RoleAssignment.get_viewable_object_ids(
             self.request.user, RequirementNode
         )
+        visible_framework_ids = RoleAssignment.get_viewable_object_ids(
+            self.request.user, Framework
+        )
         return (
             qs.filter(
                 compliance_assessment_id__in=self._get_viewable_ca_ids(),
                 requirement_id__in=visible_requirement_node_ids,
+                compliance_assessment__framework_id__in=visible_framework_ids,
+                requirement__framework_id__in=visible_framework_ids,
+                requirement__framework_id=F("compliance_assessment__framework_id"),
             )
             .filter(
                 Q(compliance_assessment_id__in=self._get_full_view_ca_ids())
@@ -18142,11 +19023,25 @@ class RequirementAssessmentViewSet(BaseModelViewSet):
             request.user, AppliedControl
         )
 
+        measures = list(
+            _optimized_applied_control_action_queryset(
+                AppliedControl.objects.filter(id__in=object_ids_view)
+                .exclude(category="policy")
+                .exclude(status="done")
+                .order_by("eta")
+            )
+        )
+        from core.applied_control_visibility import (
+            build_applied_control_request_projections,
+        )
+
+        projections = build_applied_control_request_projections(
+            user=request.user,
+            controls=measures,
+        )
         measures = sorted(
-            AppliedControl.objects.filter(id__in=object_ids_view)
-            .exclude(status="done")
-            .order_by("eta"),
-            key=lambda mtg: mtg.get_ranking_score(),
+            measures,
+            key=lambda measure: projections[measure.id].ranking_score,
             reverse=True,
         )
 
@@ -18162,12 +19057,20 @@ class RequirementAssessmentViewSet(BaseModelViewSet):
             for key in ["created_at","updated_at","eta"] :
                 measures[i][key] = str(measures[i][key])"""
 
-        ranking_scores = {str(mtg.id): mtg.get_ranking_score() for mtg in measures}
-
-        measures = [AppliedControlReadSerializer(mtg).data for mtg in measures]
-
-        for i in range(len(measures)):
-            measures[i]["ranking_score"] = ranking_scores[measures[i]["id"]]
+        context = {
+            "request": request,
+            "daily_rate": GlobalSettings.get_daily_rate(),
+            "optimized_data": self._get_optimized_object_data(measures),
+            "_applied_control_request_projections": {
+                (request.user.pk, control_id): projection
+                for control_id, projection in projections.items()
+            },
+        }
+        measures = AppliedControlBulkReadSerializer(
+            measures,
+            many=True,
+            context=context,
+        ).data
 
         """
         The serializer of AppliedControl isn't applied automatically for this function
@@ -18177,8 +19080,31 @@ class RequirementAssessmentViewSet(BaseModelViewSet):
 
     @action(detail=False, name="Get the secuity measures to review")
     def to_review(self, request):
-        measures = measures_to_review(request.user)
-        measures = [AppliedControlReadSerializer(mtg).data for mtg in measures]
+        measures = list(
+            _optimized_applied_control_action_queryset(measures_to_review(request.user))
+        )
+        from core.applied_control_visibility import (
+            build_applied_control_request_projections,
+        )
+
+        projections = build_applied_control_request_projections(
+            user=request.user,
+            controls=measures,
+        )
+        context = {
+            "request": request,
+            "daily_rate": GlobalSettings.get_daily_rate(),
+            "optimized_data": self._get_optimized_object_data(measures),
+            "_applied_control_request_projections": {
+                (request.user.pk, control_id): projection
+                for control_id, projection in projections.items()
+            },
+        }
+        measures = AppliedControlBulkReadSerializer(
+            measures,
+            many=True,
+            context=context,
+        ).data
 
         """
         The serializer of AppliedControl isn't applied automatically for this function
@@ -19073,6 +19999,7 @@ class SecurityExceptionViewSet(ExportMixin, BaseModelViewSet):
     """
 
     model = SecurityException
+    governed_requirement_assessment_filter_field = "security_exceptions"
     filterset_fields = {
         "name": ["exact"],
         "requirement_assessments": ["exact"],
@@ -19773,7 +20700,7 @@ class FindingViewSet(BaseModelViewSet):
     def owner(self, request):
         return Response(
             ActorReadSerializer(
-                Actor.objects.filter(findings__isnull=False).distinct(),
+                self._get_visible_related_owners("findings"),
                 many=True,
             ).data
         )
@@ -21838,9 +22765,10 @@ class RequirementAssignmentViewSet(BaseModelViewSet):
         """
         assignment = self.get_object()
         compliance_assessment = assignment.compliance_assessment
-        if compliance_assessment.framework_id not in set(
-            RoleAssignment.get_viewable_object_ids(request.user, Framework)
-        ):
+        if not Framework.objects.filter(
+            id=compliance_assessment.framework_id,
+            id__in=RoleAssignment.get_viewable_object_ids(request.user, Framework),
+        ).exists():
             raise PermissionDenied(
                 "Complete audit data is unavailable for this caller."
             )
@@ -21928,48 +22856,58 @@ class RequirementAssignmentViewSet(BaseModelViewSet):
                 if parent:
                     req._parent_requirement_obj = parent
 
+        serializer_context = {
+            "viewer_role": viewer_role,
+            "request": request,
+        }
+        questionnaire_context = QuestionnaireVisibilityContext.build(
+            request=request,
+            requirement_assessments=requirement_assessments_objects,
+            requirement_nodes=requirements_objects,
+        )
+        serializer_context["_questionnaire_visibility_context"] = questionnaire_context
         requirement_assessments = RequirementAssessmentReadSerializer(
             requirement_assessments_objects,
             many=True,
-            context={"viewer_role": viewer_role, "request": request},
+            context=serializer_context,
         ).data
         requirements = RequirementNodeReadSerializer(
-            requirements_objects, many=True, context={"request": request}
+            requirements_objects, many=True, context=serializer_context
         ).data
 
-        # Compute per-RA question counts for question-based progress
-        question_counts = {}
-        total_visible_questions = 0
-        total_answered_questions = 0
-        for ra in requirement_assessments_objects:
-            visible, answered = ra.get_visible_questions_counts(user=request.user)
-            question_counts[str(ra.id)] = {
-                "visible_questions": visible,
-                "answered_questions": answered,
-            }
-            total_visible_questions += visible
-            total_answered_questions += answered
+        response_data = {
+            "requirements": requirements,
+            "requirement_assessments": requirement_assessments,
+            "viewer_role": viewer_role,
+        }
+        # Question progress is derived from Answer rows.  When the answer field
+        # itself is hidden, both per-row and aggregate counts are sensitive too.
+        if is_field_visible_to(compliance_assessment, "answers", viewer_role):
+            question_counts = {}
+            total_visible_questions = 0
+            total_answered_questions = 0
+            for ra in requirement_assessments_objects:
+                visible, answered = questionnaire_context.counts_for(request, ra)
+                question_counts[str(ra.id)] = {
+                    "visible_questions": visible,
+                    "answered_questions": answered,
+                }
+                total_visible_questions += visible
+                total_answered_questions += answered
 
-        for ra_data in requirement_assessments:
-            ra_id = str(ra_data["id"])
-            if ra_id in question_counts:
-                ra_data["visible_questions"] = question_counts[ra_id][
-                    "visible_questions"
-                ]
-                ra_data["answered_questions"] = question_counts[ra_id][
-                    "answered_questions"
-                ]
+            for ra_data in requirement_assessments:
+                ra_id = str(ra_data["id"])
+                if ra_id in question_counts:
+                    ra_data["visible_questions"] = question_counts[ra_id][
+                        "visible_questions"
+                    ]
+                    ra_data["answered_questions"] = question_counts[ra_id][
+                        "answered_questions"
+                    ]
+            response_data["total_visible_questions"] = total_visible_questions
+            response_data["total_answered_questions"] = total_answered_questions
 
-        return Response(
-            {
-                "requirements": requirements,
-                "requirement_assessments": requirement_assessments,
-                "total_visible_questions": total_visible_questions,
-                "total_answered_questions": total_answered_questions,
-                "viewer_role": viewer_role,
-            },
-            status=status.HTTP_200_OK,
-        )
+        return Response(response_data, status=status.HTTP_200_OK)
 
     @staticmethod
     def _send_transition_notification(assignment, transition_key, observation=""):
@@ -22006,11 +22944,20 @@ class QuestionViewSet(BaseModelViewSet):
     ]
 
     def get_queryset(self):
+        visible_framework_ids = RoleAssignment.get_viewable_object_ids(
+            self.request.user, Framework
+        )
+        visible_requirement_node_ids = RoleAssignment.get_viewable_object_ids(
+            self.request.user, RequirementNode
+        )
         qs = (
             super()
             .get_queryset()
             .select_related("requirement_node", "requirement_node__framework", "folder")
-            .prefetch_related("choices")
+            .filter(
+                requirement_node_id__in=visible_requirement_node_ids,
+                requirement_node__framework_id__in=visible_framework_ids,
+            )
         )
         # Allow filtering by framework
         framework_id = self.request.query_params.get("framework")
@@ -22030,7 +22977,55 @@ class QuestionChoiceViewSet(BaseModelViewSet):
     ]
 
     def get_queryset(self):
-        return super().get_queryset().select_related("question", "folder")
+        visible_framework_ids = RoleAssignment.get_viewable_object_ids(
+            self.request.user, Framework
+        )
+        visible_question_ids = RoleAssignment.get_viewable_object_ids(
+            self.request.user, Question
+        )
+        visible_requirement_node_ids = RoleAssignment.get_viewable_object_ids(
+            self.request.user, RequirementNode
+        )
+        return (
+            super()
+            .get_queryset()
+            .filter(
+                question_id__in=visible_question_ids,
+                question__requirement_node_id__in=visible_requirement_node_ids,
+                question__requirement_node__framework_id__in=visible_framework_ids,
+            )
+            .select_related("question", "folder")
+        )
+
+
+def _answer_field_access_expression(role: str):
+    """SQL projection of resolved ``answers`` access for one viewer role.
+
+    A non-empty CA snapshot is authoritative.  Only legacy empty snapshots
+    inherit the framework template, matching ``resolve_field_visibility``.
+    Coalescing missing JSON paths is important: negating a nullable JSON lookup
+    would otherwise drop ordinary assessments whose snapshot has no ``answers``
+    key.
+    """
+    from django.db.models.fields.json import KeyTextTransform, KeyTransform
+
+    ca_path = "requirement_assessment__compliance_assessment"
+    ca_access = KeyTextTransform(
+        role,
+        KeyTransform("answers", f"{ca_path}__field_visibility"),
+    )
+    framework_access = KeyTextTransform(
+        role,
+        KeyTransform("answers", f"{ca_path}__framework__field_visibility"),
+    )
+    return Case(
+        When(
+            **{f"{ca_path}__field_visibility": {}},
+            then=Coalesce(framework_access, Value("edit")),
+        ),
+        default=Coalesce(ca_access, Value("edit")),
+        output_field=CharField(),
+    )
 
 
 class AnswerViewSet(BaseModelViewSet):
@@ -22044,6 +23039,21 @@ class AnswerViewSet(BaseModelViewSet):
     ]
 
     def get_queryset(self):
+        user = self.request.user
+        visible_question_ids = RoleAssignment.get_viewable_object_ids(user, Question)
+        visible_requirement_node_ids = RoleAssignment.get_viewable_object_ids(
+            user, RequirementNode
+        )
+        visible_framework_ids = RoleAssignment.get_viewable_object_ids(user, Framework)
+        visible_choice_ids = RoleAssignment.get_viewable_object_ids(
+            user, QuestionChoice
+        )
+        visible_choices = QuestionChoice.objects.filter(
+            id__in=visible_choice_ids,
+            question_id__in=visible_question_ids,
+            question__requirement_node_id__in=visible_requirement_node_ids,
+            question__requirement_node__framework_id__in=visible_framework_ids,
+        )
         qs = (
             super()
             .get_queryset()
@@ -22053,13 +23063,18 @@ class AnswerViewSet(BaseModelViewSet):
                 "question",
                 "folder",
             )
-            .prefetch_related("selected_choices")
+            .prefetch_related(
+                Prefetch(
+                    "selected_choices",
+                    queryset=visible_choices,
+                    to_attr="questionnaire_visible_choices",
+                )
+            )
         )
         # Allow filtering by compliance assessment
         ca_id = self.request.query_params.get("compliance_assessment")
         if ca_id:
             qs = qs.filter(requirement_assessment__compliance_assessment_id=ca_id)
-        user = self.request.user
         visible_ca_ids = RoleAssignment.get_viewable_object_ids(
             user, ComplianceAssessment
         )
@@ -22070,17 +23085,36 @@ class AnswerViewSet(BaseModelViewSet):
         full_ca_ids = get_full_view_compliance_assessment_ids(user)
         user_actors = Actor.get_all_for_user(user)
         assigned_ra_ids = RequirementAssignment.objects.filter(
-            actor__in=user_actors
-        ).values_list("requirement_assessments__id", flat=True)
+            actor__in=user_actors,
+            compliance_assessment_id=OuterRef(
+                "requirement_assessment__compliance_assessment_id"
+            ),
+            requirement_assessments=OuterRef("requirement_assessment_id"),
+        )
+        full_view = Q(requirement_assessment__compliance_assessment_id__in=full_ca_ids)
+        respondent_view = ~full_view & Q(_has_matching_assignment=True)
         return (
             qs.filter(
                 requirement_assessment_id__in=visible_ra_ids,
                 requirement_assessment__compliance_assessment_id__in=visible_ca_ids,
                 question_id__in=visible_question_ids,
+                question__requirement_node_id__in=visible_requirement_node_ids,
+                question__requirement_node__framework_id__in=visible_framework_ids,
+                question__requirement_node_id=F(
+                    "requirement_assessment__requirement_id"
+                ),
+                requirement_assessment__requirement__framework_id=F(
+                    "requirement_assessment__compliance_assessment__framework_id"
+                ),
+            )
+            .alias(
+                _has_matching_assignment=Exists(assigned_ra_ids),
+                _answer_auditor_access=_answer_field_access_expression("auditor"),
+                _answer_respondent_access=_answer_field_access_expression("respondent"),
             )
             .filter(
-                Q(requirement_assessment__compliance_assessment_id__in=full_ca_ids)
-                | Q(requirement_assessment_id__in=assigned_ra_ids)
+                (full_view & ~Q(_answer_auditor_access="hidden"))
+                | (respondent_view & ~Q(_answer_respondent_access="hidden"))
             )
             .distinct()
         )

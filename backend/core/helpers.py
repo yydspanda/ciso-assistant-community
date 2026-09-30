@@ -108,13 +108,15 @@ def applied_control_priority(user: User):
     return clusters
 
 
-def measures_to_review(user: User):
-    object_ids_view = RoleAssignment.get_viewable_object_ids(user, AppliedControl)
+def measures_to_review(user: User, model=AppliedControl):
+    object_ids_view = RoleAssignment.get_viewable_object_ids(user, model)
     measures = (
-        AppliedControl.objects.filter(id__in=object_ids_view)
+        model.objects.filter(id__in=object_ids_view)
         .filter(expiry_date__lte=date.today() + timedelta(days=30))
         .order_by("expiry_date")
     )
+    if model is AppliedControl:
+        measures = measures.exclude(category="policy")
 
     return measures
 
@@ -1136,7 +1138,7 @@ def risk_per_status(user: User):
     return {"localLables": local_lables, "labels": labels, "values": values}
 
 
-def applied_control_per_status(user: User):
+def applied_control_per_status(user: User, model=AppliedControl):
     values = list()
     labels = list()
     local_lables = list()
@@ -1149,8 +1151,10 @@ def applied_control_per_status(user: User):
         AppliedControl.Status.DEGRADED: "#F97316",
         AppliedControl.Status.DEPRECATED: "#E55759",
     }
-    object_ids_view = RoleAssignment.get_viewable_object_ids(user, AppliedControl)
-    viewable_applied_controls = AppliedControl.objects.filter(id__in=object_ids_view)
+    object_ids_view = RoleAssignment.get_viewable_object_ids(user, model)
+    viewable_applied_controls = model.objects.filter(id__in=object_ids_view)
+    if model is AppliedControl:
+        viewable_applied_controls = viewable_applied_controls.exclude(category="policy")
     for st in AppliedControl.Status.choices:
         count = viewable_applied_controls.filter(status=st[0]).count()
         v = {"value": count, "itemStyle": {"color": color_map[st[0]]}}

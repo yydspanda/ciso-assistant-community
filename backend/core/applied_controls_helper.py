@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
+from auditlog.models import LogEntry
 from django.contrib.auth.models import Permission
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
@@ -216,13 +217,16 @@ def _check_permissions(
     source_folders: list,
     target_folder,
     target_is_new: bool,
+    authority_model: type[AppliedControl],
 ) -> None:
     # Scope Permission.objects.get by content_type to avoid MultipleObjectsReturned
-    # on codename collisions across apps.
-    ct = ContentType.objects.get_for_model(AppliedControl)
-    change = Permission.objects.get(codename="change_appliedcontrol", content_type=ct)
-    delete = Permission.objects.get(codename="delete_appliedcontrol", content_type=ct)
-    add = Permission.objects.get(codename="add_appliedcontrol", content_type=ct)
+    # on codename collisions across apps.  Policy is a permission-bearing proxy,
+    # so its content type must not be collapsed to AppliedControl's concrete CT.
+    ct = ContentType.objects.get_for_model(authority_model, for_concrete_model=False)
+    model_name = authority_model._meta.model_name
+    change = Permission.objects.get(codename=f"change_{model_name}", content_type=ct)
+    delete = Permission.objects.get(codename=f"delete_{model_name}", content_type=ct)
+    add = Permission.objects.get(codename=f"add_{model_name}", content_type=ct)
 
     for folder in source_folders:
         if not RoleAssignment.is_access_allowed(user=user, perm=change, folder=folder):
@@ -255,6 +259,8 @@ def merge_applied_controls(
     user,
     request=None,
     lookup_queryset=None,
+    authority_model: type[AppliedControl] = AppliedControl,
+    write_serializer_class=AppliedControlWriteSerializer,
     dry_run: bool = False,
 ) -> dict:
     """Merge N sources into 1 target. See module docstring for semantics.
@@ -303,7 +309,13 @@ def merge_applied_controls(
         target_folder = existing.folder
 
     source_folders = [s.folder for s in sources if s.folder is not None]
-    _check_permissions(user, source_folders, target_folder, target_is_new)
+    _check_permissions(
+        user,
+        source_folders,
+        target_folder,
+        target_is_new,
+        authority_model,
+    )
 
     source_id_list = [s.id for s in sources]
 
@@ -330,27 +342,73 @@ def merge_applied_controls(
     with transaction.atomic():
         # Lock sources + target so concurrent writers can't smuggle changes in
         # between the dry-run preview and the rewire.
+        # Lock and mutate through the concrete model so auditlog and webhook
+        # registrations keep their established AppliedControl sender.  The
+        # route's proxy model still owns lookup IAM, permissions and creation.
+        storage_queryset = AppliedControl.objects.all()
+        if authority_model is Policy:
+            storage_queryset = storage_queryset.filter(category="policy")
+        else:
+            storage_queryset = storage_queryset.exclude(category="policy")
         locked_sources = list(
-            AppliedControl.objects.select_for_update().filter(id__in=source_id_list)
+            storage_queryset.select_for_update().filter(id__in=source_id_list)
         )
         if len(locked_sources) != len(source_id_list):
             raise ValidationError(
                 "One or more source applied controls are no longer available."
             )
         if target_existing_obj is not None:
-            AppliedControl.objects.select_for_update().filter(
-                id=target_existing_obj.id
-            ).first()
+            try:
+                target_existing_obj = storage_queryset.select_for_update().get(
+                    id=target_existing_obj.id
+                )
+            except AppliedControl.DoesNotExist:
+                raise ValidationError(
+                    "The target applied control is no longer available."
+                )
 
         sources = locked_sources
+        source_folders = [source.folder for source in sources if source.folder_id]
+        if target_existing_obj is not None:
+            target_folder = target_existing_obj.folder
+        _check_permissions(
+            user,
+            source_folders,
+            target_folder,
+            target_is_new,
+            authority_model,
+        )
+        folder_mismatch = any(
+            source.folder_id != getattr(target_folder, "id", None) for source in sources
+        )
 
         if target_is_new:
             serializer_context = {"request": request} if request is not None else {}
-            serializer = AppliedControlWriteSerializer(
+            serializer = write_serializer_class(
                 data=target.get("fields") or {}, context=serializer_context
             )
             serializer.is_valid(raise_exception=True)
-            target_obj = serializer.save()
+            created_target = serializer.save()
+            target_obj = storage_queryset.get(id=created_target.id)
+            if authority_model is Policy:
+                # Policy is a proxy authority and is intentionally not
+                # registered as a second audit-log storage model.  Record the
+                # creation against the concrete AppliedControl identity so
+                # merge-created policies have the same immutable audit trail
+                # as ordinary controls.  The existence guard prevents a
+                # duplicate if the proxy is registered in the future.
+                concrete_ct = ContentType.objects.get_for_model(AppliedControl)
+                has_create_log = LogEntry.objects.filter(
+                    content_type=concrete_ct,
+                    object_pk=str(target_obj.pk),
+                    action=LogEntry.Action.CREATE,
+                ).exists()
+                if not has_create_log:
+                    LogEntry.objects.log_create(
+                        target_obj,
+                        action=LogEntry.Action.CREATE,
+                        changes={},
+                    )
         elif target_existing_obj is not None:
             target_obj = target_existing_obj
         else:
@@ -380,7 +438,7 @@ def merge_applied_controls(
                     "Webhook dispatch failed during merge (deleted)", exc_info=True
                 )
 
-        AppliedControl.objects.filter(id__in=source_id_list).delete()
+        storage_queryset.filter(id__in=source_id_list).delete()
 
         # Refresh updated_at + re-trigger integration sync. Skip for a new
         # target: its initial save already did both, and M2M additions don't
@@ -388,11 +446,14 @@ def merge_applied_controls(
         if not target_is_new:
             target_obj.save()
 
+        target_event = "created" if target_is_new else "updated"
         try:
-            dispatch_webhook_event(target_obj, "updated")
+            dispatch_webhook_event(target_obj, target_event)
         except Exception:
             logger.error(
-                "Webhook dispatch failed during merge (updated)", exc_info=True
+                "Webhook dispatch failed during merge",
+                event_type=target_event,
+                exc_info=True,
             )
 
     logger.info(

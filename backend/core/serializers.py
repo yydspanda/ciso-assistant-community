@@ -11,6 +11,17 @@ from django.utils import timezone
 
 from django.conf import settings
 from core.models import *
+from core.questionnaire_visibility import (
+    DirectQuestionVisibilityContext,
+    QuestionnaireVisibilityContext,
+    project_questionnaire_payload,
+)
+from core.requirement_assessment_relationships import (
+    GovernedRequirementAssessmentPrimaryKeyRelatedField,
+    RequirementAssessmentRelationshipAuthorityMixin,
+    RequirementAssessmentRelationshipProjectionListSerializer,
+    RequirementAssessmentRelationshipProjectionMixin,
+)
 from core.serializer_fields import (
     FieldsRelatedField,
     HashSlugRelatedField,
@@ -28,7 +39,10 @@ from django.contrib.auth.models import Permission
 
 from rest_framework import serializers
 from rest_framework.exceptions import PermissionDenied
-from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.exceptions import (
+    FieldDoesNotExist,
+    ValidationError as DjangoValidationError,
+)
 
 from integrations.models import IntegrationConfiguration, SyncMapping
 
@@ -1464,11 +1478,15 @@ class RiskScenarioImportExportSerializer(BaseModelSerializer):
         ]
 
 
-class AppliedControlWriteSerializer(CustomFieldsSerializerMixin, BaseModelSerializer):
+class AppliedControlWriteSerializer(
+    RequirementAssessmentRelationshipAuthorityMixin,
+    CustomFieldsSerializerMixin,
+    BaseModelSerializer,
+):
     findings = serializers.PrimaryKeyRelatedField(
         many=True, required=False, queryset=Finding.objects.all()
     )
-    requirement_assessments = serializers.PrimaryKeyRelatedField(
+    requirement_assessments = GovernedRequirementAssessmentPrimaryKeyRelatedField(
         many=True, queryset=RequirementAssessment.objects.all(), required=False
     )
     stakeholders = serializers.PrimaryKeyRelatedField(
@@ -1494,59 +1512,99 @@ class AppliedControlWriteSerializer(CustomFieldsSerializerMixin, BaseModelSerial
         required=False, default=False, write_only=True
     )
 
-    def create(self, validated_data: Any):
-        validated_data.pop("create_remote_object", None)
-        validated_data.pop("remote_object_id", None)
-        validated_data.pop("integration_config", None)
-
-        owner_data = validated_data.get("owner", [])
-        findings = validated_data.pop("findings", [])
-        task_templates = validated_data.pop("task_templates", [])
-        incidents = validated_data.pop("incidents", [])
-        applied_control = super().create(validated_data)
-        if findings:
-            applied_control.findings.set(findings)
-        if task_templates:
-            applied_control.task_templates.set(task_templates)
-        if incidents:
-            applied_control.incidents.set(incidents)
-
-        # Send notification to newly assigned owners
-        if owner_data:
-            self._send_assignment_notifications(
-                applied_control, [user.id for user in owner_data]
+    def validate_category(self, value):
+        if value == "policy" and self.Meta.model is not Policy:
+            raise serializers.ValidationError(
+                "Policies must be created and changed through the policy API."
             )
+        return value
 
-        return applied_control
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        # AppliedControl.save() derives a missing category from its reference
+        # control. Validate that effective value here as well; otherwise a
+        # caller can omit (or clear) ``category`` and create a Policy row while
+        # using only the generic AppliedControl API and permissions.
+        effective_category = attrs.get(
+            "category",
+            getattr(self.instance, "category", None),
+        )
+        reference_control = attrs.get(
+            "reference_control",
+            getattr(self.instance, "reference_control", None),
+        )
+        if effective_category is None and reference_control is not None:
+            effective_category = reference_control.category
+        if effective_category == "policy" and self.Meta.model is not Policy:
+            raise serializers.ValidationError(
+                {
+                    "category": (
+                        "Policies must be created and changed through the policy API."
+                    )
+                }
+            )
+        return attrs
+
+    def create(self, validated_data: Any):
+        with transaction.atomic():
+            validated_data.pop("create_remote_object", None)
+            validated_data.pop("remote_object_id", None)
+            validated_data.pop("integration_config", None)
+
+            owner_data = validated_data.get("owner", [])
+            findings = validated_data.pop("findings", [])
+            task_templates = validated_data.pop("task_templates", [])
+            incidents = validated_data.pop("incidents", [])
+            applied_control = super().create(validated_data)
+            if findings:
+                applied_control.findings.set(findings)
+            if task_templates:
+                applied_control.task_templates.set(task_templates)
+            if incidents:
+                applied_control.incidents.set(incidents)
+
+            # Send notification to newly assigned owners
+            if owner_data:
+                self._send_assignment_notifications(
+                    applied_control, [user.id for user in owner_data]
+                )
+
+            return applied_control
 
     def update(self, instance, validated_data):
-        # Track old owners before update
-        old_owner_ids = set(instance.owner.values_list("id", flat=True))
-
-        findings = validated_data.pop("findings", None)
-        task_templates = validated_data.pop("task_templates", None)
-        incidents = validated_data.pop("incidents", None)
-
-        updated_instance = super().update(instance, validated_data)
-
-        if findings is not None:
-            updated_instance.findings.set(findings)
-        if task_templates is not None:
-            updated_instance.task_templates.set(task_templates)
-        if incidents is not None:
-            updated_instance.incidents.set(incidents)
-
-        # Get new owners after update
-        new_owner_ids = set(updated_instance.owner.values_list("id", flat=True))
-
-        # Send notifications only to newly assigned owners
-        newly_assigned_ids = new_owner_ids - old_owner_ids
-        if newly_assigned_ids:
-            self._send_assignment_notifications(
-                updated_instance, list(newly_assigned_ids)
+        with transaction.atomic():
+            governed_relationship = "requirement_assessments" in validated_data
+            old_owner_ids = (
+                None
+                if governed_relationship
+                else set(instance.owner.values_list("id", flat=True))
             )
 
-        return updated_instance
+            findings = validated_data.pop("findings", None)
+            task_templates = validated_data.pop("task_templates", None)
+            incidents = validated_data.pop("incidents", None)
+
+            updated_instance = super().update(instance, validated_data)
+
+            if findings is not None:
+                updated_instance.findings.set(findings)
+            if task_templates is not None:
+                updated_instance.task_templates.set(task_templates)
+            if incidents is not None:
+                updated_instance.incidents.set(incidents)
+
+            # A governed request cannot include owner, so no owner snapshot is
+            # needed outside the target lock acquired by the authority mixin.
+            if old_owner_ids is not None:
+                new_owner_ids = set(updated_instance.owner.values_list("id", flat=True))
+                newly_assigned_ids = new_owner_ids - old_owner_ids
+                if newly_assigned_ids:
+                    self._send_assignment_notifications(
+                        updated_instance, list(newly_assigned_ids)
+                    )
+
+            return updated_instance
 
     def to_representation(self, instance):
         ret = super().to_representation(instance)
@@ -1588,11 +1646,22 @@ class AppliedControlWriteSerializer(CustomFieldsSerializerMixin, BaseModelSerial
             for actor in assigned_actors:
                 assigned_emails.extend(actor.get_emails())
 
-            if assigned_emails:
-                # Queue the task for async execution
-                send_applied_control_assignment_notification(
-                    applied_control.id, assigned_emails
-                )
+            unique_emails = tuple(dict.fromkeys(filter(None, assigned_emails)))
+            if unique_emails:
+                control_id = applied_control.id
+
+                def enqueue_notification():
+                    try:
+                        send_applied_control_assignment_notification(
+                            control_id, list(unique_emails)
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "Failed to queue AppliedControl assignment notification",
+                            error_type=type(exc).__name__,
+                        )
+
+                transaction.on_commit(enqueue_notification)
         except Exception as e:
             logger.error(
                 f"Failed to send AppliedControl assignment notification: {str(e)}"
@@ -1601,9 +1670,182 @@ class AppliedControlWriteSerializer(CustomFieldsSerializerMixin, BaseModelSerial
     class Meta:
         model = AppliedControl
         fields = "__all__"
+        list_serializer_class = (
+            RequirementAssessmentRelationshipProjectionListSerializer
+        )
 
 
-class AppliedControlReadSerializer(AppliedControlWriteSerializer):
+class AppliedControlRequestProjectionMixin:
+    """Expose only caller-visible AppliedControl-derived metadata."""
+
+    def _related_model_for_applied_control_field(self, name, field):
+        related_field = getattr(field, "child_relation", field)
+        if not isinstance(
+            related_field,
+            (FieldsRelatedField, serializers.PrimaryKeyRelatedField),
+        ):
+            return None
+        source = field.source if field.source not in (None, "*") else name
+        model = self.Meta.model
+        for part in source.split("."):
+            try:
+                model_field = model._meta.get_field(part)
+            except FieldDoesNotExist:
+                model_field = next(
+                    (
+                        candidate
+                        for candidate in model._meta.get_fields()
+                        if getattr(candidate, "get_accessor_name", lambda: None)()
+                        == part
+                    ),
+                    None,
+                )
+                if model_field is None:
+                    return None
+            model = getattr(model_field, "related_model", None)
+            if model is None:
+                return None
+        return model
+
+    @staticmethod
+    def _is_applied_control_pk_related_field(field) -> bool:
+        return isinstance(
+            getattr(field, "child_relation", field),
+            serializers.PrimaryKeyRelatedField,
+        )
+
+    def _visible_applied_control_related_ids(self, model):
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request is not None else None
+        cache = self.context.setdefault("_applied_control_related_iam_ids", {})
+        cache_key = (getattr(user, "pk", None), model._meta.label_lower)
+        if cache_key in cache:
+            return cache[cache_key]
+        if user is None or not getattr(user, "is_authenticated", False):
+            allowed = set()
+        else:
+            try:
+                allowed = {
+                    str(item_id)
+                    for item_id in RoleAssignment.get_viewable_object_ids(user, model)
+                }
+            except NotImplementedError, Permission.DoesNotExist:
+                # Models without IAM ownership retain their ordinary rendering.
+                allowed = None
+        cache[cache_key] = allowed
+        return allowed
+
+    @staticmethod
+    def _applied_control_related_item_id(item):
+        value = item.get("id") if isinstance(item, dict) else item
+        return None if value is None else str(value)
+
+    def _mask_applied_control_related_fields(self, data):
+        if not isinstance(data, dict):
+            return data
+        for name, field in self.fields.items():
+            related_model = self._related_model_for_applied_control_field(name, field)
+            if related_model is None or name not in data:
+                continue
+            allowed = self._visible_applied_control_related_ids(related_model)
+            if allowed is None:
+                continue
+            value = data[name]
+            if isinstance(value, list):
+                if self._is_applied_control_pk_related_field(field):
+                    data[name] = [
+                        item
+                        for item in value
+                        if self._applied_control_related_item_id(item) in allowed
+                    ]
+                else:
+                    data[name] = [
+                        item
+                        if self._applied_control_related_item_id(item) in allowed
+                        else ({} if isinstance(item, dict) else "")
+                        for item in value
+                    ]
+            elif isinstance(value, dict):
+                item_id = self._applied_control_related_item_id(value)
+                if item_id is not None and item_id not in allowed:
+                    data[name] = {}
+        return data
+
+    def to_representation(self, instance):
+        return self._mask_applied_control_related_fields(
+            super().to_representation(instance)
+        )
+
+    def _applied_control_projection_cache_key(self, instance):
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request is not None else None
+        return (getattr(user, "pk", None), getattr(instance, "pk", None))
+
+    def _prime_applied_control_request_projections(self, instances) -> None:
+        from core.applied_control_visibility import (
+            build_applied_control_request_projections,
+        )
+
+        bounded = tuple(
+            instance
+            for instance in instances
+            if isinstance(instance, models.Model) and instance.pk is not None
+        )
+        if not bounded:
+            return
+        cache = self.context.setdefault("_applied_control_request_projections", {})
+        missing = tuple(
+            instance
+            for instance in bounded
+            if self._applied_control_projection_cache_key(instance) not in cache
+        )
+        if not missing:
+            return
+        request = self.context.get("request")
+        user = getattr(request, "user", None) if request is not None else None
+        projections = build_applied_control_request_projections(
+            user=user,
+            controls=missing,
+        )
+        for instance in missing:
+            cache[self._applied_control_projection_cache_key(instance)] = projections[
+                instance.pk
+            ]
+
+    def _applied_control_request_projection(self, instance):
+        from core.applied_control_visibility import (
+            EMPTY_APPLIED_CONTROL_PROJECTION,
+        )
+
+        cache = self.context.setdefault("_applied_control_request_projections", {})
+        cache_key = self._applied_control_projection_cache_key(instance)
+        if cache_key not in cache:
+            self._prime_applied_control_request_projections((instance,))
+        return cache.get(cache_key, EMPTY_APPLIED_CONTROL_PROJECTION)
+
+    def get_ranking_score(self, obj):
+        return self._applied_control_request_projection(obj).ranking_score
+
+    def get_findings_count(self, obj):
+        return self._applied_control_request_projection(obj).findings_count
+
+    def get_is_assigned(self, obj):
+        return self._applied_control_request_projection(obj).is_assigned
+
+
+class AppliedControlRequestProjectionListSerializer(serializers.ListSerializer):
+    """Prime derived IAM projections once for an action-plan page."""
+
+    def to_representation(self, data):
+        iterable = data.all() if isinstance(data, models.Manager) else data
+        instances = list(iterable)
+        self.child._prime_applied_control_request_projections(instances)
+        return super().to_representation(instances)
+
+
+class AppliedControlReadSerializer(
+    AppliedControlRequestProjectionMixin, AppliedControlWriteSerializer
+):
     path = PathField(read_only=True)
     folder = FieldsRelatedField()
     incidents = FieldsRelatedField(many=True)
@@ -1628,22 +1870,16 @@ class AppliedControlReadSerializer(AppliedControlWriteSerializer):
     filtering_labels = FieldsRelatedField(["id", "folder"], many=True)
     assets = FieldsRelatedField(many=True)
 
-    ranking_score = serializers.IntegerField(source="get_ranking_score")
+    ranking_score = serializers.SerializerMethodField()
     owner = FieldsRelatedField(many=True)
     security_exceptions = FieldsRelatedField(many=True)
     state = serializers.SerializerMethodField()
-    findings_count = serializers.IntegerField(source="findings.count")
-    is_assigned = serializers.BooleanField(read_only=True)
+    findings_count = serializers.SerializerMethodField()
+    is_assigned = serializers.SerializerMethodField()
     linked_models = serializers.SerializerMethodField()
 
     def get_linked_models(self, obj):
-        from core.views import APPLIED_CONTROL_LINKED_FIELD_NAMES
-
-        return [
-            name
-            for name in APPLIED_CONTROL_LINKED_FIELD_NAMES
-            if getattr(obj, f"has_{name}", False)
-        ]
+        return list(self._applied_control_request_projection(obj).linked_models)
 
     def get_state(self, obj):
         if not obj.eta:
@@ -1718,12 +1954,34 @@ class AppliedControlBulkReadSerializer(AppliedControlReadSerializer):
         currency = self.get_currency(obj)
         return AppliedControl._stringify_cost(f"{annual_cost:,.2f}", currency)
 
+    def get_custom_fields(self, obj) -> dict:
+        values = getattr(obj, "_bulk_custom_field_values", None)
+        if values is None:
+            return super().get_custom_fields(obj)
+
+        result: dict = {}
+        for value in values:
+            definition = value.definition
+            if definition.field_type == "multi_choice":
+                result.setdefault(definition.key, []).append(value.value)
+            else:
+                result[definition.key] = value.value
+        return result
+
     def to_representation(self, instance):
         # skip Write/Read.to_representation, which query SyncMapping per row
-        return BaseModelSerializer.to_representation(self, instance)
+        return self._mask_applied_control_related_fields(
+            RequirementAssessmentRelationshipProjectionMixin.to_representation(
+                self, instance
+            )
+        )
 
 
-class AppliedControlListSerializer(BaseModelSerializer):
+class AppliedControlListSerializer(
+    AppliedControlRequestProjectionMixin,
+    RequirementAssessmentRelationshipProjectionMixin,
+    BaseModelSerializer,
+):
     """
     Lightweight serializer for the applied controls list view.
 
@@ -1757,6 +2015,9 @@ class AppliedControlListSerializer(BaseModelSerializer):
 
     class Meta:
         model = AppliedControl
+        list_serializer_class = (
+            RequirementAssessmentRelationshipProjectionListSerializer
+        )
         fields = [
             "id",
             "ref_id",
@@ -1787,21 +2048,13 @@ class AppliedControlListSerializer(BaseModelSerializer):
         ]
 
     def get_is_assigned(self, obj):
-        # `owner` is prefetched on the list path; `.all()` hits the prefetch
-        # cache, while `.exists()` (the model @property) bypasses it.
-        return bool(obj.owner.all())
+        return self._applied_control_request_projection(obj).is_assigned
 
     def get_linked_models(self, obj):
-        from core.views import APPLIED_CONTROL_LINKED_FIELD_NAMES
-
-        return [
-            name
-            for name in APPLIED_CONTROL_LINKED_FIELD_NAMES
-            if getattr(obj, f"has_{name}", False)
-        ]
+        return list(self._applied_control_request_projection(obj).linked_models)
 
 
-class ActionPlanSerializer(BaseModelSerializer):
+class ActionPlanSerializer(AppliedControlRequestProjectionMixin, BaseModelSerializer):
     folder = FieldsRelatedField()
     reference_control = FieldsRelatedField()
     priority = serializers.CharField(source="get_priority_display")
@@ -1820,12 +2073,13 @@ class ActionPlanSerializer(BaseModelSerializer):
         max_digits=12, decimal_places=2, read_only=True
     )
 
-    ranking_score = serializers.IntegerField(source="get_ranking_score")
+    ranking_score = serializers.SerializerMethodField()
     owner = FieldsRelatedField(many=True)
 
     class Meta:
         model = AppliedControl
         fields = "__all__"
+        list_serializer_class = AppliedControlRequestProjectionListSerializer
 
 
 class ComplianceAssessmentActionPlanSerializer(ActionPlanSerializer):
@@ -1882,7 +2136,7 @@ class ComplianceAssessmentActionPlanSerializer(ActionPlanSerializer):
                 )
         return attachments
 
-    class Meta:
+    class Meta(ActionPlanSerializer.Meta):
         model = AppliedControl
         fields = [
             "id",
@@ -1919,19 +2173,19 @@ class RiskAssessmentActionPlanSerializer(ActionPlanSerializer):
         if pk is None:
             return None
         risk_scenarios = (
-            RiskScenario.objects.filter(risk_assessment=pk)
-            .filter(Q(applied_controls=obj) | Q(existing_applied_controls=obj))
-            .distinct()
+            scenario
+            for scenario in self._applied_control_request_projection(obj).risk_scenarios
+            if str(scenario.risk_assessment_id) == str(pk)
         )
         return [
             {
-                "str": str(req.ref_id + " - " + req.name),
-                "id": str(req.id),
+                "str": f"{scenario.ref_id} - {scenario.name}",
+                "id": str(scenario.id),
             }
-            for req in risk_scenarios
+            for scenario in risk_scenarios
         ]
 
-    class Meta:
+    class Meta(ActionPlanSerializer.Meta):
         model = AppliedControl
         fields = [
             "id",
@@ -1961,6 +2215,9 @@ class RiskAssessmentActionPlanSerializer(ActionPlanSerializer):
 
 class AppliedControlDuplicateSerializer(BaseModelSerializer):
     duplicate_evidences = serializers.BooleanField(default=False)
+    # Resolve target authority in the view so a valid-but-missing UUID and an
+    # existing caller-hidden folder share the same denial response.
+    folder = serializers.UUIDField()
 
     class Meta:
         model = AppliedControl
@@ -2065,6 +2322,9 @@ class PolicyWriteSerializer(AppliedControlWriteSerializer):
     class Meta:
         model = Policy
         fields = "__all__"
+        list_serializer_class = (
+            RequirementAssessmentRelationshipProjectionListSerializer
+        )
 
 
 class PolicyReadSerializer(AppliedControlReadSerializer):
@@ -2085,6 +2345,9 @@ class PolicyReadSerializer(AppliedControlReadSerializer):
     class Meta:
         model = Policy
         fields = "__all__"
+        list_serializer_class = (
+            RequirementAssessmentRelationshipProjectionListSerializer
+        )
 
 
 class ActorReadSerializer(BaseModelSerializer):
@@ -2552,8 +2815,20 @@ class RequirementNodeReadSerializer(ReferentialSerializer):
     def get_questions(self, obj):
         """Reconstruct the old JSON format from Question/QuestionChoice models
         for backward compatibility with the frontend."""
-        questions = obj.get_questions_translated
         request = self.context.get("request")
+        questionnaire_context = self.context.get("_questionnaire_visibility_context")
+        if request is not None and isinstance(
+            questionnaire_context, QuestionnaireVisibilityContext
+        ):
+            questions = questionnaire_context.translated_questions_for(request, obj)
+            visibility = (
+                questionnaire_context.visible_question_urns,
+                questionnaire_context.visible_choice_urns_by_question,
+                questionnaire_context.choice_question_urns,
+            )
+        else:
+            questions = obj.get_questions_translated
+            visibility = None
         if not questions:
             return None
         # Preserve the established serializer contract for trusted in-process
@@ -2563,18 +2838,26 @@ class RequirementNodeReadSerializer(ReferentialSerializer):
         if request is None:
             return questions
 
-        visibility = self.context.get("_questionnaire_visibility")
+        visibility = visibility or self.context.get("_questionnaire_visibility")
         if visibility is None:
             visible_question_ids = RoleAssignment.get_viewable_object_ids(
                 request.user, Question
             )
             visible_questions = list(
                 Question.objects.filter(id__in=visible_question_ids).values_list(
-                    "id", "urn"
+                    "id", "urn", "type"
                 )
             )
-            question_urn_by_id = dict(visible_questions)
+            question_urn_by_id = {
+                question_id: urn for question_id, urn, _type in visible_questions
+            }
             visible_question_urns = set(question_urn_by_id.values())
+            choice_question_urns = {
+                urn
+                for _question_id, urn, question_type in visible_questions
+                if question_type
+                in (Question.Type.UNIQUE_CHOICE, Question.Type.MULTIPLE_CHOICE)
+            }
             visible_choice_ids = RoleAssignment.get_viewable_object_ids(
                 request.user, QuestionChoice
             )
@@ -2589,44 +2872,21 @@ class RequirementNodeReadSerializer(ReferentialSerializer):
             visibility = (
                 visible_question_urns,
                 visible_choice_urns_by_question,
+                choice_question_urns,
             )
             self.context["_questionnaire_visibility"] = visibility
 
-        visible_question_urns, visible_choice_urns_by_question = visibility
-        filtered = {}
-        for question_urn, question_data in questions.items():
-            if question_urn not in visible_question_urns:
-                continue
-            question_data = dict(question_data)
-            depends_on = question_data.get("depends_on")
-            if isinstance(depends_on, dict):
-                dependency_urn = depends_on.get("question")
-                if dependency_urn not in visible_question_urns:
-                    continue
-                depends_on = dict(depends_on)
-                dependency_choices = visible_choice_urns_by_question.get(
-                    dependency_urn, set()
-                )
-                if isinstance(depends_on.get("answers"), list):
-                    depends_on["answers"] = [
-                        answer
-                        for answer in depends_on["answers"]
-                        if answer in dependency_choices
-                    ]
-                question_data["depends_on"] = depends_on
-            if isinstance(question_data.get("choices"), list):
-                visible_choice_urns = visible_choice_urns_by_question.get(
-                    question_urn, set()
-                )
-                question_data["choices"] = [
-                    choice
-                    for choice in question_data["choices"]
-                    if choice.get("urn") in visible_choice_urns
-                ]
-                if not question_data["choices"]:
-                    question_data.pop("choices")
-            filtered[question_urn] = question_data
-        return filtered or None
+        (
+            visible_question_urns,
+            visible_choice_urns_by_question,
+            choice_question_urns,
+        ) = visibility
+        return project_questionnaire_payload(
+            questions,
+            visible_question_urns=visible_question_urns,
+            visible_choice_urns_by_question=visible_choice_urns_by_question,
+            choice_question_urns=choice_question_urns,
+        )
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -2667,6 +2927,22 @@ class RequirementNodeReadSerializer(ReferentialSerializer):
 
 
 class RequirementNodeWriteSerializer(BaseModelSerializer):
+    def to_internal_value(self, data):
+        if self.instance is not None and "framework" in data:
+            try:
+                submitted_framework_id = UUID(str(data["framework"]))
+            except TypeError, ValueError, AttributeError:
+                raise PermissionDenied({"framework": "This field is immutable"})
+            if submitted_framework_id != self.instance.framework_id:
+                # Reject before the related-field lookup so a public update cannot
+                # distinguish an existing foreign Framework UUID from a missing one.
+                raise PermissionDenied({"framework": "This field is immutable"})
+        return super().to_internal_value(data)
+
+    def validate_framework(self, value):
+        self._ensure_immutable("framework", value)
+        return value
+
     def update(self, instance, validated_data):
         # Skip the URN-based "imported objects" guard from BaseModelSerializer
         # because requirement nodes on draft frameworks should be editable.
@@ -2699,7 +2975,9 @@ class RequirementNodeWriteSerializer(BaseModelSerializer):
         exclude = ["created_at", "updated_at"]
 
 
-class EvidenceReadSerializer(BaseModelSerializer):
+class EvidenceReadSerializer(
+    RequirementAssessmentRelationshipProjectionMixin, BaseModelSerializer
+):
     path = PathField(read_only=True)
     attachment = serializers.SerializerMethodField()
     size = serializers.CharField(source="get_size")
@@ -2726,13 +3004,18 @@ class EvidenceReadSerializer(BaseModelSerializer):
     class Meta:
         model = Evidence
         fields = "__all__"
+        list_serializer_class = (
+            RequirementAssessmentRelationshipProjectionListSerializer
+        )
 
 
-class EvidenceWriteSerializer(BaseModelSerializer):
+class EvidenceWriteSerializer(
+    RequirementAssessmentRelationshipAuthorityMixin, BaseModelSerializer
+):
     applied_controls = serializers.PrimaryKeyRelatedField(
         many=True, queryset=AppliedControl.objects.all(), required=False
     )
-    requirement_assessments = serializers.PrimaryKeyRelatedField(
+    requirement_assessments = GovernedRequirementAssessmentPrimaryKeyRelatedField(
         many=True, queryset=RequirementAssessment.objects.all(), required=False
     )
     findings = serializers.PrimaryKeyRelatedField(
@@ -2769,26 +3052,31 @@ class EvidenceWriteSerializer(BaseModelSerializer):
     class Meta:
         model = Evidence
         exclude = ["is_published"]
-
-    def create(self, validated_data):
-        attachment = validated_data.pop("attachment", None)
-        link = validated_data.pop("link", None)
-
-        evidence = super().create(validated_data)
-
-        EvidenceRevision.objects.get_or_create(
-            evidence=evidence, defaults={"link": link, "attachment": attachment}
+        list_serializer_class = (
+            RequirementAssessmentRelationshipProjectionListSerializer
         )
 
-        return evidence
+    def create(self, validated_data):
+        with transaction.atomic():
+            attachment = validated_data.pop("attachment", None)
+            link = validated_data.pop("link", None)
+
+            evidence = super().create(validated_data)
+
+            EvidenceRevision.objects.get_or_create(
+                evidence=evidence, defaults={"link": link, "attachment": attachment}
+            )
+
+            return evidence
 
     def update(self, instance, validated_data):
-        # Track old folder before update
-        old_folder_id = instance.folder_id
-
-        # Handle properly owner field cleaning
         with transaction.atomic():
+            governed_relationship = "requirement_assessments" in validated_data
+            old_folder_id = None if governed_relationship else instance.folder_id
             instance = super().update(instance, validated_data)
+
+            if governed_relationship:
+                old_folder_id = self._governed_locked_scalar_snapshot["folder_id"]
 
             # Update all EvidenceRevisions' folder if the Evidence's folder changed
             if old_folder_id != instance.folder_id:
@@ -3389,6 +3677,22 @@ class ComplianceAssessmentWriteSerializer(BaseModelSerializer):
         write_only=True, required=False, default=False
     )
 
+    def to_internal_value(self, data):
+        if self.instance is not None and "framework" in data:
+            try:
+                submitted_framework_id = UUID(str(data["framework"]))
+            except TypeError, ValueError, AttributeError:
+                raise PermissionDenied({"framework": "This field is immutable"})
+            if submitted_framework_id != self.instance.framework_id:
+                # Reject before the related-field lookup so a public update cannot
+                # distinguish an existing foreign Framework UUID from a missing one.
+                raise PermissionDenied({"framework": "This field is immutable"})
+        return super().to_internal_value(data)
+
+    def validate_framework(self, value):
+        self._ensure_immutable("framework", value)
+        return value
+
     def validate(self, attrs):
         if hasattr(self, "instance") and self.instance and self.instance.is_locked:
             # If we're unlocking (setting is_locked to False), allow the operation
@@ -3651,12 +3955,27 @@ class ComplianceAssessmentImportExportSerializer(BaseModelSerializer):
 
 
 class RequirementAssessmentReadListSerializer(serializers.ListSerializer):
-    """Batch mapping-provenance IAM once for a page/list response."""
+    """Batch request-scoped IAM projections once for a page/list response."""
 
     def to_representation(self, data):
         instances = list(data.all() if hasattr(data, "all") else data)
         request = self.context.get("request")
         if request is not None:
+            questionnaire_context = self.context.get(
+                "_questionnaire_visibility_context"
+            )
+            if not isinstance(
+                questionnaire_context, QuestionnaireVisibilityContext
+            ) or not questionnaire_context.covers_requirement_assessments(
+                request, instances
+            ):
+                self.context["_questionnaire_visibility_context"] = (
+                    QuestionnaireVisibilityContext.build(
+                        request=request,
+                        requirement_assessments=instances,
+                    )
+                )
+
             from core.utils import get_mapping_inference_visibility_context
 
             inferences = [
@@ -3746,38 +4065,34 @@ class RequirementAssessmentReadSerializer(BaseModelSerializer):
         r = self._resolved(obj)
         return r["scores_definition"] if r else None
 
+    def _ensure_questionnaire_visibility_context(self, obj):
+        request = self.context.get("request")
+        if request is None:
+            return None
+        questionnaire_context = self.context.get("_questionnaire_visibility_context")
+        if not isinstance(
+            questionnaire_context, QuestionnaireVisibilityContext
+        ) or not questionnaire_context.covers_requirement_assessments(request, (obj,)):
+            questionnaire_context = QuestionnaireVisibilityContext.build(
+                request=request,
+                requirement_assessments=(obj,),
+                requirement_nodes=(obj.requirement,),
+            )
+            self.context["_questionnaire_visibility_context"] = questionnaire_context
+        return questionnaire_context
+
     def get_answers(self, obj):
         """Reconstruct old JSON format {question_urn: answer_value} from Answer model."""
-        from core.utils import build_answers_dict
-
         request = self.context.get("request")
         if request is None:
             return {}
-        visible_answer_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, Answer
-        )
-        visible_question_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, Question
-        )
-        visible_choice_ids = RoleAssignment.get_viewable_object_ids(
-            request.user, QuestionChoice
-        )
-        answers = (
-            obj.answers.filter(
-                id__in=visible_answer_ids,
-                question_id__in=visible_question_ids,
-            )
-            .select_related("question")
-            .prefetch_related(
-                models.Prefetch(
-                    "selected_choices",
-                    queryset=QuestionChoice.objects.filter(id__in=visible_choice_ids),
-                )
-            )
-        )
-        return build_answers_dict(answers)
+        questionnaire_context = self._ensure_questionnaire_visibility_context(obj)
+        return questionnaire_context.answer_values_for(request, obj)
 
     def to_representation(self, instance):
+        # Build before nested fields are rendered so requirement questions,
+        # answers and progress consumers all share the exact same projection.
+        self._ensure_questionnaire_visibility_context(instance)
         data = super().to_representation(instance)
 
         ca = getattr(instance, "compliance_assessment", None)
@@ -3982,7 +4297,348 @@ class RequirementAssessmentReadSerializer(BaseModelSerializer):
         list_serializer_class = RequirementAssessmentReadListSerializer
 
 
+def _apply_visible_answer_choice_update(
+    answer: Answer,
+    desired_choices,
+    visible_choice_ids,
+    *,
+    fail_on_hidden: bool,
+) -> None:
+    """Replace only the caller-visible portion of an Answer's choices.
+
+    A questionnaire response is projected through QuestionChoice folder IAM, so
+    its submitted choices are only a partial view of the persisted relation.
+    Applying that partial view with ``set``/``clear`` would silently delete
+    hidden selections. Multiple-choice answers therefore use a visible delta;
+    unique-choice answers fail closed when any existing selection is hidden,
+    because preserving it while accepting another value would violate the
+    question's single-choice invariant.
+    """
+    desired_choices = list(desired_choices)
+    desired_ids = {choice.id for choice in desired_choices}
+
+    if (
+        fail_on_hidden
+        and answer.selected_choices.exclude(id__in=visible_choice_ids).exists()
+    ):
+        raise PermissionDenied(
+            "Existing answer choices are unavailable for this caller."
+        )
+
+    if any(choice.question_id != answer.question_id for choice in desired_choices):
+        raise serializers.ValidationError(
+            {"selected_choices": "A selected choice does not belong to this question."}
+        )
+
+    visible_desired_ids = set(
+        QuestionChoice.objects.filter(id__in=desired_ids)
+        .filter(id__in=visible_choice_ids)
+        .values_list("id", flat=True)
+    )
+    if visible_desired_ids != desired_ids:
+        raise PermissionDenied(
+            "One or more selected choices are unavailable for this caller."
+        )
+
+    current_visible_choices = {
+        choice.id: choice
+        for choice in answer.selected_choices.filter(id__in=visible_choice_ids)
+    }
+    desired_by_id = {choice.id: choice for choice in desired_choices}
+    remove_choices = [
+        choice
+        for choice_id, choice in current_visible_choices.items()
+        if choice_id not in desired_ids
+    ]
+    add_choices = [
+        choice
+        for choice_id, choice in desired_by_id.items()
+        if choice_id not in current_visible_choices
+    ]
+    if remove_choices:
+        answer.selected_choices.remove(*remove_choices)
+    if add_choices:
+        answer.selected_choices.add(*add_choices)
+
+
+_IMMUTABLE_RELATION_UNAVAILABLE = "The requested relationship is unavailable."
+_ANSWER_RELATION_UNAVAILABLE = "One or more answer relationships are unavailable."
+_ASSIGNMENT_PARENT_UNAVAILABLE = "The requested assignment parent is unavailable."
+_ASSIGNMENT_RELATION_UNAVAILABLE = (
+    "One or more assignment relationships are unavailable."
+)
+
+
+def _normalize_related_uuid(value, *, detail: str) -> UUID:
+    """Normalize an untrusted relation PK without exposing lookup results."""
+
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise PermissionDenied(detail) from exc
+
+
+def _assert_raw_immutable_relation_ids(instance, data, field_names) -> None:
+    """Reject immutable FK changes before DRF performs a related-object query."""
+
+    if instance is None:
+        return
+    for field_name in field_names:
+        if field_name not in data:
+            continue
+        submitted_id = _normalize_related_uuid(
+            data.get(field_name), detail=_IMMUTABLE_RELATION_UNAVAILABLE
+        )
+        if submitted_id != getattr(instance, f"{field_name}_id", None):
+            raise PermissionDenied(_IMMUTABLE_RELATION_UNAVAILABLE)
+
+
+class ImmutableUpdatePrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
+    """Resolve an unchanged update FK from the instance, never from client PK."""
+
+    def to_internal_value(self, data):
+        instance = getattr(self.root, "instance", None)
+        if instance is None:
+            return super().to_internal_value(data)
+        submitted_id = _normalize_related_uuid(
+            data, detail=_IMMUTABLE_RELATION_UNAVAILABLE
+        )
+        current_id = getattr(instance, f"{self.field_name}_id", None)
+        if submitted_id != current_id:
+            raise PermissionDenied(_IMMUTABLE_RELATION_UNAVAILABLE)
+        return getattr(instance, self.field_name)
+
+
+class RequirementAssignmentComplianceAssessmentField(
+    ImmutableUpdatePrimaryKeyRelatedField
+):
+    """Resolve a new Assignment parent only inside the caller's CA IAM slice."""
+
+    @staticmethod
+    def _add_permission():
+        return Permission.objects.get(
+            codename="add_requirementassignment",
+            content_type__app_label="core",
+            content_type__model="requirementassignment",
+        )
+
+    def to_internal_value(self, data):
+        instance = getattr(self.root, "instance", None)
+        if instance is not None:
+            return super().to_internal_value(data)
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not getattr(user, "is_authenticated", False):
+            raise PermissionDenied(_ASSIGNMENT_PARENT_UNAVAILABLE)
+        assessment_id = _normalize_related_uuid(
+            data, detail=_ASSIGNMENT_PARENT_UNAVAILABLE
+        )
+        try:
+            assessment = (
+                ComplianceAssessment.objects.select_related("folder")
+                .filter(
+                    id=assessment_id,
+                    id__in=RoleAssignment.get_viewable_object_ids(
+                        user, ComplianceAssessment
+                    ),
+                )
+                .first()
+            )
+            can_add = assessment is not None and RoleAssignment.is_access_allowed(
+                user=user,
+                perm=self._add_permission(),
+                folder=assessment.folder,
+            )
+        except NotImplementedError, Permission.DoesNotExist:
+            can_add = False
+        if not can_add:
+            raise PermissionDenied(_ASSIGNMENT_PARENT_UNAVAILABLE)
+        return assessment
+
+
+class RequirementAssignmentAuthorityPrimaryKeyRelatedField(
+    serializers.PrimaryKeyRelatedField
+):
+    """Resolve Assignment M2M operands without exposing hidden object UUIDs."""
+
+    def __init__(self, *args, authority_model, **kwargs):
+        self.authority_model = authority_model
+        super().__init__(*args, **kwargs)
+
+    @staticmethod
+    def visible_queryset(*, user, authority_model, object_ids):
+        """Mirror the public Actor/RA product projections for assignment writes."""
+
+        bounded_ids = tuple(object_ids)
+        if not bounded_ids:
+            return authority_model.objects.none()
+        if authority_model is Actor:
+            from global_settings.models import GlobalSettings
+
+            queryset = (
+                Actor.objects.filter(id__in=bounded_ids)
+                .filter(id__in=RoleAssignment.get_viewable_object_ids(user, Actor))
+                # Machine principals are never valid owner/assignee picker
+                # values, even when their underlying User is folder-visible.
+                .exclude(user__service_account__isnull=False)
+            )
+            allow_entities = (
+                GlobalSettings.objects.filter(name=GlobalSettings.Names.GENERAL)
+                .values_list("value__allow_assignments_to_entities", flat=True)
+                .first()
+            )
+            if not allow_entities:
+                queryset = queryset.filter(entity__isnull=True)
+            return queryset
+        if authority_model is RequirementAssessment:
+            from core.utils import get_full_view_compliance_assessment_ids
+
+            visible_framework_ids = RoleAssignment.get_viewable_object_ids(
+                user, Framework
+            )
+            product_visible = models.Q(
+                compliance_assessment_id__in=get_full_view_compliance_assessment_ids(
+                    user
+                )
+            ) | models.Q(assignments__actor__in=Actor.get_all_for_user(user))
+            return (
+                RequirementAssessment.objects.filter(id__in=bounded_ids)
+                .filter(
+                    id__in=RoleAssignment.get_viewable_object_ids(
+                        user, RequirementAssessment
+                    ),
+                    compliance_assessment_id__in=RoleAssignment.get_viewable_object_ids(
+                        user, ComplianceAssessment
+                    ),
+                    compliance_assessment__framework_id__in=visible_framework_ids,
+                    requirement_id__in=RoleAssignment.get_viewable_object_ids(
+                        user, RequirementNode
+                    ),
+                    requirement__framework_id__in=visible_framework_ids,
+                    requirement__framework_id=F("compliance_assessment__framework_id"),
+                )
+                .filter(product_visible)
+                .distinct()
+            )
+        return authority_model.objects.none()
+
+    def to_internal_value(self, data):
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not getattr(user, "is_authenticated", False):
+            raise PermissionDenied(_ASSIGNMENT_RELATION_UNAVAILABLE)
+        object_id = _normalize_related_uuid(
+            data, detail=_ASSIGNMENT_RELATION_UNAVAILABLE
+        )
+        try:
+            row = self.visible_queryset(
+                user=user,
+                authority_model=self.authority_model,
+                object_ids=(object_id,),
+            ).first()
+        except NotImplementedError, Permission.DoesNotExist:
+            row = None
+        if row is None:
+            raise PermissionDenied(_ASSIGNMENT_RELATION_UNAVAILABLE)
+        return row
+
+
+class AnswerAuthorityPrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
+    """Resolve Answer relations only inside the caller's complete IAM slice."""
+
+    def __init__(self, *args, authority_model, immutable_on_update=False, **kwargs):
+        self.authority_model = authority_model
+        self.immutable_on_update = immutable_on_update
+        super().__init__(*args, **kwargs)
+
+    def _visible_queryset(self, user, object_id):
+        visible_framework_ids = RoleAssignment.get_viewable_object_ids(user, Framework)
+        visible_requirement_node_ids = RoleAssignment.get_viewable_object_ids(
+            user, RequirementNode
+        )
+        visible_question_ids = RoleAssignment.get_viewable_object_ids(user, Question)
+
+        if self.authority_model is RequirementAssessment:
+            # Generic folder IAM is only the first visibility gate.  A
+            # respondent can read an individual requirement assessment only
+            # when they have full-audit visibility or it is linked to one of
+            # their direct/team actors (the same product boundary enforced by
+            # RequirementAssessmentViewSet).  Resolve the submitted UUID
+            # inside that complete slice so an unassigned row cannot become an
+            # existence oracle before Answer validation reaches its direct-
+            # actor write checks.
+            from core.utils import get_full_view_compliance_assessment_ids
+
+            product_visible = models.Q(
+                compliance_assessment_id__in=get_full_view_compliance_assessment_ids(
+                    user
+                )
+            ) | models.Q(assignments__actor__in=Actor.get_all_for_user(user))
+            return (
+                RequirementAssessment.objects.filter(
+                    id=object_id,
+                    id__in=RoleAssignment.get_viewable_object_ids(
+                        user, RequirementAssessment
+                    ),
+                    compliance_assessment_id__in=RoleAssignment.get_viewable_object_ids(
+                        user, ComplianceAssessment
+                    ),
+                    compliance_assessment__framework_id__in=visible_framework_ids,
+                    requirement_id__in=visible_requirement_node_ids,
+                    requirement__framework_id__in=visible_framework_ids,
+                    requirement__framework_id=F("compliance_assessment__framework_id"),
+                )
+                .filter(product_visible)
+                .distinct()
+            )
+        if self.authority_model is Question:
+            return Question.objects.filter(
+                id=object_id,
+                id__in=visible_question_ids,
+                requirement_node_id__in=visible_requirement_node_ids,
+                requirement_node__framework_id__in=visible_framework_ids,
+            )
+        if self.authority_model is QuestionChoice:
+            return QuestionChoice.objects.filter(
+                id=object_id,
+                id__in=RoleAssignment.get_viewable_object_ids(user, QuestionChoice),
+                question_id__in=visible_question_ids,
+                question__requirement_node_id__in=visible_requirement_node_ids,
+                question__requirement_node__framework_id__in=visible_framework_ids,
+            )
+        raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
+
+    def to_internal_value(self, data):
+        instance = getattr(self.root, "instance", None)
+        if instance is not None and self.immutable_on_update:
+            submitted_id = _normalize_related_uuid(
+                data, detail=_ANSWER_RELATION_UNAVAILABLE
+            )
+            current_id = getattr(instance, f"{self.field_name}_id", None)
+            if submitted_id != current_id:
+                raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
+            return getattr(instance, self.field_name)
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if not getattr(user, "is_authenticated", False):
+            raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
+        object_id = _normalize_related_uuid(data, detail=_ANSWER_RELATION_UNAVAILABLE)
+        try:
+            related = self._visible_queryset(user, object_id).first()
+        except (NotImplementedError, Permission.DoesNotExist) as exc:
+            raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE) from exc
+        if related is None:
+            raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
+        return related
+
+
 class RequirementAssessmentWriteSerializer(BaseModelSerializer):
+    compliance_assessment = ImmutableUpdatePrimaryKeyRelatedField(
+        queryset=ComplianceAssessment.objects.all()
+    )
+    folder = ImmutableUpdatePrimaryKeyRelatedField(queryset=Folder.objects.all())
     requirement = serializers.PrimaryKeyRelatedField(read_only=True)
     answers = serializers.JSONField(required=False, write_only=True)
     # Mapping provenance is generated by the controlled mapping service. It is
@@ -4003,6 +4659,13 @@ class RequirementAssessmentWriteSerializer(BaseModelSerializer):
         ).data
 
     def to_internal_value(self, data):
+        # This must precede field-visibility filtering: silently stripping a
+        # hidden immutable parent field would otherwise turn its UUID into an
+        # existence/field-policy oracle and make a reparenting attempt appear
+        # successful.
+        _assert_raw_immutable_relation_ids(
+            self.instance, data, ("compliance_assessment", "folder")
+        )
         # Strip fields the respondent isn't allowed to write before DRF validates
         # individual field choices — a placeholder value in a disabled select
         # would otherwise trip choice validation. Security enforcement is repeated
@@ -4052,6 +4715,37 @@ class RequirementAssessmentWriteSerializer(BaseModelSerializer):
                 "Answers must be a JSON object mapping question URNs to values."
             )
         return value
+
+    def validate_compliance_assessment(self, value):
+        self._ensure_immutable("compliance_assessment", value)
+        return value
+
+    def validate_folder(self, value):
+        self._ensure_immutable("folder", value)
+        return value
+
+    def _check_m2m_visibility(self, validated_data: dict) -> None:
+        """Defer update-only controlled relations to their bounded delta check.
+
+        The base checker materializes every globally visible related-object ID.
+        These fields have a stricter update-time check below that considers only
+        current and submitted IDs, so running both is redundant and scales with
+        the institution rather than this requirement assessment.
+        """
+        if self.instance is None:
+            return super()._check_m2m_visibility(validated_data)
+        controlled_fields = {
+            "applied_controls",
+            "evidences",
+            "security_exceptions",
+        }
+        return super()._check_m2m_visibility(
+            {
+                field_name: value
+                for field_name, value in validated_data.items()
+                if field_name not in controlled_fields
+            }
+        )
 
     def validate(self, attrs):
         compliance_assessment = self.get_compliance_assessment()
@@ -4179,10 +4873,277 @@ class RequirementAssessmentWriteSerializer(BaseModelSerializer):
                 "The specified Compliance Assessment does not exist."
             )
 
+    def _pop_visible_relationship_updates(self, instance, validated_data):
+        """Extract caller-visible M2M deltas without rewriting hidden rows.
+
+        RequirementAssessment reads independently filter related objects by
+        folder IAM. A client can therefore only send back the visible subset;
+        applying that subset with ``RelatedManager.set`` would silently unlink
+        hidden objects. Reconstructing a full set would also resurrect a hidden
+        link removed concurrently by an authorised actor. Return only the
+        caller-visible desired IDs and visibility boundary so ``update`` can
+        add/remove a bounded delta after scalar fields are saved.
+        """
+        controlled_fields = {
+            "applied_controls",
+            "evidences",
+            "security_exceptions",
+        }.intersection(validated_data)
+        if not controlled_fields:
+            return {}
+        request = self.context.get("request")
+        if not request or not request.user.is_authenticated:
+            raise PermissionDenied(
+                "Relationship updates require an authenticated authority context."
+            )
+
+        updates = {}
+        for field_name in controlled_fields:
+            manager = getattr(instance, field_name)
+            submitted = list(validated_data[field_name])
+            submitted_ids = {related.id for related in submitted}
+            current_ids = set(manager.values_list("id", flat=True))
+            candidate_ids = current_ids | submitted_ids
+            try:
+                viewable_ids = RoleAssignment.get_viewable_object_ids(
+                    request.user, manager.model
+                )
+                visible_ids = set(
+                    manager.model.objects.filter(id__in=candidate_ids)
+                    .filter(id__in=viewable_ids)
+                    .values_list("id", flat=True)
+                )
+            except (NotImplementedError, Permission.DoesNotExist) as exc:
+                raise PermissionDenied(
+                    "Relationship visibility could not be verified."
+                ) from exc
+
+            if not submitted_ids.issubset(visible_ids):
+                raise PermissionDenied("Relationship visibility could not be verified.")
+            validated_data.pop(field_name)
+            updates[field_name] = (visible_ids, submitted_ids)
+        return updates
+
+    @staticmethod
+    def _apply_visible_relationship_updates(instance, relationship_updates):
+        for field_name, (visible_ids, submitted_ids) in relationship_updates.items():
+            manager = getattr(instance, field_name)
+            current_visible_ids = set(
+                manager.filter(id__in=visible_ids).values_list("id", flat=True)
+            )
+            remove_ids = current_visible_ids - submitted_ids
+            add_ids = submitted_ids - current_visible_ids
+            if remove_ids:
+                manager.remove(*remove_ids)
+            if add_ids:
+                manager.add(*add_ids)
+
+    def _prepare_locked_answer_updates(self, instance, answers_data):
+        """Lock and authorize the complete legacy questionnaire mutation batch.
+
+        The legacy RequirementAssessment endpoint remains a compatibility input
+        surface, but it must not be a second authority implementation.  Resolve
+        legacy URN values first, then enter the same Answer aggregate boundary as
+        the direct Answer endpoint in stable Question order.  No RA or Answer is
+        written until every requested child has been locked and authorized.
+        """
+        request = self.context.get("request")
+        if request is None or not getattr(request.user, "is_authenticated", False):
+            raise PermissionDenied(
+                "Questionnaire updates require an authenticated request."
+            )
+
+        user = request.user
+        visible_question_ids = RoleAssignment.get_viewable_object_ids(user, Question)
+        visible_requirement_node_ids = RoleAssignment.get_viewable_object_ids(
+            user, RequirementNode
+        )
+        visible_framework_ids = RoleAssignment.get_viewable_object_ids(user, Framework)
+        visible_choice_ids = RoleAssignment.get_viewable_object_ids(
+            user, QuestionChoice
+        )
+        questions_by_urn = {
+            question.urn: question
+            for question in Question.objects.filter(
+                requirement_node_id=instance.requirement_id,
+                requirement_node_id__in=visible_requirement_node_ids,
+                requirement_node__framework_id=instance.compliance_assessment.framework_id,
+                requirement_node__framework_id__in=visible_framework_ids,
+                id__in=visible_question_ids,
+                urn__in=answers_data,
+            ).order_by("pk")
+        }
+        unknown_questions = set(answers_data) - set(questions_by_urn)
+        if unknown_questions:
+            raise serializers.ValidationError(
+                {"answers": ("One or more questions are unavailable for this caller.")}
+            )
+
+        existing_answer_ids = dict(
+            Answer.objects.filter(
+                requirement_assessment_id=instance.id,
+                question_id__in=[question.id for question in questions_by_urn.values()],
+            ).values_list("question_id", "id")
+        )
+        authority = AnswerWriteSerializer(context=self.context)
+        requested_updates = []
+        for question in sorted(questions_by_urn.values(), key=lambda row: str(row.id)):
+            answer_value = answers_data[question.urn]
+            desired_choices = None
+            stored_value = answer_value
+
+            if question.type == Question.Type.UNIQUE_CHOICE:
+                if answer_value:
+                    choice = question.choices.filter(
+                        id__in=visible_choice_ids,
+                        urn=answer_value,
+                    ).first()
+                    if choice is None:
+                        raise serializers.ValidationError(
+                            {
+                                "answers": (
+                                    "A selected choice is unavailable for this caller."
+                                )
+                            }
+                        )
+                    desired_choices = [choice]
+                else:
+                    desired_choices = []
+                stored_value = None
+            elif question.type == Question.Type.MULTIPLE_CHOICE:
+                if isinstance(answer_value, list) and answer_value:
+                    choices = question.choices.filter(
+                        id__in=visible_choice_ids,
+                        urn__in=answer_value,
+                    )
+                    found_identifiers = set(choices.values_list("urn", flat=True))
+                    if set(answer_value) - found_identifiers:
+                        raise serializers.ValidationError(
+                            {
+                                "answers": (
+                                    "One or more selected choices are unavailable for "
+                                    "this caller."
+                                )
+                            }
+                        )
+                    desired_choices = list(choices)
+                else:
+                    desired_choices = []
+                stored_value = None
+
+            desired_choice_ids = {choice.id for choice in (desired_choices or ())}
+            requested_updates.append(
+                {
+                    "question_id": question.id,
+                    "expected_question_urn": question.urn,
+                    "expected_question_type": question.type,
+                    "answer_id": existing_answer_ids.get(question.id),
+                    "desired_choice_ids": desired_choice_ids,
+                    "expected_choice_urns_by_id": {
+                        choice.id: choice.urn for choice in (desired_choices or ())
+                    },
+                    "stored_value": stored_value,
+                    "has_choice_update": desired_choices is not None,
+                }
+            )
+
+        scopes = authority._lock_answer_scopes(
+            requirement_assessment_id=instance.id,
+            operations=requested_updates,
+        )
+        prepared = []
+        locked_requirement_assessment = None
+        for requested_update, scope in zip(requested_updates, scopes, strict=True):
+            (
+                compliance_assessment,
+                assignments,
+                current_requirement_assessment,
+                locked_answer,
+                locked_question,
+                locked_choices,
+                user_actor_ids,
+            ) = scope
+            authority._assert_locked_answer_authority(
+                action="change" if locked_answer is not None else "add",
+                compliance_assessment=compliance_assessment,
+                assignments=assignments,
+                requirement_assessment=current_requirement_assessment,
+                answer=locked_answer,
+                question=locked_question,
+                locked_choices=locked_choices,
+                user_actor_ids=user_actor_ids,
+                desired_choice_ids=requested_update["desired_choice_ids"],
+            )
+            if (
+                locked_requirement_assessment is not None
+                and locked_requirement_assessment.id
+                != current_requirement_assessment.id
+            ):
+                raise PermissionDenied(
+                    "The answer parent changed during authorization."
+                )
+            locked_requirement_assessment = current_requirement_assessment
+            locked_choice_by_id = {choice.id: choice for choice in locked_choices}
+            prepared.append(
+                (
+                    locked_question,
+                    locked_answer,
+                    requested_update["stored_value"],
+                    (
+                        [
+                            locked_choice_by_id[choice_id]
+                            for choice_id in sorted(
+                                requested_update["desired_choice_ids"], key=str
+                            )
+                        ]
+                        if requested_update["has_choice_update"]
+                        else None
+                    ),
+                )
+            )
+
+        return locked_requirement_assessment, prepared, visible_choice_ids
+
+    @staticmethod
+    def _apply_locked_answer_updates(
+        requirement_assessment,
+        prepared_updates,
+        visible_choice_ids,
+    ):
+        for question, answer, stored_value, desired_choices in prepared_updates:
+            if answer is None:
+                answer = Answer.objects.create(
+                    requirement_assessment=requirement_assessment,
+                    question=question,
+                    folder=requirement_assessment.folder,
+                )
+            if desired_choices is not None:
+                _apply_visible_answer_choice_update(
+                    answer,
+                    desired_choices,
+                    visible_choice_ids,
+                    fail_on_hidden=(question.type == Question.Type.UNIQUE_CHOICE),
+                )
+            answer.value = stored_value
+            answer.save(update_fields=["value"])
+
     def update(self, instance, validated_data):
         with transaction.atomic():
             # Handle answers if provided in old JSON format
             answers_data = validated_data.pop("answers", None)
+
+            prepared_answer_updates = []
+            visible_choice_ids = None
+            if answers_data and isinstance(answers_data, dict):
+                (
+                    instance,
+                    prepared_answer_updates,
+                    visible_choice_ids,
+                ) = self._prepare_locked_answer_updates(instance, answers_data)
+
+            relationship_updates = self._pop_visible_relationship_updates(
+                instance, validated_data
+            )
 
             # Question-driven score is recompute-owned: drop manual writes
             # unless is_score_overridden pins a value.
@@ -4200,6 +5161,7 @@ class RequirementAssessmentWriteSerializer(BaseModelSerializer):
 
             was_overridden = instance.is_score_overridden
             instance = super().update(instance, validated_data)
+            self._apply_visible_relationship_updates(instance, relationship_updates)
 
             # Override turned off: resync score from answers below.
             override_turned_off = (
@@ -4214,137 +5176,12 @@ class RequirementAssessmentWriteSerializer(BaseModelSerializer):
                     instance.is_scored = new_is_scored
                     instance.save(update_fields=["is_scored"])
 
-            if answers_data and isinstance(answers_data, dict):
-                # Convert incoming answers dict to Answer model updates
-                from core.models import Answer, Question
-
-                request = self.context.get("request")
-                if request is None:
-                    raise PermissionDenied(
-                        "Questionnaire updates require an authenticated request."
-                    )
-                visible_question_ids = RoleAssignment.get_viewable_object_ids(
-                    request.user, Question
+            if prepared_answer_updates:
+                self._apply_locked_answer_updates(
+                    instance,
+                    prepared_answer_updates,
+                    visible_choice_ids,
                 )
-                visible_choice_ids = RoleAssignment.get_viewable_object_ids(
-                    request.user, QuestionChoice
-                )
-                visible_answer_ids = RoleAssignment.get_viewable_object_ids(
-                    request.user, Answer
-                )
-
-                questions_by_urn = {
-                    q.urn: q
-                    for q in Question.objects.filter(
-                        requirement_node=instance.requirement,
-                        id__in=visible_question_ids,
-                    ).prefetch_related("choices")
-                }
-                unknown_questions = set(answers_data) - set(questions_by_urn)
-                if unknown_questions:
-                    raise serializers.ValidationError(
-                        {
-                            "answers": (
-                                "One or more questions are unavailable for this caller."
-                            )
-                        }
-                    )
-                existing_answers = {
-                    answer.question_id: answer
-                    for answer in Answer.objects.filter(
-                        requirement_assessment=instance,
-                        question__urn__in=answers_data,
-                    )
-                }
-                if any(
-                    answer.id not in visible_answer_ids
-                    for answer in existing_answers.values()
-                ):
-                    raise PermissionDenied(
-                        "One or more answers are unavailable for this caller."
-                    )
-                add_answer_permission = Permission.objects.get(
-                    content_type__app_label="core",
-                    content_type__model="answer",
-                    codename="add_answer",
-                )
-                change_answer_permission = Permission.objects.get(
-                    content_type__app_label="core",
-                    content_type__model="answer",
-                    codename="change_answer",
-                )
-                for q_urn, answer_value in answers_data.items():
-                    question = questions_by_urn.get(q_urn)
-                    answer = existing_answers.get(question.id)
-                    required_permission = (
-                        change_answer_permission
-                        if answer is not None
-                        else add_answer_permission
-                    )
-                    if not RoleAssignment.is_access_allowed(
-                        user=request.user,
-                        perm=required_permission,
-                        folder=instance.folder,
-                    ):
-                        raise PermissionDenied(
-                            "You do not have permission to update this answer."
-                        )
-                    if answer is None:
-                        answer = Answer.objects.create(
-                            requirement_assessment=instance,
-                            question=question,
-                            folder=instance.folder,
-                        )
-
-                    if question.type == Question.Type.UNIQUE_CHOICE:
-                        if answer_value:
-                            choice = question.choices.filter(
-                                id__in=visible_choice_ids,
-                                urn=answer_value,
-                            ).first()
-                            if not choice:
-                                raise serializers.ValidationError(
-                                    {
-                                        "answers": (
-                                            "A selected choice is unavailable for "
-                                            "this caller."
-                                        )
-                                    }
-                                )
-                            answer.selected_choices.set([choice])
-                        else:
-                            answer.selected_choices.clear()
-                        answer.value = None
-                        answer.save(update_fields=["value"])
-                    elif question.type == Question.Type.MULTIPLE_CHOICE:
-                        if isinstance(answer_value, list) and answer_value:
-                            choices = question.choices.filter(
-                                id__in=visible_choice_ids,
-                                urn__in=answer_value,
-                            )
-                            found_identifiers = set(
-                                choices.values_list("urn", flat=True)
-                            )
-                            missing = set(answer_value) - found_identifiers
-
-                            if missing:
-                                raise serializers.ValidationError(
-                                    {
-                                        "answers": (
-                                            "One or more selected choices are "
-                                            "unavailable for this caller."
-                                        )
-                                    }
-                                )
-                            answer.selected_choices.set(choices)
-                        else:
-                            answer.selected_choices.clear()
-                        answer.value = None
-                        answer.save(update_fields=["value"])
-                    else:
-                        answer.value = answer_value
-                        answer.save(update_fields=["value"])
-
                 # Check if any choice has scoring or result logic. For
                 # compute_result, mirror `resolve_compute_result`: empty strings,
                 # whitespace and unknown values are not actually result-bearing
@@ -4418,6 +5255,44 @@ class QuestionChoiceReadSerializer(BaseModelSerializer):
 
 
 class QuestionChoiceWriteSerializer(BaseModelSerializer):
+    def to_representation(self, instance):
+        return QuestionChoiceReadSerializer(instance, context=self.context).data
+
+    def validate_folder(self, value):
+        self._ensure_immutable("folder", value)
+        return value
+
+    def validate_question(self, value):
+        self._ensure_immutable("question", value)
+        return value
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        request = self.context.get("request")
+        question = attrs.get("question") or (
+            self.instance.question if self.instance is not None else None
+        )
+        if request is not None and question is not None:
+            visible_question_ids = RoleAssignment.get_viewable_object_ids(
+                request.user, Question
+            )
+            visible_requirement_node_ids = RoleAssignment.get_viewable_object_ids(
+                request.user, RequirementNode
+            )
+            visible_framework_ids = RoleAssignment.get_viewable_object_ids(
+                request.user, Framework
+            )
+            if not Question.objects.filter(
+                id=question.id,
+                id__in=visible_question_ids,
+                requirement_node_id__in=visible_requirement_node_ids,
+                requirement_node__framework_id__in=visible_framework_ids,
+            ).exists():
+                raise PermissionDenied(
+                    {"question": "The parent question is unavailable for this caller."}
+                )
+        return attrs
+
     def update(self, instance, validated_data):
         # Skip the URN-based "imported objects" guard from BaseModelSerializer
         # because choices on draft frameworks should be editable.
@@ -4435,16 +5310,104 @@ class QuestionChoiceWriteSerializer(BaseModelSerializer):
         exclude = ["created_at", "updated_at"]
 
 
+class QuestionReadListSerializer(serializers.ListSerializer):
+    """Build one bounded Question/QuestionChoice projection per response page."""
+
+    def to_representation(self, data):
+        questions = list(data.all() if hasattr(data, "all") else data)
+        request = self.context.get("request")
+        if request is not None:
+            self.context["_direct_question_visibility_context"] = (
+                DirectQuestionVisibilityContext.build(
+                    request=request,
+                    questions=questions,
+                )
+            )
+        return super().to_representation(questions)
+
+
 class QuestionReadSerializer(BaseModelSerializer):
     folder = FieldsRelatedField()
-    choices = QuestionChoiceReadSerializer(many=True, read_only=True)
+    choices = serializers.SerializerMethodField()
+    depends_on = serializers.SerializerMethodField()
+
+    def _visibility_context(self, obj):
+        request = self.context.get("request")
+        if request is None:
+            return None
+        visibility_context = self.context.get("_direct_question_visibility_context")
+        if not isinstance(
+            visibility_context, DirectQuestionVisibilityContext
+        ) or not visibility_context.covers_question(request, obj):
+            visibility_context = DirectQuestionVisibilityContext.build(
+                request=request,
+                questions=(obj,),
+            )
+            self.context["_direct_question_visibility_context"] = visibility_context
+        return visibility_context
+
+    def get_choices(self, obj):
+        visibility_context = self._visibility_context(obj)
+        choices = (
+            obj.choices.all()
+            if visibility_context is None
+            else visibility_context.choices_for(self.context["request"], obj)
+        )
+        return QuestionChoiceReadSerializer(
+            choices,
+            many=True,
+            context=self.context,
+        ).data
+
+    def get_depends_on(self, obj):
+        visibility_context = self._visibility_context(obj)
+        if visibility_context is None:
+            return obj.depends_on
+        return visibility_context.dependency_for(self.context["request"], obj)
 
     class Meta:
         model = Question
         fields = "__all__"
+        list_serializer_class = QuestionReadListSerializer
 
 
 class QuestionWriteSerializer(BaseModelSerializer):
+    def to_representation(self, instance):
+        return QuestionReadSerializer(instance, context=self.context).data
+
+    def validate_folder(self, value):
+        self._ensure_immutable("folder", value)
+        return value
+
+    def validate_requirement_node(self, value):
+        self._ensure_immutable("requirement_node", value)
+        return value
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        request = self.context.get("request")
+        requirement_node = attrs.get("requirement_node") or (
+            self.instance.requirement_node if self.instance is not None else None
+        )
+        if request is not None and requirement_node is not None:
+            if not RequirementNode.objects.filter(
+                id=requirement_node.id,
+                id__in=RoleAssignment.get_viewable_object_ids(
+                    request.user, RequirementNode
+                ),
+                framework_id__in=RoleAssignment.get_viewable_object_ids(
+                    request.user, Framework
+                ),
+            ).exists():
+                raise PermissionDenied(
+                    {
+                        "requirement_node": (
+                            "The parent requirement is unavailable for this caller."
+                        )
+                    }
+                )
+        return attrs
+
     def update(self, instance, validated_data):
         # Skip the URN-based "imported objects" guard from BaseModelSerializer
         # because questions on draft frameworks should be editable.
@@ -4464,27 +5427,54 @@ class QuestionWriteSerializer(BaseModelSerializer):
 
 class AnswerReadSerializer(BaseModelSerializer):
     folder = FieldsRelatedField()
-    selected_choices = FieldsRelatedField(many=True)
+    selected_choices = serializers.SerializerMethodField()
+
+    def get_selected_choices(self, instance):
+        request = self.context.get("request")
+        if request is None or not getattr(request.user, "is_authenticated", False):
+            return []
+        choices = getattr(instance, "questionnaire_visible_choices", None)
+        if choices is None:
+            visible_question_ids = RoleAssignment.get_viewable_object_ids(
+                request.user, Question
+            )
+            visible_requirement_node_ids = RoleAssignment.get_viewable_object_ids(
+                request.user, RequirementNode
+            )
+            visible_framework_ids = RoleAssignment.get_viewable_object_ids(
+                request.user, Framework
+            )
+            visible_choice_ids = RoleAssignment.get_viewable_object_ids(
+                request.user, QuestionChoice
+            )
+            choices = instance.selected_choices.filter(
+                question_id=instance.question_id,
+                question_id__in=visible_question_ids,
+                question__requirement_node_id__in=visible_requirement_node_ids,
+                question__requirement_node__framework_id__in=visible_framework_ids,
+                id__in=visible_choice_ids,
+            )
+        else:
+            # A custom Prefetch is an authorization optimization, not evidence
+            # that a legacy/corrupt M2M row belongs to this Answer's Question.
+            choices = [
+                choice
+                for choice in choices
+                if choice.question_id == instance.question_id
+            ]
+        field = FieldsRelatedField()
+        return [field.to_representation(choice) for choice in choices]
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        request = self.context.get("request")
-        if request is None:
-            data["selected_choices"] = []
-            return data
-        visible_choice_ids = set(
-            RoleAssignment.get_viewable_object_ids(request.user, QuestionChoice)
-        )
-        visible_choices = []
-        for choice in data.get("selected_choices", []):
-            raw_id = choice.get("id") if isinstance(choice, dict) else choice
-            try:
-                choice_id = UUID(str(raw_id))
-            except TypeError, ValueError:
-                continue
-            if choice_id in visible_choice_ids:
-                visible_choices.append(choice)
-        data["selected_choices"] = visible_choices
+        if instance.question.type in (
+            Question.Type.UNIQUE_CHOICE,
+            Question.Type.MULTIPLE_CHOICE,
+        ):
+            # Old rows may still carry choice URNs in ``value``.  Choices cross
+            # their own IAM boundary above; the raw compatibility column must
+            # never become a second, unfiltered representation.
+            data["value"] = None
         return data
 
     class Meta:
@@ -4493,13 +5483,667 @@ class AnswerReadSerializer(BaseModelSerializer):
 
 
 class AnswerWriteSerializer(BaseModelSerializer):
+    # The RequirementAssessment is the only security-domain authority.  Keeping
+    # this read-only also prevents an arbitrary client-supplied Folder UUID from
+    # becoming an existence oracle during DRF field resolution.
+    folder = serializers.PrimaryKeyRelatedField(read_only=True)
+    requirement_assessment = AnswerAuthorityPrimaryKeyRelatedField(
+        queryset=RequirementAssessment.objects.all(),
+        authority_model=RequirementAssessment,
+        immutable_on_update=True,
+    )
+    question = AnswerAuthorityPrimaryKeyRelatedField(
+        queryset=Question.objects.all(),
+        authority_model=Question,
+        immutable_on_update=True,
+    )
     # Accept selected_choices as list of PKs for M2M
-    selected_choices = serializers.PrimaryKeyRelatedField(
-        queryset=QuestionChoice.objects.all(), many=True, required=False
+    selected_choices = AnswerAuthorityPrimaryKeyRelatedField(
+        queryset=QuestionChoice.objects.all(),
+        authority_model=QuestionChoice,
+        many=True,
+        required=False,
     )
 
+    def to_internal_value(self, data):
+        request = self.context.get("request")
+        if not getattr(getattr(request, "user", None), "is_authenticated", False):
+            raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
+        return super().to_internal_value(data)
+
     def to_representation(self, instance):
+        # The write queryset may have prefetched the pre-update authorized
+        # choice slice to a custom attribute.  Force the response projection to
+        # re-read the committed relation instead of echoing that stale list.
+        if hasattr(instance, "questionnaire_visible_choices"):
+            delattr(instance, "questionnaire_visible_choices")
         return AnswerReadSerializer(instance, context=self.context).data
+
+    def _check_m2m_visibility(self, validated_data: dict) -> None:
+        """Choice IAM is checked against this Answer's exact Question below."""
+        return super()._check_m2m_visibility(
+            {
+                field_name: value
+                for field_name, value in validated_data.items()
+                if field_name
+                not in {
+                    "selected_choices",
+                    "_m2m_choices",
+                    "_m2m_expected_choice_urns_by_id",
+                }
+            }
+        )
+
+    @staticmethod
+    def _answer_permission(action: str):
+        return Permission.objects.get(
+            content_type__app_label="core",
+            content_type__model="answer",
+            codename=f"{action}_answer",
+        )
+
+    def _lock_answer_scopes(
+        self,
+        *,
+        requirement_assessment_id,
+        operations,
+    ):
+        """Lock one or more Answer aggregates in one deterministic boundary.
+
+        Unlocked reads only discover the complete parent and security-folder
+        identity set.  The locked order is Folder -> Framework -> CA -> ordered
+        Assignments -> RequirementNode -> RA -> Questions -> Answers -> Choices
+        -> through rows -> direct user Actors -> User.  Locked rows are then
+        compared with every locator before authority is evaluated.  No mutation
+        returns to an earlier lock class, and new Answer rows derive their folder
+        only from the locked RequirementAssessment.
+        """
+        operations = [
+            {
+                "question_id": operation["question_id"],
+                "expected_question_urn": operation.get("expected_question_urn"),
+                "expected_question_type": operation.get("expected_question_type"),
+                "answer_id": operation.get("answer_id"),
+                "desired_choice_ids": frozenset(
+                    operation.get("desired_choice_ids", ())
+                ),
+                "expected_choice_urns_by_id": (
+                    dict(operation["expected_choice_urns_by_id"])
+                    if operation.get("expected_choice_urns_by_id") is not None
+                    else None
+                ),
+            }
+            for operation in operations
+        ]
+        operations.sort(key=lambda operation: str(operation["question_id"]))
+        question_ids = [operation["question_id"] for operation in operations]
+        if not operations or len(set(question_ids)) != len(question_ids):
+            raise serializers.ValidationError(
+                "Answer lock operations must contain distinct questions."
+            )
+
+        requirement_assessment_locator = (
+            RequirementAssessment.objects.filter(id=requirement_assessment_id)
+            .values(
+                "id",
+                "compliance_assessment_id",
+                "requirement_id",
+                "folder_id",
+            )
+            .first()
+        )
+        if requirement_assessment_locator is None:
+            raise PermissionDenied("The answer parent is unavailable.")
+        compliance_assessment_locator = (
+            ComplianceAssessment.objects.filter(
+                id=requirement_assessment_locator["compliance_assessment_id"]
+            )
+            .values("id", "framework_id", "folder_id")
+            .first()
+        )
+        requirement_node_locator = (
+            RequirementNode.objects.filter(
+                id=requirement_assessment_locator["requirement_id"]
+            )
+            .values("id", "framework_id", "folder_id")
+            .first()
+        )
+        if compliance_assessment_locator is None or requirement_node_locator is None:
+            raise PermissionDenied("The answer parent chain is unavailable.")
+
+        question_locators = {
+            row["id"]: row
+            for row in Question.objects.filter(id__in=question_ids)
+            .order_by("pk")
+            .values("id", "requirement_node_id", "folder_id", "urn", "type")
+        }
+        if set(question_locators) != set(question_ids):
+            raise PermissionDenied("One or more answer questions are unavailable.")
+
+        answer_locators = list(
+            Answer.objects.filter(
+                requirement_assessment_id=requirement_assessment_id,
+                question_id__in=question_ids,
+            )
+            .order_by("pk")
+            .values("id", "requirement_assessment_id", "question_id", "folder_id")
+        )
+        answer_ids = [row["id"] for row in answer_locators]
+        choice_through = Answer.selected_choices.through
+        current_choice_pairs = list(
+            choice_through.objects.filter(answer_id__in=answer_ids)
+            .order_by("pk")
+            .values_list("answer_id", "questionchoice_id")
+        )
+        all_choice_ids = {choice_id for _answer_id, choice_id in current_choice_pairs}
+        all_choice_ids.update(
+            choice_id
+            for operation in operations
+            for choice_id in operation["desired_choice_ids"]
+        )
+        choice_locators = {
+            row["id"]: row
+            for row in QuestionChoice.objects.filter(id__in=all_choice_ids)
+            .order_by("pk")
+            .values("id", "question_id", "folder_id", "urn")
+        }
+        if set(choice_locators) != all_choice_ids:
+            raise PermissionDenied("One or more answer choices are unavailable.")
+
+        assignment_locators = list(
+            RequirementAssignment.objects.filter(
+                compliance_assessment_id=compliance_assessment_locator["id"],
+                requirement_assessments=requirement_assessment_id,
+            )
+            .order_by("pk")
+            .values("id", "compliance_assessment_id")
+        )
+        assignment_ids = [row["id"] for row in assignment_locators]
+        framework_ids = {
+            compliance_assessment_locator["framework_id"],
+            requirement_node_locator["framework_id"],
+        }
+        framework_locators = {
+            row["id"]: row
+            for row in Framework.objects.filter(id__in=framework_ids)
+            .order_by("pk")
+            .values("id", "folder_id")
+        }
+        if set(framework_locators) != framework_ids:
+            raise PermissionDenied("The answer framework is unavailable.")
+
+        folder_ids = {
+            compliance_assessment_locator["folder_id"],
+            requirement_node_locator["folder_id"],
+            requirement_assessment_locator["folder_id"],
+            *(row["folder_id"] for row in framework_locators.values()),
+            *(row["folder_id"] for row in question_locators.values()),
+            *(row["folder_id"] for row in answer_locators),
+            *(row["folder_id"] for row in choice_locators.values()),
+        }
+        if None in folder_ids:
+            raise PermissionDenied("The answer security domain is unavailable.")
+        locked_folder_ids = set(
+            Folder.objects.select_for_update()
+            .filter(id__in=folder_ids)
+            .order_by("pk")
+            .values_list("id", flat=True)
+        )
+        if locked_folder_ids != folder_ids:
+            raise PermissionDenied("The answer security domain is unavailable.")
+
+        locked_frameworks = list(
+            Framework.objects.select_for_update()
+            .filter(id__in=framework_ids)
+            .order_by("pk")
+        )
+        if len(locked_frameworks) != len(framework_ids) or any(
+            framework.folder_id != framework_locators[framework.id]["folder_id"]
+            for framework in locked_frameworks
+        ):
+            raise PermissionDenied("The answer framework changed during authorization.")
+
+        compliance_assessment = (
+            ComplianceAssessment.objects.select_for_update()
+            .filter(id=compliance_assessment_locator["id"])
+            .order_by("pk")
+            .first()
+        )
+        if compliance_assessment is None or (
+            compliance_assessment.framework_id
+            != compliance_assessment_locator["framework_id"]
+            or compliance_assessment.folder_id
+            != compliance_assessment_locator["folder_id"]
+        ):
+            raise PermissionDenied("The answer audit changed during authorization.")
+
+        assignments = list(
+            RequirementAssignment.objects.select_for_update()
+            .filter(pk__in=assignment_ids)
+            .order_by("pk")
+        )
+        if [assignment.id for assignment in assignments] != assignment_ids or any(
+            assignment.compliance_assessment_id != compliance_assessment_locator["id"]
+            for assignment in assignments
+        ):
+            raise PermissionDenied(
+                "The answer assignment boundary changed during authorization."
+            )
+
+        requirement_node = (
+            RequirementNode.objects.select_for_update()
+            .filter(id=requirement_node_locator["id"])
+            .order_by("pk")
+            .first()
+        )
+        if requirement_node is None or (
+            requirement_node.framework_id != requirement_node_locator["framework_id"]
+            or requirement_node.folder_id != requirement_node_locator["folder_id"]
+        ):
+            raise PermissionDenied(
+                "The answer requirement changed during authorization."
+            )
+
+        requirement_assessment = (
+            RequirementAssessment.objects.select_for_update()
+            .filter(id=requirement_assessment_id)
+            .order_by("pk")
+            .first()
+        )
+        if requirement_assessment is None or any(
+            getattr(requirement_assessment, field_name) != expected
+            for field_name, expected in (
+                (
+                    "compliance_assessment_id",
+                    requirement_assessment_locator["compliance_assessment_id"],
+                ),
+                ("requirement_id", requirement_assessment_locator["requirement_id"]),
+                ("folder_id", requirement_assessment_locator["folder_id"]),
+            )
+        ):
+            raise PermissionDenied("The answer parent changed during authorization.")
+
+        locked_questions = list(
+            Question.objects.select_for_update()
+            .filter(id__in=question_ids)
+            .order_by("pk")
+        )
+        questions_by_id = {question.id: question for question in locked_questions}
+        if set(questions_by_id) != set(question_ids) or any(
+            question.requirement_node_id
+            != question_locators[question.id]["requirement_node_id"]
+            or question.folder_id != question_locators[question.id]["folder_id"]
+            or question.urn != question_locators[question.id]["urn"]
+            or question.type != question_locators[question.id]["type"]
+            for question in locked_questions
+        ):
+            raise PermissionDenied("One or more answer questions are unavailable.")
+        if any(
+            (
+                operation["expected_question_urn"] is not None
+                and questions_by_id[operation["question_id"]].urn
+                != operation["expected_question_urn"]
+            )
+            or (
+                operation["expected_question_type"] is not None
+                and questions_by_id[operation["question_id"]].type
+                != operation["expected_question_type"]
+            )
+            for operation in operations
+        ):
+            raise PermissionDenied("An answer question changed during authorization.")
+        if (
+            any(
+                question.requirement_node_id != requirement_node.id
+                for question in locked_questions
+            )
+            or requirement_node.framework_id != compliance_assessment.framework_id
+        ):
+            raise PermissionDenied("The answer parent chain is inconsistent.")
+
+        locked_answers = list(
+            Answer.objects.select_for_update()
+            .filter(
+                requirement_assessment_id=requirement_assessment.id,
+                question_id__in=question_ids,
+            )
+            .order_by("pk")
+        )
+        answer_locators_by_id = {row["id"]: row for row in answer_locators}
+        if {answer.id for answer in locked_answers} != set(
+            answer_locators_by_id
+        ) or any(
+            answer.requirement_assessment_id
+            != answer_locators_by_id[answer.id]["requirement_assessment_id"]
+            or answer.question_id != answer_locators_by_id[answer.id]["question_id"]
+            or answer.folder_id != answer_locators_by_id[answer.id]["folder_id"]
+            for answer in locked_answers
+        ):
+            raise PermissionDenied("The answer parent changed during authorization.")
+        answers_by_question_id = {
+            answer.question_id: answer for answer in locked_answers
+        }
+        for operation in operations:
+            answer = answers_by_question_id.get(operation["question_id"])
+            expected_answer_id = operation["answer_id"]
+            if expected_answer_id is None:
+                if answer is not None:
+                    raise serializers.ValidationError(
+                        "An answer already exists for this requirement and question."
+                    )
+            elif answer is None or answer.id != expected_answer_id:
+                raise PermissionDenied(
+                    "The answer parent changed during authorization."
+                )
+
+        current_choice_ids_by_answer = {}
+        for answer_id, choice_id in current_choice_pairs:
+            current_choice_ids_by_answer.setdefault(answer_id, set()).add(choice_id)
+        locked_choices = list(
+            QuestionChoice.objects.select_for_update()
+            .filter(id__in=all_choice_ids)
+            .order_by("pk")
+        )
+        choices_by_id = {choice.id: choice for choice in locked_choices}
+        if set(choices_by_id) != all_choice_ids or any(
+            choice.question_id != choice_locators[choice.id]["question_id"]
+            or choice.folder_id != choice_locators[choice.id]["folder_id"]
+            or choice.urn != choice_locators[choice.id]["urn"]
+            for choice in locked_choices
+        ):
+            raise PermissionDenied("One or more answer choices are unavailable.")
+
+        operation_choices = {}
+        for operation in operations:
+            question_id = operation["question_id"]
+            answer = answers_by_question_id.get(question_id)
+            operation_choice_ids = set(operation["desired_choice_ids"])
+            if answer is not None:
+                operation_choice_ids.update(
+                    current_choice_ids_by_answer.get(answer.id, ())
+                )
+            choices = [
+                choices_by_id[choice_id]
+                for choice_id in sorted(operation_choice_ids, key=str)
+            ]
+            if any(choice.question_id != question_id for choice in choices):
+                raise PermissionDenied(
+                    "An answer choice does not belong to its question."
+                )
+            expected_choice_urns = operation["expected_choice_urns_by_id"]
+            if expected_choice_urns is not None and (
+                set(expected_choice_urns) != set(operation["desired_choice_ids"])
+                or any(
+                    choices_by_id[choice_id].urn != expected_urn
+                    for choice_id, expected_urn in expected_choice_urns.items()
+                )
+            ):
+                raise PermissionDenied("An answer choice changed during authorization.")
+            operation_choices[question_id] = choices
+
+        # Through rows are locked only after every aggregate row and choice.
+        locked_assignment_link_ids = set(
+            RequirementAssignment.requirement_assessments.through.objects.select_for_update()
+            .filter(
+                requirementassignment_id__in=assignment_ids,
+                requirementassessment_id=requirement_assessment.id,
+            )
+            .order_by("pk")
+            .values_list("requirementassignment_id", flat=True)
+        )
+        current_assignment_link_ids = set(
+            RequirementAssignment.requirement_assessments.through.objects.filter(
+                requirementassessment_id=requirement_assessment.id,
+            ).values_list("requirementassignment_id", flat=True)
+        )
+        if locked_assignment_link_ids != set(
+            assignment_ids
+        ) or current_assignment_link_ids != set(assignment_ids):
+            raise PermissionDenied(
+                "The answer assignment boundary changed during authorization."
+            )
+        list(
+            RequirementAssignment.actor.through.objects.select_for_update()
+            .filter(requirementassignment_id__in=assignment_ids)
+            .order_by("pk")
+            .values_list("pk", flat=True)
+        )
+        list(
+            choice_through.objects.select_for_update()
+            .filter(answer_id__in=answer_ids)
+            .order_by("pk")
+            .values_list("pk", flat=True)
+        )
+        locked_choice_pairs = set(
+            choice_through.objects.filter(answer_id__in=answer_ids).values_list(
+                "answer_id", "questionchoice_id"
+            )
+        )
+        if locked_choice_pairs != set(current_choice_pairs):
+            raise PermissionDenied("The answer choices changed during authorization.")
+
+        # Team membership is independently mutable and does not participate in
+        # this lock protocol.  As with inverse RA writes, only the caller's
+        # direct user-backed Actor can confer Answer assignment authority.
+        request = self.context.get("request")
+        user_actor_ids_before = set()
+        user_actor_ids_after = set()
+        if request is not None and getattr(request.user, "is_authenticated", False):
+            user_actor_ids_before = set(
+                Actor.objects.filter(user_id=request.user.id).values_list(
+                    "id", flat=True
+                )
+            )
+            linked_actor_ids = set(
+                RequirementAssignment.actor.through.objects.filter(
+                    requirementassignment_id__in=assignment_ids,
+                ).values_list("actor_id", flat=True)
+            )
+            locked_direct_actors = list(
+                Actor.objects.select_for_update()
+                .filter(
+                    models.Q(id__in=linked_actor_ids)
+                    | models.Q(id__in=user_actor_ids_before),
+                    user__isnull=False,
+                )
+                .order_by("pk")
+            )
+            locked_user = (
+                User.objects.select_for_update()
+                .filter(id=request.user.id, is_active=True)
+                .order_by("pk")
+                .first()
+            )
+            if locked_user is None:
+                raise PermissionDenied("The caller is unavailable.")
+            user_actor_ids_after = set(
+                Actor.objects.filter(user_id=locked_user.id).values_list(
+                    "id", flat=True
+                )
+            )
+            if user_actor_ids_after != user_actor_ids_before:
+                raise PermissionDenied("The caller's assignment authority changed.")
+            if any(
+                actor.user_id != locked_user.id
+                for actor in locked_direct_actors
+                if actor.id in user_actor_ids_after
+            ):
+                raise PermissionDenied("The caller's assignment authority changed.")
+
+        return [
+            (
+                compliance_assessment,
+                assignments,
+                requirement_assessment,
+                answers_by_question_id.get(operation["question_id"]),
+                questions_by_id[operation["question_id"]],
+                operation_choices[operation["question_id"]],
+                user_actor_ids_after,
+            )
+            for operation in operations
+        ]
+
+    def _lock_answer_scope(
+        self,
+        *,
+        requirement_assessment_id,
+        question_id,
+        answer_id=None,
+        desired_choice_ids=(),
+        expected_choice_urns_by_id=None,
+    ):
+        """Single-answer wrapper over the shared deterministic batch boundary."""
+        return self._lock_answer_scopes(
+            requirement_assessment_id=requirement_assessment_id,
+            operations=(
+                {
+                    "question_id": question_id,
+                    "answer_id": answer_id,
+                    "desired_choice_ids": desired_choice_ids,
+                    "expected_choice_urns_by_id": expected_choice_urns_by_id,
+                },
+            ),
+        )[0]
+
+    def _assert_locked_answer_authority(
+        self,
+        *,
+        action: str,
+        compliance_assessment,
+        assignments,
+        requirement_assessment,
+        answer,
+        question,
+        locked_choices,
+        user_actor_ids,
+        desired_choice_ids=(),
+    ) -> None:
+        request = self.context.get("request")
+        if not getattr(getattr(request, "user", None), "is_authenticated", False):
+            raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
+
+        if question.requirement_node_id != requirement_assessment.requirement_id:
+            raise PermissionDenied(
+                "The answer question does not belong to its assessment."
+            )
+        if (
+            requirement_assessment.requirement.framework_id
+            != compliance_assessment.framework_id
+        ):
+            raise PermissionDenied("The answer assessment framework is inconsistent.")
+        if compliance_assessment.is_locked:
+            raise serializers.ValidationError(
+                "⚠️ Cannot modify the answer when the audit is locked."
+            )
+        if compliance_assessment.status == ComplianceAssessment.Status.IN_REVIEW:
+            raise serializers.ValidationError(
+                "⚠️ Cannot modify the answer when the audit is in review."
+            )
+
+        user = request.user
+        required_views = (
+            (ComplianceAssessment, compliance_assessment.id),
+            (RequirementAssessment, requirement_assessment.id),
+            (RequirementNode, requirement_assessment.requirement_id),
+            (Framework, compliance_assessment.framework_id),
+            (Question, question.id),
+        )
+        if answer is not None:
+            if answer.folder_id != requirement_assessment.folder_id:
+                raise PermissionDenied(
+                    "The answer security domain is inconsistent with its assessment."
+                )
+            required_views += ((Answer, answer.id),)
+        for model, object_id in required_views:
+            if not model.objects.filter(
+                id=object_id,
+                id__in=RoleAssignment.get_viewable_object_ids(user, model),
+            ).exists():
+                raise PermissionDenied(
+                    "You do not have permission to access this answer."
+                )
+
+        from core.utils import (
+            has_full_view_compliance_assessment,
+            is_field_editable_by,
+        )
+
+        is_full_viewer = has_full_view_compliance_assessment(
+            user, compliance_assessment
+        )
+        viewer_role = "auditor" if is_full_viewer else "respondent"
+        if not is_field_editable_by(compliance_assessment, "answers", viewer_role):
+            raise PermissionDenied("You do not have permission to update this answer.")
+
+        if not is_full_viewer:
+            assignment_ids = [assignment.id for assignment in assignments]
+            requirement_links = set(
+                RequirementAssignment.requirement_assessments.through.objects.filter(
+                    requirementassignment_id__in=assignment_ids,
+                    requirementassessment_id=requirement_assessment.id,
+                ).values_list("requirementassignment_id", flat=True)
+            )
+            actor_links = set(
+                RequirementAssignment.actor.through.objects.filter(
+                    requirementassignment_id__in=requirement_links,
+                    actor_id__in=user_actor_ids,
+                ).values_list("requirementassignment_id", flat=True)
+            )
+            user_assignments = [
+                assignment for assignment in assignments if assignment.id in actor_links
+            ]
+            if not user_assignments:
+                raise PermissionDenied(
+                    "You do not have permission to access this answer."
+                )
+            if any(
+                assignment.status
+                in (
+                    RequirementAssignment.Status.SUBMITTED,
+                    RequirementAssignment.Status.CLOSED,
+                )
+                for assignment in user_assignments
+            ):
+                raise serializers.ValidationError(
+                    "Cannot modify: this requirement's assignment has been submitted or closed."
+                )
+
+        if not RoleAssignment.is_access_allowed(
+            user=user,
+            perm=self._answer_permission(action),
+            # RequirementAssessment owns the Answer security domain.  Never let
+            # a legacy/corrupt child folder become a weaker permission root.
+            folder=requirement_assessment.folder,
+        ):
+            raise PermissionDenied(
+                f"You do not have permission to {action} this answer."
+            )
+
+        desired_choice_ids = set(desired_choice_ids)
+        if desired_choice_ids:
+            visible_choice_ids = RoleAssignment.get_viewable_object_ids(
+                user, QuestionChoice
+            )
+            authorized_choice_ids = set(
+                QuestionChoice.objects.filter(
+                    id__in=desired_choice_ids,
+                    question_id=question.id,
+                )
+                .filter(id__in=visible_choice_ids)
+                .values_list("id", flat=True)
+            )
+            if authorized_choice_ids != desired_choice_ids:
+                raise PermissionDenied(
+                    "One or more selected choices are unavailable for this caller."
+                )
+
+    def validate_requirement_assessment(self, value):
+        self._ensure_immutable("requirement_assessment", value)
+        return value
+
+    def validate_question(self, value):
+        self._ensure_immutable("question", value)
+        return value
 
     def validate(self, attrs):
         requirement_assessment = attrs.get("requirement_assessment") or (
@@ -4549,14 +6193,18 @@ class AnswerWriteSerializer(BaseModelSerializer):
 
             user = request.user
             if (
-                compliance_assessment.id
-                not in RoleAssignment.get_viewable_object_ids(
-                    user, ComplianceAssessment
-                )
-                or requirement_assessment.id
-                not in RoleAssignment.get_viewable_object_ids(
-                    user, RequirementAssessment
-                )
+                not ComplianceAssessment.objects.filter(
+                    id=compliance_assessment.id,
+                    id__in=RoleAssignment.get_viewable_object_ids(
+                        user, ComplianceAssessment
+                    ),
+                ).exists()
+                or not RequirementAssessment.objects.filter(
+                    id=requirement_assessment.id,
+                    id__in=RoleAssignment.get_viewable_object_ids(
+                        user, RequirementAssessment
+                    ),
+                ).exists()
             ):
                 raise PermissionDenied(
                     "You do not have permission to access this answer."
@@ -4565,8 +6213,18 @@ class AnswerWriteSerializer(BaseModelSerializer):
             is_full_viewer = has_full_view_compliance_assessment(
                 user, compliance_assessment
             )
+            viewer_role = "auditor" if is_full_viewer else "respondent"
+            from core.utils import is_field_editable_by
+
+            if not is_field_editable_by(compliance_assessment, "answers", viewer_role):
+                raise PermissionDenied(
+                    "You do not have permission to update this answer."
+                )
             if not is_full_viewer:
-                user_actors = Actor.get_all_for_user(user)
+                # Team membership writers do not share this aggregate lock
+                # protocol. Match the locked authority boundary and accept only
+                # the caller's direct, user-backed Actor.
+                user_actors = Actor.objects.filter(user_id=user.id)
                 if not RequirementAssignment.objects.filter(
                     compliance_assessment=compliance_assessment,
                     requirement_assessments=requirement_assessment,
@@ -4576,8 +6234,12 @@ class AnswerWriteSerializer(BaseModelSerializer):
                         "You do not have permission to access this answer."
                     )
 
-            if question and question.id not in RoleAssignment.get_viewable_object_ids(
-                user, Question
+            if (
+                question
+                and not Question.objects.filter(
+                    id=question.id,
+                    id__in=RoleAssignment.get_viewable_object_ids(user, Question),
+                ).exists()
             ):
                 raise PermissionDenied(
                     "You do not have permission to access this answer."
@@ -4586,12 +6248,6 @@ class AnswerWriteSerializer(BaseModelSerializer):
             visible_choice_ids = RoleAssignment.get_viewable_object_ids(
                 user, QuestionChoice
             )
-            if selected_choices_list is not None and any(
-                choice.id not in visible_choice_ids for choice in selected_choices_list
-            ):
-                raise PermissionDenied(
-                    "You do not have permission to access this answer."
-                )
 
             if not is_full_viewer:
                 locked_assignment = requirement_assessment.assignments.filter(
@@ -4663,8 +6319,10 @@ class AnswerWriteSerializer(BaseModelSerializer):
                                 {"value": f"Invalid choice '{value}'."}
                             )
                         attrs["_m2m_choices"] = [choice]
+                        attrs["_m2m_expected_choice_urns_by_id"] = {choice.id: value}
                     else:
                         attrs["_m2m_choices"] = []
+                        attrs["_m2m_expected_choice_urns_by_id"] = {}
                     attrs["value"] = None
 
                 # Direct M2M PKs: validate all belong to question and at most 1
@@ -4688,6 +6346,7 @@ class AnswerWriteSerializer(BaseModelSerializer):
                                 }
                             )
                     attrs["_m2m_choices"] = selected_choices_list
+                    attrs["_m2m_expected_choice_urns_by_id"] = None
                     attrs["value"] = None
 
             elif q_type == Question.Type.MULTIPLE_CHOICE:
@@ -4710,8 +6369,12 @@ class AnswerWriteSerializer(BaseModelSerializer):
                                 {"value": f"Invalid choices: {missing}"}
                             )
                         attrs["_m2m_choices"] = list(choices)
+                        attrs["_m2m_expected_choice_urns_by_id"] = {
+                            choice.id: choice.urn for choice in choices
+                        }
                     else:
                         attrs["_m2m_choices"] = []
+                        attrs["_m2m_expected_choice_urns_by_id"] = {}
                     attrs["value"] = None
 
                 # Direct M2M PKs: validate all belong to question
@@ -4729,6 +6392,7 @@ class AnswerWriteSerializer(BaseModelSerializer):
                                 }
                             )
                     attrs["_m2m_choices"] = selected_choices_list
+                    attrs["_m2m_expected_choice_urns_by_id"] = None
                     attrs["value"] = None
 
             elif q_type == Question.Type.BOOLEAN:
@@ -4751,28 +6415,165 @@ class AnswerWriteSerializer(BaseModelSerializer):
                             {"value": "Date answers must be in YYYY-MM-DD format."}
                         )
 
+            if "_m2m_choices" in attrs:
+                # Keep the authority boundary lazy so update-time delta queries
+                # intersect it in SQL instead of materializing every globally
+                # visible QuestionChoice ID.
+                attrs["_m2m_visible_choice_ids"] = visible_choice_ids
+
         return super().validate(attrs)
 
     def create(self, validated_data):
         m2m_choices = validated_data.pop("_m2m_choices", None)
+        expected_choice_urns_by_id = validated_data.pop(
+            "_m2m_expected_choice_urns_by_id", None
+        )
+        validated_data.pop("_m2m_visible_choice_ids", None)
         # Remove selected_choices from validated_data since M2M can't be set on create
         validated_data.pop("selected_choices", None)
-        instance = super().create(validated_data)
-        if m2m_choices is not None:
-            instance.selected_choices.set(m2m_choices)
-            # Re-save to trigger IG update for dynamic frameworks
-            instance.save()
-        return instance
+        requirement_assessment = validated_data.get("requirement_assessment")
+        if requirement_assessment is None:
+            raise serializers.ValidationError(
+                {"requirement_assessment": "This field is required."}
+            )
+        question = validated_data.get("question")
+        if question is None:
+            raise serializers.ValidationError({"question": "This field is required."})
+        desired_choice_ids = {
+            choice.id for choice in (m2m_choices if m2m_choices is not None else [])
+        }
+        with transaction.atomic():
+            scope = self._lock_answer_scope(
+                requirement_assessment_id=requirement_assessment.id,
+                question_id=question.id,
+                desired_choice_ids=desired_choice_ids,
+                expected_choice_urns_by_id=expected_choice_urns_by_id,
+            )
+            (
+                compliance_assessment,
+                assignments,
+                locked_requirement_assessment,
+                _answer,
+                locked_question,
+                locked_choices,
+                user_actor_ids,
+            ) = scope
+            self._assert_locked_answer_authority(
+                action="add",
+                compliance_assessment=compliance_assessment,
+                assignments=assignments,
+                requirement_assessment=locked_requirement_assessment,
+                answer=None,
+                question=locked_question,
+                locked_choices=locked_choices,
+                user_actor_ids=user_actor_ids,
+                desired_choice_ids=desired_choice_ids,
+            )
+            locked_choice_by_id = {choice.id: choice for choice in locked_choices}
+            locked_desired_choices = [
+                locked_choice_by_id[choice_id]
+                for choice_id in sorted(desired_choice_ids, key=str)
+            ]
+            validated_data["requirement_assessment"] = locked_requirement_assessment
+            validated_data["question"] = locked_question
+            # The parent owns the security domain. Never trust a second client
+            # supplied folder for a child Answer.
+            validated_data["folder"] = locked_requirement_assessment.folder
+            instance = super().create(validated_data)
+            if m2m_choices is not None:
+                instance.selected_choices.set(locked_desired_choices)
+                # Re-save to trigger IG update for dynamic frameworks
+                instance.save()
+            return instance
 
     def update(self, instance, validated_data):
         m2m_choices = validated_data.pop("_m2m_choices", None)
+        expected_choice_urns_by_id = validated_data.pop(
+            "_m2m_expected_choice_urns_by_id", None
+        )
+        validated_data.pop("_m2m_visible_choice_ids", None)
         validated_data.pop("selected_choices", None)
-        instance = super().update(instance, validated_data)
-        if m2m_choices is not None:
-            instance.selected_choices.set(m2m_choices)
-            # Re-save to trigger IG update for dynamic frameworks
-            instance.save()
-        return instance
+        desired_choice_ids = {
+            choice.id for choice in (m2m_choices if m2m_choices is not None else [])
+        }
+        with transaction.atomic():
+            scope = self._lock_answer_scope(
+                requirement_assessment_id=instance.requirement_assessment_id,
+                question_id=instance.question_id,
+                answer_id=instance.id,
+                desired_choice_ids=desired_choice_ids,
+                expected_choice_urns_by_id=expected_choice_urns_by_id,
+            )
+            (
+                compliance_assessment,
+                assignments,
+                locked_requirement_assessment,
+                locked_answer,
+                locked_question,
+                locked_choices,
+                user_actor_ids,
+            ) = scope
+            self.instance = locked_answer
+            self._assert_locked_answer_authority(
+                action="change",
+                compliance_assessment=compliance_assessment,
+                assignments=assignments,
+                requirement_assessment=locked_requirement_assessment,
+                answer=locked_answer,
+                question=locked_question,
+                locked_choices=locked_choices,
+                user_actor_ids=user_actor_ids,
+                desired_choice_ids=desired_choice_ids,
+            )
+            locked_choice_by_id = {choice.id: choice for choice in locked_choices}
+            locked_desired_choices = [
+                locked_choice_by_id[choice_id]
+                for choice_id in sorted(desired_choice_ids, key=str)
+            ]
+            instance = super().update(locked_answer, validated_data)
+            if m2m_choices is not None:
+                _apply_visible_answer_choice_update(
+                    instance,
+                    locked_desired_choices,
+                    RoleAssignment.get_viewable_object_ids(
+                        self.context["request"].user, QuestionChoice
+                    ),
+                    fail_on_hidden=(
+                        instance.question.type == Question.Type.UNIQUE_CHOICE
+                    ),
+                )
+                # Re-save to trigger IG update for dynamic frameworks
+                instance.save()
+            return instance
+
+    def delete(self, instance):
+        with transaction.atomic():
+            scope = self._lock_answer_scope(
+                requirement_assessment_id=instance.requirement_assessment_id,
+                question_id=instance.question_id,
+                answer_id=instance.id,
+            )
+            (
+                compliance_assessment,
+                assignments,
+                locked_requirement_assessment,
+                locked_answer,
+                locked_question,
+                locked_choices,
+                user_actor_ids,
+            ) = scope
+            self.instance = locked_answer
+            self._assert_locked_answer_authority(
+                action="delete",
+                compliance_assessment=compliance_assessment,
+                assignments=assignments,
+                requirement_assessment=locked_requirement_assessment,
+                answer=locked_answer,
+                question=locked_question,
+                locked_choices=locked_choices,
+                user_actor_ids=user_actor_ids,
+            )
+            return super().delete(locked_answer)
 
     class Meta:
         model = Answer
@@ -5183,10 +6984,188 @@ class RequirementAssignmentReadSerializer(BaseModelSerializer):
 
 
 class RequirementAssignmentWriteSerializer(BaseModelSerializer):
+    compliance_assessment = RequirementAssignmentComplianceAssessmentField(
+        queryset=ComplianceAssessment.objects.all()
+    )
+    # Assignment security follows its ComplianceAssessment. Accept a matching
+    # legacy client value below, but never persist a client-selected Folder as
+    # an independent authority root.
+    folder = serializers.PrimaryKeyRelatedField(read_only=True)
+    actor = RequirementAssignmentAuthorityPrimaryKeyRelatedField(
+        queryset=Actor.objects.all(),
+        authority_model=Actor,
+        many=True,
+        allow_empty=False,
+    )
+    requirement_assessments = RequirementAssignmentAuthorityPrimaryKeyRelatedField(
+        queryset=RequirementAssessment.objects.all(),
+        authority_model=RequirementAssessment,
+        many=True,
+        required=False,
+    )
+
+    def to_internal_value(self, data):
+        _assert_raw_immutable_relation_ids(
+            self.instance, data, ("compliance_assessment", "folder")
+        )
+        attrs = super().to_internal_value(data)
+        if self.instance is None:
+            assessment = attrs.get("compliance_assessment")
+            if assessment is None:
+                raise PermissionDenied(_ASSIGNMENT_PARENT_UNAVAILABLE)
+            if "folder" in data:
+                submitted_folder_id = _normalize_related_uuid(
+                    data.get("folder"), detail=_ASSIGNMENT_PARENT_UNAVAILABLE
+                )
+                if submitted_folder_id != assessment.folder_id:
+                    raise PermissionDenied(_ASSIGNMENT_PARENT_UNAVAILABLE)
+            self._assignment_parent_snapshot = (
+                assessment.id,
+                assessment.folder_id,
+            )
+        return attrs
+
     class Meta:
         model = RequirementAssignment
         fields = "__all__"
         read_only_fields = ["status"]
+
+    def validate_compliance_assessment(self, value):
+        self._ensure_immutable("compliance_assessment", value)
+        return value
+
+    def validate_folder(self, value):
+        self._ensure_immutable("folder", value)
+        return value
+
+    @staticmethod
+    def _assert_requirement_assessments_belong_to_assessment(
+        *, user, compliance_assessment, requirement_assessments
+    ) -> None:
+        rows = tuple(requirement_assessments)
+        if not rows:
+            return
+        if any(
+            row.compliance_assessment_id != compliance_assessment.id for row in rows
+        ):
+            raise PermissionDenied(_ASSIGNMENT_RELATION_UNAVAILABLE)
+
+    @staticmethod
+    def _assert_relation_visibility(*, user, model, object_ids) -> None:
+        requested_ids = set(object_ids)
+        if not requested_ids:
+            return
+        try:
+            visible_ids = set(
+                RequirementAssignmentAuthorityPrimaryKeyRelatedField.visible_queryset(
+                    user=user,
+                    authority_model=model,
+                    object_ids=requested_ids,
+                ).values_list("id", flat=True)
+            )
+        except NotImplementedError, Permission.DoesNotExist:
+            visible_ids = set()
+        if visible_ids != requested_ids:
+            raise PermissionDenied(_ASSIGNMENT_RELATION_UNAVAILABLE)
+
+    def create(self, validated_data):
+        """Bind and reprove the Assignment parent under a deterministic lock."""
+
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        snapshot = getattr(self, "_assignment_parent_snapshot", None)
+        if not getattr(user, "is_authenticated", False) or snapshot is None:
+            raise PermissionDenied(_ASSIGNMENT_PARENT_UNAVAILABLE)
+        assessment_id, folder_id = snapshot
+
+        with transaction.atomic():
+            locked_folder = (
+                Folder.objects.select_for_update().filter(id=folder_id).first()
+            )
+            locked_assessment = (
+                ComplianceAssessment.objects.select_for_update(of=("self",))
+                .filter(id=assessment_id, folder_id=folder_id)
+                .first()
+            )
+            try:
+                assessment_is_visible = (
+                    locked_assessment is not None
+                    and ComplianceAssessment.objects.filter(
+                        id=locked_assessment.id,
+                        id__in=RoleAssignment.get_viewable_object_ids(
+                            user, ComplianceAssessment
+                        ),
+                    ).exists()
+                )
+                can_add = (
+                    locked_folder is not None
+                    and assessment_is_visible
+                    and RoleAssignment.is_access_allowed(
+                        user=user,
+                        perm=(
+                            RequirementAssignmentComplianceAssessmentField._add_permission()
+                        ),
+                        folder=locked_folder,
+                    )
+                )
+            except NotImplementedError, Permission.DoesNotExist:
+                can_add = False
+            if not can_add:
+                raise PermissionDenied(_ASSIGNMENT_PARENT_UNAVAILABLE)
+
+            requested_actors = tuple(validated_data.get("actor", ()))
+            requested_assessments = tuple(
+                validated_data.get("requirement_assessments", ())
+            )
+            actor_ids = {actor.id for actor in requested_actors}
+            requirement_assessment_ids = {row.id for row in requested_assessments}
+            locked_requirement_assessments = list(
+                RequirementAssessment.objects.select_for_update()
+                .filter(id__in=requirement_assessment_ids)
+                .order_by("pk")
+            )
+            locked_actors = list(
+                Actor.objects.select_for_update()
+                .filter(id__in=actor_ids)
+                .order_by("pk")
+            )
+            if {
+                row.id for row in locked_requirement_assessments
+            } != requirement_assessment_ids or {
+                actor.id for actor in locked_actors
+            } != actor_ids:
+                raise PermissionDenied(_ASSIGNMENT_RELATION_UNAVAILABLE)
+            self._assert_relation_visibility(
+                user=user,
+                model=RequirementAssessment,
+                object_ids=requirement_assessment_ids,
+            )
+            self._assert_relation_visibility(
+                user=user,
+                model=Actor,
+                object_ids=actor_ids,
+            )
+            self._assert_requirement_assessments_belong_to_assessment(
+                user=user,
+                compliance_assessment=locked_assessment,
+                requirement_assessments=locked_requirement_assessments,
+            )
+            if RequirementAssignment.objects.filter(
+                compliance_assessment=locked_assessment,
+                requirement_assessments__in=locked_requirement_assessments,
+            ).exists():
+                raise serializers.ValidationError(
+                    {
+                        "requirement_assessments": "Some requirement assessments are already assigned to another assignment."
+                    }
+                )
+
+            locked_data = dict(validated_data)
+            locked_data["compliance_assessment"] = locked_assessment
+            locked_data["folder"] = locked_folder
+            locked_data["actor"] = locked_actors
+            locked_data["requirement_assessments"] = locked_requirement_assessments
+            return super().create(locked_data)
 
     def validate(self, attrs):
         """
@@ -5200,14 +7179,15 @@ class RequirementAssignmentWriteSerializer(BaseModelSerializer):
         requirement_assessments = attrs.get("requirement_assessments", [])
 
         if compliance_assessment and requirement_assessments:
-            # Check that all requirement assessments belong to the compliance assessment
-            for ra in requirement_assessments:
-                if ra.compliance_assessment_id != compliance_assessment.id:
-                    raise serializers.ValidationError(
-                        {
-                            "requirement_assessments": f"Requirement assessment '{ra}' does not belong to the specified compliance assessment."
-                        }
-                    )
+            request = self.context.get("request")
+            user = getattr(request, "user", None)
+            if not getattr(user, "is_authenticated", False):
+                raise PermissionDenied(_ASSIGNMENT_RELATION_UNAVAILABLE)
+            self._assert_requirement_assessments_belong_to_assessment(
+                user=user,
+                compliance_assessment=compliance_assessment,
+                requirement_assessments=requirement_assessments,
+            )
 
             # Check that requirement assessments are not already assigned to another assignment
             existing_assignment_ids = (
@@ -5274,7 +7254,9 @@ class LibraryFilteringLabelWriteSerializer(BaseModelSerializer):
 
 
 class SecurityExceptionWriteSerializer(
-    CustomFieldsSerializerMixin, BaseModelSerializer
+    RequirementAssessmentRelationshipAuthorityMixin,
+    CustomFieldsSerializerMixin,
+    BaseModelSerializer,
 ):
     genericcollection = serializers.PrimaryKeyRelatedField(
         source="genericcollection_set",
@@ -5282,7 +7264,7 @@ class SecurityExceptionWriteSerializer(
         required=False,
         queryset=GenericCollection.objects.all(),
     )
-    requirement_assessments = serializers.PrimaryKeyRelatedField(
+    requirement_assessments = GovernedRequirementAssessmentPrimaryKeyRelatedField(
         many=True, queryset=RequirementAssessment.objects.all(), required=False
     )
     applied_controls = serializers.PrimaryKeyRelatedField(
@@ -5296,37 +7278,47 @@ class SecurityExceptionWriteSerializer(
     )
 
     def create(self, validated_data):
-        owner_data = validated_data.get("owners", [])
-        security_exception = super().create(validated_data)
+        with transaction.atomic():
+            owner_data = validated_data.get("owners", [])
+            security_exception = super().create(validated_data)
 
-        # Notify newly assigned owners
-        if owner_data:
-            self._send_assignment_notifications(
-                security_exception, [actor.id for actor in owner_data]
-            )
+            # Notify newly assigned owners
+            if owner_data:
+                self._send_assignment_notifications(
+                    security_exception, [actor.id for actor in owner_data]
+                )
 
-        return security_exception
+            return security_exception
 
     def update(self, instance, validated_data):
-        old_owner_ids = set(instance.owners.values_list("id", flat=True))
-        old_status = instance.status
+        with transaction.atomic():
+            governed_relationship = "requirement_assessments" in validated_data
+            if governed_relationship:
+                old_owner_ids = None
+                old_status = None
+            else:
+                old_owner_ids = set(instance.owners.values_list("id", flat=True))
+                old_status = instance.status
 
-        updated_instance = super().update(instance, validated_data)
+            updated_instance = super().update(instance, validated_data)
 
-        new_owner_ids = set(updated_instance.owners.values_list("id", flat=True))
+            if governed_relationship:
+                old_status = self._governed_locked_scalar_snapshot["status"]
+            else:
+                new_owner_ids = set(
+                    updated_instance.owners.values_list("id", flat=True)
+                )
+                newly_assigned_ids = new_owner_ids - old_owner_ids
+                if newly_assigned_ids:
+                    self._send_assignment_notifications(
+                        updated_instance, list(newly_assigned_ids)
+                    )
 
-        # Notify only newly assigned owners
-        newly_assigned_ids = new_owner_ids - old_owner_ids
-        if newly_assigned_ids:
-            self._send_assignment_notifications(
-                updated_instance, list(newly_assigned_ids)
-            )
+            # Notify owners and approver on status change
+            if updated_instance.status != old_status:
+                self._send_status_notification(updated_instance)
 
-        # Notify owners and approver on status change
-        if updated_instance.status != old_status:
-            self._send_status_notification(updated_instance)
-
-        return updated_instance
+            return updated_instance
 
     def _send_assignment_notifications(self, security_exception, owner_ids):
         """Send assignment notifications to the specified owners"""
@@ -5347,11 +7339,19 @@ class SecurityExceptionWriteSerializer(
             unique_emails = list(dict.fromkeys(filter(None, assigned_emails)))
             if unique_emails:
                 exception_id = security_exception.id
-                transaction.on_commit(
-                    lambda: send_security_exception_assignment_notification(
-                        exception_id, unique_emails
-                    )
-                )
+
+                def enqueue_assignment_notification():
+                    try:
+                        send_security_exception_assignment_notification(
+                            exception_id, unique_emails
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "Failed to queue SecurityException assignment notification",
+                            error_type=type(exc).__name__,
+                        )
+
+                transaction.on_commit(enqueue_assignment_notification)
         except Exception as e:
             logger.error(
                 f"Failed to send SecurityException assignment notification: {str(e)}"
@@ -5381,11 +7381,19 @@ class SecurityExceptionWriteSerializer(
 
             exception_id = security_exception.id
             new_status = security_exception.get_status_display()
-            transaction.on_commit(
-                lambda: send_security_exception_status_notification(
-                    exception_id, new_status, actor_name, recipient_emails
-                )
-            )
+
+            def enqueue_status_notification():
+                try:
+                    send_security_exception_status_notification(
+                        exception_id, new_status, actor_name, recipient_emails
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Failed to queue SecurityException status notification",
+                        error_type=type(exc).__name__,
+                    )
+
+            transaction.on_commit(enqueue_status_notification)
         except Exception as e:
             logger.error(
                 f"Failed to send SecurityException status notification: {str(e)}"
@@ -5394,12 +7402,19 @@ class SecurityExceptionWriteSerializer(
     class Meta:
         model = SecurityException
         fields = "__all__"
+        list_serializer_class = (
+            RequirementAssessmentRelationshipProjectionListSerializer
+        )
         # Deprecated: approval is handled through validation flows. The field is
         # kept read-only so existing values remain visible without new writes.
         read_only_fields = ["approver"]
 
 
-class SecurityExceptionReadSerializer(CustomFieldsSerializerMixin, BaseModelSerializer):
+class SecurityExceptionReadSerializer(
+    RequirementAssessmentRelationshipProjectionMixin,
+    CustomFieldsSerializerMixin,
+    BaseModelSerializer,
+):
     path = PathField(read_only=True)
     folder = FieldsRelatedField()
     owners = FieldsRelatedField(many=True)
@@ -5408,6 +7423,7 @@ class SecurityExceptionReadSerializer(CustomFieldsSerializerMixin, BaseModelSeri
     associated_objects_count = serializers.SerializerMethodField()
     assets = FieldsRelatedField(many=True)
     evidences = FieldsRelatedField(many=True)
+    requirement_assessments = FieldsRelatedField(many=True)
     validation_flows = FieldsRelatedField(
         many=True,
         fields=[
@@ -5422,10 +7438,8 @@ class SecurityExceptionReadSerializer(CustomFieldsSerializerMixin, BaseModelSeri
     )
 
     def get_associated_objects_count(self, obj):
-        """Prefer annotated or prefetched counts to avoid extra DB queries."""
-        annotated = getattr(obj, "associated_objects_count", None)
-        if annotated is not None:
-            return annotated
+        """Count only caller-projectable requirement-assessment links."""
+        projected_ra_count = len(self._projected_requirement_assessment_ids(obj))
         try:
             # Uses prefetch cache when available (no extra queries)
             return (
@@ -5433,7 +7447,7 @@ class SecurityExceptionReadSerializer(CustomFieldsSerializerMixin, BaseModelSeri
                 + len(obj.applied_controls.all())
                 + len(obj.vulnerabilities.all())
                 + len(obj.risk_scenarios.all())
-                + len(obj.requirement_assessments.all())
+                + projected_ra_count
                 + len(obj.evidences.all())
             )
         except Exception:
@@ -5443,13 +7457,16 @@ class SecurityExceptionReadSerializer(CustomFieldsSerializerMixin, BaseModelSeri
                 + obj.applied_controls.count()
                 + obj.vulnerabilities.count()
                 + obj.risk_scenarios.count()
-                + obj.requirement_assessments.count()
+                + projected_ra_count
                 + obj.evidences.count()
             )
 
     class Meta:
         model = SecurityException
         fields = "__all__"
+        list_serializer_class = (
+            RequirementAssessmentRelationshipProjectionListSerializer
+        )
 
 
 class FindingsAssessmentWriteSerializer(BaseModelSerializer):

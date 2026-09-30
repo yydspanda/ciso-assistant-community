@@ -9050,7 +9050,12 @@ class RequirementAssessment(AbstractBaseModel, FolderMixin, ETADueDateMixin):
             self.requirement
         ):
             return results
-        reference_controls = self.requirement.reference_controls.all()
+        # Policy rows are governed through the Policy proxy and its distinct
+        # content-type permissions. Generic control suggestions must never
+        # propose or create one using only add_appliedcontrol authority.
+        reference_controls = self.requirement.reference_controls.exclude(
+            category="policy"
+        )
         if allowed_reference_control_ids is not None:
             reference_controls = reference_controls.filter(
                 id__in=allowed_reference_control_ids
@@ -9119,7 +9124,9 @@ class RequirementAssessment(AbstractBaseModel, FolderMixin, ETADueDateMixin):
             self.requirement
         ):
             return applied_controls
-        reference_controls = self.requirement.reference_controls.all()
+        reference_controls = self.requirement.reference_controls.exclude(
+            category="policy"
+        )
         if allowed_reference_control_ids is not None:
             reference_controls = reference_controls.filter(
                 id__in=allowed_reference_control_ids
