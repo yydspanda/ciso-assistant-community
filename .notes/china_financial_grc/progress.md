@@ -27,7 +27,7 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
 | Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
 | Production acceptance | Legal, privacy, security, records, audit, operations, and production acceptance have not been performed. |
-| Hosted project governance | PR #4 remains open on remote head `122e5d696`; its 174 checks recorded 165 successes and nine failures. Local hosted-test remediation and backend security corrections are committed separately; frontend nested-create remediation is still being verified. Fresh canonical upstream is `e6ba85f8`; the local pre-merge branch is still 153 commits behind. Required governance passes on the old remote head, but neither that result nor local tests proves the new candidate ready to merge. The no-bypass ruleset and weekly read-only upstream monitor remain active. |
+| Hosted project governance | PR #4 remains open on remote head `122e5d696`; its 174 checks recorded 165 successes and nine failures. Local hosted-test remediation, backend security corrections, and frontend nested-create fixes are committed separately. The pre-merge frontend suite passed 370 tests. Fresh canonical upstream is `e6ba85f8`; the local pre-merge branch is still 153 commits behind. Required governance passes on the old remote head, but neither that result nor local tests proves the new candidate ready to merge. The no-bypass ruleset and weekly read-only upstream monitor remain active. |
 
 ## Current verification summary
 
@@ -35,7 +35,9 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   [CFGRC-REC-20260930-01](progress-archive/2026-09.md#cfgrc-rec-20260930-01):
   531 passed / four PostgreSQL-gated skips in the combined regression, 24 focused
   EBIOS tests, 20 focused integration tests, and all 992 backend files formatted
-  under hosted Ruff 0.15.17. Frontend and post-merge verification remain open.
+  under hosted Ruff 0.15.17. The separate frontend checkpoint
+  [CFGRC-REC-20260930-02](progress-archive/2026-09.md#cfgrc-rec-20260930-02)
+  passed all 370 tests; full type, browser, and post-merge gates remain open.
 - The historical evidence below applies to its named August trees. A fresh
   canonical fetch on 2026-09-30 resolved upstream to
   `e6ba85f8085fcdc37702e304dfabd138e74ff3be`; the current branch has not merged
@@ -216,8 +218,7 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 
 ## Current next action
 
-Finish the table-mode nested-create regression and freeze the frontend fixes.
-Then reconcile freshly fetched canonical upstream in a separate two-parent
+Reconcile freshly fetched canonical upstream in a separate two-parent
 merge, preserving upstream interfaces and the existing authority protections.
 Verify the fresh and fork-upgrade migration paths on disposable PostgreSQL,
 run the proportional merged-tree backend/frontend/browser matrix, and monitor
@@ -246,6 +247,7 @@ the ten most recent records and does not duplicate their evidence.
 
 | Completed | Record | Task IDs | Result |
 | --- | --- | --- | --- |
+| 2026-09-30 | [CFGRC-REC-20260930-02](progress-archive/2026-09.md#cfgrc-rec-20260930-02) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Nested creation bound to route-owned assessment authority; all 370 frontend tests passed before the next upstream merge. |
 | 2026-09-30 | [CFGRC-REC-20260930-01](progress-archive/2026-09.md#cfgrc-rec-20260930-01) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Pre-merge backend security checkpoint committed with local regression evidence; reconciliation remains active. |
 | 2026-08-27 | [CFGRC-REC-20260827-01](progress-archive/2026-08.md#cfgrc-rec-20260827-01) | `CFGRC-P1-READ-REVIEW` | Regulatory audit events isolated from generic workflows without weakening auditlog. |
 | 2026-08-26 | [CFGRC-REC-20260826-04](progress-archive/2026-08.md#cfgrc-rec-20260826-04) | `CFGRC-GOV-LEDGER`, `CFGRC-GOV-UPSTREAM` | Protected-main ruleset and hosted governance/upstream checks activated with retained run evidence. |
@@ -255,7 +257,6 @@ the ten most recent records and does not duplicate their evidence.
 | 2026-08-25 | [CFGRC-REC-20260825-01](progress-archive/2026-08.md#cfgrc-rec-20260825-01) | `CFGRC-P1-REVIEW-DISPOSITION` | ADR 0004 implementation pushed and handed off. |
 | 2026-08-24 | [CFGRC-REC-20260824-04](progress-archive/2026-08.md#cfgrc-rec-20260824-04) | `CFGRC-P1-REVIEW-DISPOSITION` | Bounded applicability review disposition implemented. |
 | 2026-08-24 | [CFGRC-REC-20260824-03](progress-archive/2026-08.md#cfgrc-rec-20260824-03) | `CFGRC-P1-REVIEW-DISPOSITION-DESIGN` | Review-disposition architecture accepted. |
-| 2026-08-24 | [CFGRC-REC-20260824-02](progress-archive/2026-08.md#cfgrc-rec-20260824-02) | `CFGRC-P1-APPLICABILITY` | Bounded synthetic applicability persistence verified. |
 
 ## Ledger update rules
 
