@@ -68,6 +68,8 @@
 	const study = reportData.study;
 	const useBubbles = data.useBubbles;
 	const inherentRiskEnabled = data.inherentRiskEnabled;
+	const controlHref = (control: { id: string; category?: string | null }) =>
+		control.category === 'policy' ? `/policies/${control.id}` : `/applied-controls/${control.id}`;
 
 	const pertinenceColor: Record<string, string> = {
 		undefined: 'bg-surface-200-800 text-surface-700-300',
@@ -1173,7 +1175,7 @@
 												<tr class="hover:bg-surface-50-950">
 													<td class="px-3 py-2 text-sm text-surface-950-50">
 														<Anchor
-															href="/applied-controls/{control.id}"
+															href={controlHref(control)}
 															class="text-primary-600 hover:text-primary-800-200 hover:underline"
 														>
 															{control.name}
@@ -1265,7 +1267,7 @@
 											<tr class="hover:bg-surface-50-950">
 												<td class="px-3 py-2 text-sm text-surface-950-50">
 													<Anchor
-														href="/applied-controls/{control.id}"
+														href={controlHref(control)}
 														class="text-primary-600 hover:text-primary-800-200 hover:underline"
 													>
 														{control.str}
@@ -1345,7 +1347,7 @@
 									<tr class="hover:bg-surface-50-950">
 										<td class="px-3 py-2 text-sm text-surface-950-50">
 											<Anchor
-												href="/applied-controls/{control.id}"
+												href={controlHref(control)}
 												class="text-primary-600 hover:text-primary-800-200 hover:underline"
 											>
 												{control.name}

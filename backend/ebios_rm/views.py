@@ -3,8 +3,9 @@ import uuid
 
 import django_filters as df
 import pandas as pd
+from django.db import transaction
 from django.db.models import Case, F, FloatField, ProtectedError, Value, When
-from django.http import HttpResponse
+from django.http import Http404, HttpResponse
 from core.serializers import RiskMatrixReadSerializer
 from core.views import (
     BaseModelViewSet as AbstractBaseModelViewSet,
@@ -141,84 +142,209 @@ class EbiosRMStudyViewSet(BaseModelViewSet):
 
     @action(detail=True, name="Get EBIOS RM study report data", url_path="report-data")
     def report_data(self, request, pk):
+        from .report_projection import canonical_report_digest
+
+        try:
+            report_data = self._build_report_data_snapshot(request, pk)
+            expected_digest = canonical_report_digest(report_data)
+
+            # Build the exact narrow payload again in a fresh transaction.
+            # This re-runs IAM, integrity checks, computed aggregates, and the
+            # GlobalSettings-dependent radar projection.  A durable mutation
+            # or permission revocation between materialization and release is
+            # therefore fail-closed without maintaining a second, broader
+            # hand-written dependency signature.
+            current_report_data = self._build_report_data_snapshot(request, pk)
+        except Http404 as exc:
+            raise PermissionDenied(
+                "Complete EBIOS RM report data is unavailable for this caller."
+            ) from exc
+
+        if canonical_report_digest(current_report_data) != expected_digest:
+            raise PermissionDenied(
+                "Complete EBIOS RM report data changed during rendering."
+            )
+        return Response(report_data)
+
+    @transaction.atomic
+    def _build_report_data_snapshot(self, request, pk):
         """
-        Endpoint to prepare comprehensive report data for an EBIOS RM study.
-        Returns all study attributes and associated objects in a structured format.
+        Build and fully materialize one narrow, authorized report projection.
         """
         study = self.get_object()
 
-        from .serializers import (
-            EbiosRMStudyReadSerializer,
-            FearedEventReadSerializer,
-            RoToReadSerializer,
-            StakeholderReadSerializer,
-            StrategicScenarioReadSerializer,
-            AttackPathReadSerializer,
-            OperationalScenarioReadSerializer,
-            OperatingModeReadSerializer,
+        from core.models import (
+            AppliedControl,
+            Asset,
+            ComplianceAssessment,
+            Framework,
+            RequirementAssessment,
+            RequirementNode,
+            RiskAssessment,
+            RiskMatrix,
+            RiskScenario,
+            Terminology,
         )
-        from .models import OperatingMode
-        from core.models import RequirementAssessment
+        from core.utils import has_full_view_compliance_assessment
+        from core.views import (
+            ComplianceAssessmentViewSet,
+            filter_caller_visible_applied_controls,
+        )
+        from iam.models import Folder, RoleAssignment
+
+        from . import report_projection
         from .helpers import ecosystem_circular_chart_data
+        from .models import OperatingMode
+        from .report_authority import authorize_ebios_report_graph
 
-        # Get all related data, sorted per issue #3715
-        feared_events = FearedEvent.objects.filter(
-            ebios_rm_study=study, is_selected=True
-        ).order_by("-gravity", "name")
-        ro_to_couples = (
-            RoTo.objects.filter(ebios_rm_study=study, is_selected=True)
-            .with_pertinence()
-            .order_by("-pertinence", "risk_origin__name", "target_objective")
+        authorized_graph = authorize_ebios_report_graph(
+            user=request.user,
+            study=study,
         )
-        stakeholders = Stakeholder.objects.filter(
-            ebios_rm_study=study, is_selected=True
-        ).order_by("entity__name")
-        strategic_scenarios = StrategicScenario.objects.filter(ebios_rm_study=study)
-        attack_paths = AttackPath.objects.filter(ebios_rm_study=study, is_selected=True)
-        operational_scenarios = OperationalScenario.objects.filter(ebios_rm_study=study)
+        study = authorized_graph.study
 
+        def require_complete_visibility(queryset, model=None):
+            """Reject a comprehensive report if any payload row is hidden."""
+
+            authority_model = model or queryset.model
+            visible_ids = RoleAssignment.get_viewable_object_ids(
+                request.user, authority_model
+            )
+            if queryset.exclude(id__in=visible_ids).exists():
+                raise PermissionDenied(
+                    "Complete EBIOS RM report data is unavailable for this caller."
+                )
+            return queryset
+
+        # Prove only dependencies present in the report-only DTO.
+        require_complete_visibility(
+            RiskMatrix.objects.filter(id=study.risk_matrix_id), RiskMatrix
+        )
+        require_complete_visibility(study.assets.all(), Asset)
+        require_complete_visibility(
+            Folder.objects.filter(id__in=study.assets.values("folder_id")),
+            Folder,
+        )
+
+        compliance_assessments = require_complete_visibility(
+            study.compliance_assessments.order_by("id"), ComplianceAssessment
+        )
+
+        compliance_action_plan_rows = {}
+        for assessment in compliance_assessments:
+            if not has_full_view_compliance_assessment(request.user, assessment):
+                raise PermissionDenied(
+                    "Complete EBIOS RM report data is unavailable for this caller."
+                )
+            ComplianceAssessmentViewSet._assert_auditor_fields_visible(
+                assessment,
+                "status",
+                "result",
+                "applied_controls",
+            )
+            requirement_scope = RequirementAssessment.objects.filter(
+                compliance_assessment=assessment
+            )
+            require_complete_visibility(requirement_scope, RequirementAssessment)
+            require_complete_visibility(
+                RequirementNode.objects.filter(
+                    id__in=requirement_scope.values("requirement_id")
+                ),
+                RequirementNode,
+            )
+            require_complete_visibility(
+                Framework.objects.filter(id=assessment.framework_id), Framework
+            )
+            action_requirements = (
+                ComplianceAssessmentViewSet._action_plan_requirement_queryset(
+                    request.user,
+                    assessment,
+                    include_non_assessable=False,
+                )
+            )
+            control_scope = AppliedControl.objects.filter(
+                requirement_assessments__in=action_requirements
+            ).distinct()
+            authorized_controls = filter_caller_visible_applied_controls(
+                control_scope, request.user
+            )
+            if control_scope.exclude(id__in=authorized_controls.values("id")).exists():
+                raise PermissionDenied(
+                    "Complete EBIOS RM report data is unavailable for this caller."
+                )
+            compliance_action_plan_rows[assessment.id] = list(
+                authorized_controls.order_by("eta", "id")
+            )
+
+        # Get only rows rendered by the report.  Cross-study and relation
+        # integrity is proved by ``authorize_ebios_report_graph``.
+        feared_events = require_complete_visibility(
+            FearedEvent.objects.filter(ebios_rm_study=study, is_selected=True),
+            FearedEvent,
+        ).order_by("-gravity", "name", "id")
+        ro_to_scope = RoTo.objects.filter(ebios_rm_study=study, is_selected=True)
+        require_complete_visibility(
+            Terminology.objects.filter(id__in=ro_to_scope.values("risk_origin_id")),
+            Terminology,
+        )
+        ro_to_couples = require_complete_visibility(ro_to_scope, RoTo)
+        ro_to_couples = ro_to_couples.with_pertinence().order_by(
+            "-pertinence", "risk_origin__name", "target_objective", "id"
+        )
+        stakeholders = require_complete_visibility(
+            Stakeholder.objects.filter(ebios_rm_study=study, is_selected=True),
+            Stakeholder,
+        ).order_by("entity__name", "id")
+        strategic_scenarios = require_complete_visibility(
+            StrategicScenario.objects.filter(ebios_rm_study=study),
+            StrategicScenario,
+        ).order_by("id")
+        attack_paths = require_complete_visibility(
+            AttackPath.objects.filter(ebios_rm_study=study, is_selected=True),
+            AttackPath,
+        ).order_by("id")
+        operational_scenarios = require_complete_visibility(
+            OperationalScenario.objects.filter(ebios_rm_study=study),
+            OperationalScenario,
+        ).order_by("id")
+
+        stakeholder_control_scope = AppliedControl.objects.filter(
+            stakeholders__in=stakeholders
+        ).distinct()
+        if stakeholder_control_scope.exclude(
+            id__in=filter_caller_visible_applied_controls(
+                stakeholder_control_scope, request.user
+            ).values("id")
+        ).exists():
+            raise PermissionDenied(
+                "Complete EBIOS RM report data is unavailable for this caller."
+            )
         # Get operating modes for all operational scenarios
-        operating_modes = OperatingMode.objects.filter(
-            operational_scenario__in=operational_scenarios
+        operating_modes = require_complete_visibility(
+            OperatingMode.objects.filter(
+                operational_scenario__in=operational_scenarios
+            ),
+            OperatingMode,
+        ).order_by("id")
+        kill_chains = require_complete_visibility(
+            KillChain.objects.filter(operating_mode__in=operating_modes),
+            KillChain,
         )
-
-        # Build graph data for each operating mode
-        def build_mode_graph(mo):
-            """Build kill chain steps and elementary actions"""
-            from .serializers import KillChainReadSerializer
-
-            steps = mo.kill_chain_steps.all()
-            if not steps.exists():
-                return None
-
-            kill_chain_steps = KillChainReadSerializer(steps, many=True).data
-
-            # Collect all EAs referenced in kill chain steps
-            ea_ids = set()
-            for step in steps:
-                ea_ids.add(step.elementary_action_id)
-                for ant in step.antecedents.all():
-                    ea_ids.add(ant.id)
-
-            eas = ElementaryAction.objects.filter(id__in=ea_ids)
-            elementary_actions = [
-                {
-                    "id": str(ea.id),
-                    "name": ea.name,
-                    "attack_stage": ea.attack_stage,
-                    "icon_fa_class": ea.icon_fa_class,
-                }
-                for ea in eas
-            ]
-
-            return {
-                "kill_chain_steps": kill_chain_steps,
-                "elementary_actions": elementary_actions,
-            }
+        elementary_action_ids = set(
+            kill_chains.values_list("elementary_action_id", flat=True)
+        ) | set(
+            KillChain.antecedents.through.objects.filter(
+                killchain_id__in=kill_chains.values("id")
+            ).values_list("elementaryaction_id", flat=True)
+        )
+        require_complete_visibility(
+            ElementaryAction.objects.filter(id__in=elementary_action_ids),
+            ElementaryAction,
+        )
 
         # Get compliance assessments with their result counts
         compliance_assessments_data = []
-        for assessment in study.compliance_assessments.all():
+        for assessment in compliance_assessments:
             result_counts = {}
             for count, result in assessment.get_requirements_result_count():
                 result_counts[result] = count
@@ -234,54 +360,75 @@ class EbiosRMStudyViewSet(BaseModelViewSet):
                     "eta": assessment.eta,
                     "due_date": assessment.due_date,
                     "status": assessment.status,
+                    # The auditor-field gate above requires status visibility,
+                    # so this is the status-driven progress path and does not
+                    # read questionnaire answers or choices.
                     "progress": assessment.progress,
                     "result_counts": result_counts,
                 }
             )
 
         # Get risk matrix data from last risk assessment
+        last_risk_assessment = study.risk_assessments.order_by(
+            "-created_at", "-id"
+        ).first()
         risk_matrix_data = None
-        if study.last_risk_assessment:
-            from core.serializers import (
-                RiskScenarioReadSerializer,
-                RiskMatrixReadSerializer,
+        risk_scenarios = RiskScenario.objects.none()
+        risk_applied_controls = []
+        if last_risk_assessment:
+            require_complete_visibility(
+                RiskAssessment.objects.filter(id=last_risk_assessment.id),
+                RiskAssessment,
             )
-
-            risk_scenarios = study.last_risk_assessment.risk_scenarios.all().order_by(
-                "ref_id"
+            require_complete_visibility(
+                RiskMatrix.objects.filter(id=last_risk_assessment.risk_matrix_id),
+                RiskMatrix,
             )
+            risk_scenarios = require_complete_visibility(
+                last_risk_assessment.risk_scenarios.all(), RiskScenario
+            ).order_by("ref_id", "id")
+            risk_control_scope = AppliedControl.objects.filter(
+                risk_scenarios__in=risk_scenarios
+            ).distinct()
+            authorized_risk_controls = filter_caller_visible_applied_controls(
+                risk_control_scope, request.user
+            )
+            if risk_control_scope.exclude(
+                id__in=authorized_risk_controls.values("id")
+            ).exists():
+                raise PermissionDenied(
+                    "Complete EBIOS RM report data is unavailable for this caller."
+                )
+            risk_applied_controls = list(authorized_risk_controls.order_by("eta", "id"))
             risk_matrix_data = {
                 "risk_assessment": {
-                    "id": str(study.last_risk_assessment.id),
-                    "name": study.last_risk_assessment.name,
-                    "version": study.last_risk_assessment.version,
+                    "id": str(last_risk_assessment.id),
+                    "name": last_risk_assessment.name,
+                    "version": last_risk_assessment.version,
                 },
-                "risk_matrix": RiskMatrixReadSerializer(study.risk_matrix).data,
-                "risk_scenarios": RiskScenarioReadSerializer(
-                    risk_scenarios, many=True
-                ).data,
+                # RiskScenario display methods use the assessment matrix.  Use
+                # that same matrix for the rendered grid even if the study's
+                # reference matrix has since changed.
+                "risk_matrix": report_projection.risk_matrix(
+                    last_risk_assessment.risk_matrix
+                ),
+                "risk_scenarios": report_projection.risk_scenarios(risk_scenarios),
             }
 
         # Get ecosystem radar data
-        radar_data = ecosystem_circular_chart_data(stakeholders)
+        radar_data = ecosystem_circular_chart_data(
+            stakeholders,
+            jitter_seed=str(study.id),
+            max_value=authorized_graph.radar_max,
+        )
 
-        # Get action plans from compliance assessments
-        from core.serializers import AppliedControlReadSerializer
-        from core.models import AppliedControl
-
+        # Get action plans from compliance assessments.  The generic control
+        # serializer includes unrelated integration state and many relations;
+        # this report has a deliberately smaller public contract.
         compliance_action_plans = []
-        for assessment in study.compliance_assessments.all():
-            requirement_assessments = assessment.get_requirement_assessments(
-                include_non_assessable=False
-            )
-            applied_controls = (
-                AppliedControl.objects.filter(
-                    requirement_assessments__in=requirement_assessments
-                )
-                .distinct()
-                .order_by("eta")
-            )
-            if applied_controls.exists():
+        for assessment in compliance_assessments:
+            applied_controls = compliance_action_plan_rows[assessment.id]
+            if applied_controls:
                 compliance_action_plans.append(
                     {
                         "assessment_id": str(assessment.id),
@@ -289,71 +436,58 @@ class EbiosRMStudyViewSet(BaseModelViewSet):
                         "framework": (
                             assessment.framework.name if assessment.framework else None
                         ),
-                        "applied_controls": AppliedControlReadSerializer(
-                            applied_controls, many=True
-                        ).data,
+                        "applied_controls": report_projection.action_controls(
+                            applied_controls
+                        ),
                     }
                 )
 
         # Get action plan from risk assessment
         risk_action_plan = None
-        if study.last_risk_assessment:
-            risk_scenarios = study.last_risk_assessment.risk_scenarios.all()
-            risk_applied_controls = (
-                AppliedControl.objects.filter(risk_scenarios__in=risk_scenarios)
-                .distinct()
-                .order_by("eta")
-            )
-            if risk_applied_controls.exists():
-                risk_action_plan = {
-                    "risk_assessment_id": str(study.last_risk_assessment.id),
-                    "risk_assessment_name": study.last_risk_assessment.name,
-                    "applied_controls": AppliedControlReadSerializer(
-                        risk_applied_controls, many=True
-                    ).data,
-                }
+        if last_risk_assessment and risk_applied_controls:
+            risk_action_plan = {
+                "risk_assessment_id": str(last_risk_assessment.id),
+                "risk_assessment_name": last_risk_assessment.name,
+                "applied_controls": report_projection.action_controls(
+                    risk_applied_controls
+                ),
+            }
 
-        # Serialize operating modes with graph data
-        operating_modes_data = []
-        for mode in operating_modes:
-            mode_data = OperatingModeReadSerializer(mode).data
-            graph_data = build_mode_graph(mode)
-            if graph_data:
-                mode_data["graph"] = graph_data
-            operating_modes_data.append(mode_data)
+        controls_by_stakeholder = {
+            stakeholder.id: list(stakeholder.applied_controls.order_by("eta", "id"))
+            for stakeholder in stakeholders
+        }
 
-        # Sort strategic scenarios by gravity desc, then name asc
+        operating_modes_data = report_projection.operating_modes(operating_modes)
         strategic_scenarios_data = sorted(
-            StrategicScenarioReadSerializer(strategic_scenarios, many=True).data,
-            key=lambda s: (-s.get("gravity", {}).get("value", -1), s.get("name", "")),
-        )
-
-        # Sort operational scenarios by gravity desc, likelihood desc, then name asc
-        operational_scenarios_data = sorted(
-            OperationalScenarioReadSerializer(operational_scenarios, many=True).data,
-            key=lambda s: (
-                -s.get("gravity", {}).get("value", -1),
-                -s.get("likelihood", {}).get("value", -1),
-                s.get("str", ""),
+            report_projection.strategic_scenarios(strategic_scenarios),
+            key=lambda row: (
+                -row.get("gravity", {}).get("value", -1),
+                row.get("name", ""),
+                row["id"],
             ),
         )
+        operational_scenarios_data = sorted(
+            report_projection.operational_scenarios(operational_scenarios),
+            key=lambda row: (
+                -row.get("gravity", {}).get("value", -1),
+                -row.get("likelihood", {}).get("value", -1),
+                row.get("ref_id", ""),
+                row["id"],
+            ),
+        )
+        stakeholder_data = report_projection.stakeholders(
+            stakeholders,
+            controls_by_stakeholder=controls_by_stakeholder,
+        )
 
-        # Sort study assets: primary before support, then alphabetical
-        study_data = EbiosRMStudyReadSerializer(study).data
-        if study_data.get("assets"):
-            study_data["assets"] = sorted(
-                study_data["assets"],
-                key=lambda a: (0 if a.get("type") == "PR" else 1, a.get("str", "")),
-            )
-
-        # Build comprehensive report data
         report_data = {
-            "study": study_data,
-            "feared_events": FearedEventReadSerializer(feared_events, many=True).data,
-            "ro_to_couples": RoToReadSerializer(ro_to_couples, many=True).data,
-            "stakeholders": StakeholderReadSerializer(stakeholders, many=True).data,
+            "study": report_projection.study(study),
+            "feared_events": report_projection.feared_events(feared_events),
+            "ro_to_couples": report_projection.ro_to_couples(ro_to_couples),
+            "stakeholders": stakeholder_data,
             "strategic_scenarios": strategic_scenarios_data,
-            "attack_paths": AttackPathReadSerializer(attack_paths, many=True).data,
+            "attack_paths": report_projection.attack_paths(attack_paths),
             "operational_scenarios": operational_scenarios_data,
             "operating_modes": operating_modes_data,
             "compliance_assessments": compliance_assessments_data,
@@ -363,7 +497,7 @@ class EbiosRMStudyViewSet(BaseModelViewSet):
             "risk_action_plan": risk_action_plan,
         }
 
-        return Response(report_data)
+        return report_data
 
     @action(detail=True, name="Export EBIOS RM study as XLSX", url_path="export-xlsx")
     def export_xlsx(self, request, pk):
