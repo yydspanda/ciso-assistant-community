@@ -1,7 +1,7 @@
 # China Financial GRC Progress Ledger / 中国金融 GRC 进度台账
 
 > Status: **Authoritative current execution record / 权威当前执行记录**
-> Updated: **2026-08-28**
+> Updated: **2026-09-30**
 > Branch: `agent/cfgrc-upstream-reconciliation-20260827`
 
 This file is the bounded current dashboard: one stage pointer, one active task,
@@ -27,10 +27,19 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
 | Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
 | Production acceptance | Legal, privacy, security, records, audit, operations, and production acceptance have not been performed. |
-| Hosted project governance | PRs #1-#3 landed through protected `main`; PR #4 is the active upstream-reconciliation candidate. Its first complete updated-head matrix exposed bounded API-contract and frontend-locator defects; the local remediation is committed and awaiting an exact-head rerun. The active no-bypass ruleset has no bypass actors, requires the GitHub-Actions-sourced `validate-project-governance` check, and keeps the weekly read-only upstream monitor explicitly enabled. |
+| Hosted project governance | PR #4 remains open on remote head `122e5d696`; its 174 checks recorded 165 successes and nine failures. Local hosted-test remediation and backend security corrections are committed separately; frontend nested-create remediation is still being verified. Fresh canonical upstream is `e6ba85f8`; the local pre-merge branch is still 153 commits behind. Required governance passes on the old remote head, but neither that result nor local tests proves the new candidate ready to merge. The no-bypass ruleset and weekly read-only upstream monitor remain active. |
 
 ## Current verification summary
 
+- The latest verified backend checkpoint is recorded in
+  [CFGRC-REC-20260930-01](progress-archive/2026-09.md#cfgrc-rec-20260930-01):
+  531 passed / four PostgreSQL-gated skips in the combined regression, 24 focused
+  EBIOS tests, 20 focused integration tests, and all 992 backend files formatted
+  under hosted Ruff 0.15.17. Frontend and post-merge verification remain open.
+- The historical evidence below applies to its named August trees. A fresh
+  canonical fetch on 2026-09-30 resolved upstream to
+  `e6ba85f8085fcdc37702e304dfabd138e74ff3be`; the current branch has not merged
+  its 153 new commits. The September checkpoint does not complete reconciliation.
 - The canonical August evidence is preserved in
   [`progress-archive/2026-08.md`](progress-archive/2026-08.md), including exact
   commands, test counts, residual gates, PostgreSQL fingerprints, and evidence
@@ -162,13 +171,12 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 9. **Only local synthetic PostgreSQL evidence exists.** Representative plans,
    complete upstream-table privileges, production topology, monitoring,
    encryption/key custody, PITR/RPO/RTO, and operations approval remain open.
-10. **The local drift gate is restored; hosted merge authority remains.** The
-    mandatory pre-push fetch on 2026-08-28 resolved canonical upstream to
-    `b38b72d8f` and fork `main` to `d1ff1e461`. Pure merge `76f96a844` makes the
-    current code tree 27 ahead / 0 behind; this factual ledger commit makes the
-    updated PR candidate 28 ahead / 0 behind. The task remains active until that
-    exact branch passes the full protected-PR matrix and lands without bypass.
-    The weekly monitor must keep measuring a freshly fetched remote after merge.
+10. **The upstream gate remains open.** Freshly fetched upstream `e6ba85f8`
+    is 153 commits beyond the current branch's last upstream merge. The new
+    candidate needs reviewed conflict resolutions, a merged migration graph,
+    proportional PostgreSQL/backend/frontend/browser tests, and every hosted
+    check on its exact submitted head. The task remains active until that branch
+    lands through protected `main`; weekly fresh-fetch monitoring stays enabled.
 11. **Inherited workflow activation still needs an owner policy.** Opening PR #1
     registered inherited validation workflows as well as the three fork jobs.
     The write-scoped CLA and OIDC/security-events Plumber workflows were
@@ -187,30 +195,36 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
     but existing custom roles are not auto-expanded. An administrator must
     grant that extension-owned permission only where registered applicability
     access is intended; generic `tprm.view_entity` is not a substitute.
-14. **Live delivery gates remain for the new assignment-mail boundary.** Mocked
-    and injected concurrency tests passed, but real Huey workers, SMTP delivery,
-    and PostgreSQL outbox claim competition were not exercised locally. Those
-    integrations require environment-scoped credentials, monitoring, and named
-    operations/security acceptance; no local result is a production guarantee.
+14. **Live delivery and authority-concurrency gates remain open.** Mocked and
+    injected tests exercise the outbox, but the latest PostgreSQL claim
+    competition, live Huey/SMTP, and concurrent IAM-role revocation remain
+    unverified. SMTP holds database locks; permission rechecks do not provide a
+    shared IAM epoch. The local suite is not production delivery acceptance.
 15. **The inherited one-shot version checker is stale.** It checks removed path
     `ciso_assistant/VERSION` only when a PR is opened, so it failed on PR #4's
     opening head just as it did on earlier fork PR opening heads. It is not a
     required ruleset check and must not be made green by fabricating an upstream
     version file. A separate CI-owner change should retire or correctly scope it;
     the exact updated reconciliation head still requires every job it triggers.
+16. **Queued integration fingerprints have a bounded guarantee.** They reject
+    provider/configuration/credential/settings changes observed before task
+    execution. A configuration may still change after the comparison and before
+    the external push; no atomic database/external-system authority is claimed.
+17. **Frontend upload compensation is best effort.** A rejected upload is
+    surfaced as a form error, but a failed compensating DELETE may leave the
+    newly created metadata object. No cross-request rollback guarantee is claimed.
 
 ## Current next action
 
-Complete the upstream-reconciliation task without bypassing the protected-main
-gate: commit and push this factual validation update, then monitor every job
-triggered for the exact updated PR #4 head. Investigate and remediate any
-candidate failure; merge only when the required governance check and the
-complete current-head matrix pass under the no-bypass ruleset. Re-fetch and
-remeasure canonical upstream before merge if it advances. Do not mix target-
-environment work or new product features into this reconciliation. After
-protected merge, add the canonical completed record and return the product
-pointer to `CFGRC-P1-TARGET-ACCEPTANCE`; that charter remains blocked on named
-operations, security, privacy, records, legal, and audit owners.
+Finish the table-mode nested-create regression and freeze the frontend fixes.
+Then reconcile freshly fetched canonical upstream in a separate two-parent
+merge, preserving upstream interfaces and the existing authority protections.
+Verify the fresh and fork-upgrade migration paths on disposable PostgreSQL,
+run the proportional merged-tree backend/frontend/browser matrix, and monitor
+every hosted check triggered for the submitted PR #4 head. Merge through the
+no-bypass protected-main path only after those checks pass. Keep the current
+stage/task pointers until reconciliation completes; target-environment and
+named-owner acceptance remain subsequent work.
 
 ## Active task board
 
@@ -232,6 +246,7 @@ the ten most recent records and does not duplicate their evidence.
 
 | Completed | Record | Task IDs | Result |
 | --- | --- | --- | --- |
+| 2026-09-30 | [CFGRC-REC-20260930-01](progress-archive/2026-09.md#cfgrc-rec-20260930-01) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Pre-merge backend security checkpoint committed with local regression evidence; reconciliation remains active. |
 | 2026-08-27 | [CFGRC-REC-20260827-01](progress-archive/2026-08.md#cfgrc-rec-20260827-01) | `CFGRC-P1-READ-REVIEW` | Regulatory audit events isolated from generic workflows without weakening auditlog. |
 | 2026-08-26 | [CFGRC-REC-20260826-04](progress-archive/2026-08.md#cfgrc-rec-20260826-04) | `CFGRC-GOV-LEDGER`, `CFGRC-GOV-UPSTREAM` | Protected-main ruleset and hosted governance/upstream checks activated with retained run evidence. |
 | 2026-08-26 | [CFGRC-REC-20260826-03](progress-archive/2026-08.md#cfgrc-rec-20260826-03) | `CFGRC-P1-READ-REVIEW` | Read-only regulatory register/viewer implemented with fail-closed temporal, metadata, IAM, and non-binding presentation contracts. |
@@ -241,7 +256,6 @@ the ten most recent records and does not duplicate their evidence.
 | 2026-08-24 | [CFGRC-REC-20260824-04](progress-archive/2026-08.md#cfgrc-rec-20260824-04) | `CFGRC-P1-REVIEW-DISPOSITION` | Bounded applicability review disposition implemented. |
 | 2026-08-24 | [CFGRC-REC-20260824-03](progress-archive/2026-08.md#cfgrc-rec-20260824-03) | `CFGRC-P1-REVIEW-DISPOSITION-DESIGN` | Review-disposition architecture accepted. |
 | 2026-08-24 | [CFGRC-REC-20260824-02](progress-archive/2026-08.md#cfgrc-rec-20260824-02) | `CFGRC-P1-APPLICABILITY` | Bounded synthetic applicability persistence verified. |
-| 2026-08-24 | [CFGRC-REC-20260824-01](progress-archive/2026-08.md#cfgrc-rec-20260824-01) | `CFGRC-P1-TEMPORAL-CORRECTION` | Controlled recorded-time correction and historical reads verified. |
 
 ## Ledger update rules
 
