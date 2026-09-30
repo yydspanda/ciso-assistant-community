@@ -27,7 +27,7 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
 | Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
 | Production acceptance | Legal, privacy, security, records, audit, operations, and production acceptance have not been performed. |
-| Hosted project governance | PR #4 remains open on old remote head `122e5d696` (165 successes / nine failures). Local commits `78e546e5b` and `835a8c772` join canonical upstream through `555225678`; `df7738176` adds attribution-only metadata. After explicit fresh fetch, that code head measured 40 ahead / zero behind. Full backend, browser, loader, and exact-head hosted gates remain open. The old remote governance pass does not approve the new candidate. The no-bypass ruleset and weekly read-only upstream monitor remain active. |
+| Hosted project governance | PR #4 is open on submitted head `0c4c66820`; governance passed, functional failures require correction, and other triggered checks are running. Local two-parent commits join upstream through `555225678`; attribution-only `df7738176` measured 40 ahead / zero behind after explicit fetch. The local artifact loader/update gate passed; full backend, browser, and complete exact-head hosted gates remain open. The no-bypass ruleset and weekly read-only upstream monitor remain active. |
 
 ## Current verification summary
 
@@ -35,12 +35,13 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   `e6ba85f8`. The separate artifact-only merge `835a8c772` joins its successor
   `555225678` with a tree identical to Git's pure merge result. Attribution-only
   correction `df7738176` leaves all object/content identities unchanged.
-  The loader gate remains open. Bounded verified
+  The local loader/update gate passed three PostgreSQL-backed tests. Bounded verified
   evidence is recorded in
   [CFGRC-REC-20260930-03](progress-archive/2026-09.md#cfgrc-rec-20260930-03)
   [CFGRC-REC-20260930-04](progress-archive/2026-09.md#cfgrc-rec-20260930-04),
   [CFGRC-REC-20260930-05](progress-archive/2026-09.md#cfgrc-rec-20260930-05),
-  and [CFGRC-REC-20260930-06](progress-archive/2026-09.md#cfgrc-rec-20260930-06).
+  [CFGRC-REC-20260930-06](progress-archive/2026-09.md#cfgrc-rec-20260930-06),
+  and [CFGRC-REC-20260930-07](progress-archive/2026-09.md#cfgrc-rec-20260930-07).
 - Fresh PostgreSQL technical acceptance passed **82 regulatory tests**, bounded
   role probes, migration/rollback checks, synthetic backup/restore fingerprint
   equality, and a restored successor write. The separate fork-upgrade path
@@ -54,7 +55,7 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   caller-scoped mutation-response expectations passed **106 AppliedControl API
   tests**; upstream/relation/Typst regressions passed **58 tests**, all on
   PostgreSQL. Full backend acceptance is **not yet passing**: earlier diagnostic
-  diagnostics and their failures are recorded in the archive. The latest stopped
+  runs and their failures are recorded in the archive. A prior run stopped
   at a stale hidden-owner aggregation expectation (378 passed / nine skipped /
   one failed); its test-only correction passed all 59 Commitment API tests.
   A forward-TaskTemplate batch projection fix passed 14 relation-authority
@@ -62,9 +63,16 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   Real synthetic API/Huey/loopback SMTP delivery and repeat-request deduplication
   passed. These bounded results do not constitute full or production acceptance.
   The full type gate also failed with **2065 errors / 857 warnings / 469 files**;
-  scoped changed loaders/helpers have no errors. The ongoing authenticated
-  browser matrix has exposed real edit-page loading and mapping-save failures;
-  diagnosis, complete browser results, and exact-head hosted acceptance remain open.
+  scoped changed loaders/helpers have no errors. The first authenticated
+  two-engine browser matrix finished with four passed / eight failed / six not
+  run; loading, save/history, stale-selector, and private-mail-fixture failures
+  remain under correction. A new local backend diagnostic was stopped deliberately
+  (exit 143, no JUnit or full pass) to unblock the loading fix; its two new CA
+  contract fixtures were corrected without relaxing authority; all 94 CA API
+  and immutable-parent tests passed. The mapping-catalog join and empty-mapping
+  short circuit passed all 15 mapping graph/catalog tests; live browser reruns
+  remain open. Complete backend/browser and
+  exact-head hosted acceptance remain open.
 - Pre-merge checkpoints remain in
   [CFGRC-REC-20260930-01](progress-archive/2026-09.md#cfgrc-rec-20260930-01)
   and [CFGRC-REC-20260930-02](progress-archive/2026-09.md#cfgrc-rec-20260930-02).
@@ -101,7 +109,7 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 10. **The upstream acceptance gate remains open.** Explicit fresh fetch of
     upstream `555225678` measured code head `df7738176` 40 ahead / zero behind.
     Its separate pure merge and source-attribution correction are committed;
-    the new artifact loader/update gate remains open. Migration paths and bounded regressions passed;
+    the local artifact loader/update gate passed. Migration paths and bounded regressions passed;
     full backend, browser, and every hosted check on the exact submitted head
     remain open. The task remains active until that branch
     lands through protected `main`; weekly fresh-fetch monitoring stays enabled.
@@ -174,6 +182,7 @@ the ten most recent records and does not duplicate their evidence.
 
 | Completed | Record | Task IDs | Result |
 | --- | --- | --- | --- |
+| 2026-09-30 | [CFGRC-REC-20260930-07](progress-archive/2026-09.md#cfgrc-rec-20260930-07) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Three artifact/loader/update tests and 94 CA API/immutable-parent tests passed; no complete acceptance claimed. |
 | 2026-09-30 | [CFGRC-REC-20260930-06](progress-archive/2026-09.md#cfgrc-rec-20260930-06) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Local two-parent merge checkpoints and attribution-only correction committed; freshly fetched upstream behind count is zero, not release approval. |
 | 2026-09-30 | [CFGRC-REC-20260930-05](progress-archive/2026-09.md#cfgrc-rec-20260930-05) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Forward TaskTemplate projection and Policy contract verified; synthetic real Huey/SMTP delivery passed; full and new-upstream gates remain open. |
 | 2026-09-30 | [CFGRC-REC-20260930-04](progress-archive/2026-09.md#cfgrc-rec-20260930-04) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Answer-parent validator and caller-scoped mutation-response compatibility verified on PostgreSQL; full acceptance remains open. |
@@ -183,7 +192,6 @@ the ten most recent records and does not duplicate their evidence.
 | 2026-08-28 | [CFGRC-REC-20260828-01](progress-archive/2026-08.md#cfgrc-rec-20260828-01) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Canonical historical PR #4 reconciliation/check evidence; old failing head is not release approval. |
 | 2026-08-27 | [CFGRC-REC-20260827-01](progress-archive/2026-08.md#cfgrc-rec-20260827-01) | `CFGRC-P1-READ-REVIEW` | Regulatory audit events isolated from generic workflows without weakening auditlog. |
 | 2026-08-26 | [CFGRC-REC-20260826-04](progress-archive/2026-08.md#cfgrc-rec-20260826-04) | `CFGRC-GOV-LEDGER`, `CFGRC-GOV-UPSTREAM` | Protected-main ruleset and hosted governance/upstream checks activated with retained run evidence. |
-| 2026-08-26 | [CFGRC-REC-20260826-03](progress-archive/2026-08.md#cfgrc-rec-20260826-03) | `CFGRC-P1-READ-REVIEW` | Read-only regulatory register/viewer implemented with fail-closed temporal, metadata, IAM, and non-binding presentation contracts. |
 
 ## Ledger update rules
 

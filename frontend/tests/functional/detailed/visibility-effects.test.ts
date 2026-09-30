@@ -177,7 +177,7 @@ test('field visibility effects: charts and relationship edit gates follow policy
 	await selectAppliedControlsButton.click();
 
 	await expect(updateModal.getByTestId('modal-title')).toBeVisible();
-	const appliedControlsField = updateModal.getByTestId('form-input-applied_controls');
+	const appliedControlsField = updateModal.getByTestId('form-input-applied-controls');
 	await appliedControlsField.click();
 	await appliedControlsField.getByRole('combobox').fill(vars.appliedControlName);
 	const appliedControlOption = appliedControlsField

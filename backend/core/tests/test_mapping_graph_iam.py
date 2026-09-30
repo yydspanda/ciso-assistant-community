@@ -162,6 +162,102 @@ def _results(response) -> list[dict]:
     return body.get("results", []) if isinstance(body, dict) else body
 
 
+@pytest.mark.parametrize("mapping_inference", [{}, [], "invalid"])
+def test_requirements_list_skips_mapping_authorization_for_empty_or_invalid_inference(
+    monkeypatch,
+    mapping_inference,
+):
+    Folder._init_root_folder()
+    folder = _domain("mapping-empty-provenance")
+    framework, (node,) = _framework("EMPTY-PROVENANCE", folder)
+    assessment = _assessment("EMPTY-PROVENANCE", framework, folder)
+    row = assessment.requirement_assessments.get(requirement=node)
+    RequirementAssessment.objects.filter(id=row.id).update(
+        mapping_inference=mapping_inference
+    )
+    user = User.objects.create_user("empty-provenance@mapping-iam.test")
+    _grant(user, "Empty provenance reader", [folder])
+
+    import core.utils as core_utils
+
+    def unexpected_authorization(*args, **kwargs):
+        raise AssertionError("empty provenance must not build mapping authorization")
+
+    monkeypatch.setattr(
+        core_utils,
+        "get_mapping_inference_visibility_context",
+        unexpected_authorization,
+    )
+
+    response = _client(user).get(
+        f"/api/compliance-assessments/{assessment.id}/requirements_list/",
+        {"assessable": "true"},
+    )
+
+    assert response.status_code == 200, response.content
+    payload = response.json()["requirement_assessments"]
+    assert len(payload) == 1
+    assert "mapping_inference" not in payload[0]
+
+
+def test_requirements_list_reuses_complete_authorization_for_nonempty_inference(
+    monkeypatch,
+):
+    Folder._init_root_folder()
+    folder = _domain("mapping-nonempty-provenance")
+    framework, (node,) = _framework("NONEMPTY-PROVENANCE", folder)
+    assessment = _assessment("NONEMPTY-PROVENANCE", framework, folder)
+    row = assessment.requirement_assessments.get(requirement=node)
+    mapping_inference = {"synthetic": "authority-bearing"}
+    RequirementAssessment.objects.filter(id=row.id).update(
+        mapping_inference=mapping_inference
+    )
+    user = User.objects.create_user("nonempty-provenance@mapping-iam.test")
+    _grant(user, "Nonempty provenance reader", [folder])
+
+    import core.utils as core_utils
+
+    expected_visibility_context = {"synthetic": "complete-authorization"}
+    authorization_calls = []
+
+    def build_authorization(caller, inferences):
+        authorization_calls.append((caller.id, inferences))
+        return expected_visibility_context
+
+    def sanitize(
+        inference,
+        compliance_assessment,
+        *,
+        viewer_role,
+        visibility_context,
+        target_result,
+    ):
+        assert inference == mapping_inference
+        assert compliance_assessment == assessment
+        assert viewer_role == "auditor"
+        assert visibility_context is expected_visibility_context
+        assert target_result == row.result
+        return {"synthetic": "authorized"}
+
+    monkeypatch.setattr(
+        core_utils,
+        "get_mapping_inference_visibility_context",
+        build_authorization,
+    )
+    monkeypatch.setattr(core_utils, "sanitize_mapping_inference_for_viewer", sanitize)
+
+    response = _client(user).get(
+        f"/api/compliance-assessments/{assessment.id}/requirements_list/",
+        {"assessable": "true"},
+    )
+
+    assert response.status_code == 200, response.content
+    payload = response.json()["requirement_assessments"]
+    assert len(payload) == 1
+    assert payload[0]["mapping_inference"] == {"synthetic": "authorized"}
+    assert authorization_calls == [(user.id, [mapping_inference])]
+
+
 def test_hidden_intermediate_framework_cannot_bridge_any_mapping_endpoint():
     Folder._init_root_folder()
     source_folder = _domain("mapping-source")

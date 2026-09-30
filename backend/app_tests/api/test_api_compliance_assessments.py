@@ -204,7 +204,9 @@ class TestComplianceAssessmentsAuthenticated:
                 "description": "new " + COMPLIANCE_ASSESSMENT_DESCRIPTION,
                 "version": COMPLIANCE_ASSESSMENT_VERSION + ".1",
                 "perimeter": str(perimeter2.id),
-                "framework": str(frameworks[1].id),
+                # The framework is the immutable assessment parent. Ordinary
+                # edits may reaffirm it, but must not rebind existing results.
+                "framework": str(frameworks[0].id),
             },
             {
                 "perimeter": {
@@ -225,8 +227,7 @@ class TestComplianceAssessmentsAuthenticated:
                         {"id": str(rc["id"]), "str": rc["str"], "urn": rc["urn"]}
                         for rc in frameworks[0].reference_controls
                     ],
-                    "min_score": frameworks[0].min_score,
-                    "max_score": frameworks[0].max_score,
+                    # Default-hidden scoring also masks the nested bounds.
                     "ref_id": str(frameworks[0].ref_id),
                     "has_update": False,
                 },

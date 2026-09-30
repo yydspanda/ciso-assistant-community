@@ -5076,15 +5076,21 @@ class RequirementAssessmentReadSerializer(BaseModelSerializer):
                 sanitize_mapping_inference_for_viewer,
             )
 
+            mapping_inference = instance.mapping_inference
             mapping_visibility = None
-            if request is not None and viewer_role == "auditor":
+            if (
+                request is not None
+                and viewer_role == "auditor"
+                and isinstance(mapping_inference, dict)
+                and mapping_inference
+            ):
                 mapping_visibility = self.context.get("_mapping_inference_visibility")
                 if mapping_visibility is None:
                     mapping_visibility = get_mapping_inference_visibility_context(
-                        request.user, [instance.mapping_inference]
+                        request.user, [mapping_inference]
                     )
             sanitized_mapping = sanitize_mapping_inference_for_viewer(
-                instance.mapping_inference,
+                mapping_inference,
                 ca,
                 viewer_role=viewer_role,
                 visibility_context=mapping_visibility,

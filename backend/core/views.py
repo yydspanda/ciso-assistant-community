@@ -21168,7 +21168,9 @@ class RequirementMappingSetViewSet(BaseModelViewSet):
         from core.mappings.engine import mapping_set_with_owner
 
         authorized_owner_ids = []
-        for stored_library in queryset.only("id", "urn", "content"):
+        # The base queryset joins folder; deferring that FK makes Django reject
+        # the projection before the exact mapping-owner proof can run.
+        for stored_library in queryset.only("id", "urn", "content", "folder"):
             if not isinstance(stored_library.content, dict):
                 continue
             mapping_sets = stored_library.content.get(
