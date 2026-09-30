@@ -3,15 +3,17 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
-
 from core.models import Asset
+from django.db import transaction
 from iam.models import Folder
+
 from integrations.itsm.servicenow.integration import ServiceNowOrchestrator
 from integrations.models import (
     IntegrationConfiguration,
     IntegrationProvider,
     SyncMapping,
 )
+from integrations.tasks import sync_object_to_integrations
 
 
 @pytest.fixture
@@ -52,6 +54,26 @@ def _mock_client():
     client.create_remote_object.return_value = "SYS-1"
     client.get_remote_object.return_value = {"key": "SYS-1", "fields": {}}
     return client
+
+
+def _capture_asset_sync_args(
+    *, root_folder, servicenow_provider, django_capture_on_commit_callbacks
+):
+    config = _config(
+        servicenow_provider,
+        {"asset": {"table_name": "cmdb_ci", "field_map": {"name": "u_name"}}},
+    )
+    with (
+        patch("integrations.tasks.sync_object_to_integrations") as mock_task,
+        django_capture_on_commit_callbacks(execute=True),
+    ):
+        asset = Asset.objects.create(
+            name="Queued server",
+            folder=root_folder,
+            type="PR",
+        )
+    mock_task.schedule.assert_called_once()
+    return config, asset, mock_task.schedule.call_args.kwargs["args"]
 
 
 def test_asset_save_accepts_skip_sync(root_folder):
@@ -130,10 +152,194 @@ def test_asset_creation_triggers_sync(
         servicenow_provider,
         {"asset": {"table_name": "cmdb_ci", "field_map": {"name": "u_name"}}},
     )
-    with patch("integrations.tasks.sync_object_to_integrations") as mock_task:
-        with django_capture_on_commit_callbacks(execute=True):
-            Asset.objects.create(name="New server", folder=root_folder, type="PR")
+    with (
+        patch("integrations.tasks.sync_object_to_integrations") as mock_task,
+        django_capture_on_commit_callbacks(execute=True),
+    ):
+        Asset.objects.create(name="New server", folder=root_folder, type="PR")
     mock_task.schedule.assert_called_once()
+
+
+def test_asset_creation_does_not_enqueue_for_inactive_provider(
+    root_folder,
+    servicenow_provider,
+    django_capture_on_commit_callbacks,
+):
+    _config(
+        servicenow_provider,
+        {"asset": {"table_name": "cmdb_ci", "field_map": {"name": "u_name"}}},
+    )
+    IntegrationProvider.objects.filter(id=servicenow_provider.id).update(
+        is_active=False
+    )
+
+    with (
+        patch("integrations.tasks.sync_object_to_integrations") as mock_task,
+        django_capture_on_commit_callbacks(execute=True),
+    ):
+        Asset.objects.create(name="No export", folder=root_folder, type="PR")
+
+    mock_task.schedule.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "boundary_change",
+    (
+        "provider_deactivated",
+        "provider_type_changed",
+        "configuration_deactivated",
+        "configuration_moved",
+        "configuration_repointed",
+        "outgoing_disabled",
+        "model_mapping_removed",
+    ),
+)
+def test_delayed_asset_sync_fails_closed_after_connector_boundary_change(
+    root_folder,
+    servicenow_provider,
+    django_capture_on_commit_callbacks,
+    boundary_change,
+):
+    config, _asset, scheduled_args = _capture_asset_sync_args(
+        root_folder=root_folder,
+        servicenow_provider=servicenow_provider,
+        django_capture_on_commit_callbacks=django_capture_on_commit_callbacks,
+    )
+
+    if boundary_change == "provider_deactivated":
+        IntegrationProvider.objects.filter(id=servicenow_provider.id).update(
+            is_active=False
+        )
+    elif boundary_change == "provider_type_changed":
+        IntegrationProvider.objects.filter(id=servicenow_provider.id).update(
+            provider_type="disabled"
+        )
+    elif boundary_change == "configuration_deactivated":
+        IntegrationConfiguration.objects.filter(id=config.id).update(is_active=False)
+    elif boundary_change == "configuration_moved":
+        other_folder = Folder.objects.create(
+            name="Other integration domain",
+            content_type=Folder.ContentType.DOMAIN,
+            parent_folder=root_folder,
+        )
+        IntegrationConfiguration.objects.filter(id=config.id).update(
+            folder=other_folder
+        )
+    elif boundary_change == "configuration_repointed":
+        IntegrationConfiguration.objects.filter(id=config.id).update(
+            credentials={
+                **config.credentials,
+                "instance_url": "https://other.service-now.com",
+            }
+        )
+    elif boundary_change == "outgoing_disabled":
+        IntegrationConfiguration.objects.filter(id=config.id).update(
+            settings={**config.settings, "enable_outgoing_sync": False}
+        )
+    else:
+        IntegrationConfiguration.objects.filter(id=config.id).update(
+            settings={
+                **config.settings,
+                "models": {
+                    "applied_control": {
+                        "table_name": "incident",
+                        "field_map": {"name": "short_description"},
+                    }
+                },
+            }
+        )
+
+    with (
+        patch(
+            "integrations.tasks.IntegrationRegistry.get_orchestrator"
+        ) as get_orchestrator,
+        patch("integrations.tasks.logger.error") as log_error,
+    ):
+        sync_object_to_integrations.call_local(*scheduled_args)
+
+    get_orchestrator.assert_not_called()
+    log_error.assert_not_called()
+
+
+def test_delayed_asset_sync_exports_when_connector_boundary_is_unchanged(
+    root_folder,
+    servicenow_provider,
+    django_capture_on_commit_callbacks,
+):
+    config, asset, scheduled_args = _capture_asset_sync_args(
+        root_folder=root_folder,
+        servicenow_provider=servicenow_provider,
+        django_capture_on_commit_callbacks=django_capture_on_commit_callbacks,
+    )
+    orchestrator = MagicMock()
+
+    with patch(
+        "integrations.tasks.IntegrationRegistry.get_orchestrator",
+        return_value=orchestrator,
+    ) as get_orchestrator:
+        sync_object_to_integrations.call_local(*scheduled_args)
+
+    get_orchestrator.assert_called_once()
+    assert get_orchestrator.call_args.args[0].id == config.id
+    pushed_object, changed_fields = orchestrator.push_changes.call_args.args
+    assert pushed_object.id == asset.id
+    assert changed_fields == []
+
+
+def test_legacy_unbound_asset_sync_job_is_deserializable_but_fails_closed(
+    root_folder,
+    servicenow_provider,
+    django_capture_on_commit_callbacks,
+):
+    _config, _asset, scheduled_args = _capture_asset_sync_args(
+        root_folder=root_folder,
+        servicenow_provider=servicenow_provider,
+        django_capture_on_commit_callbacks=django_capture_on_commit_callbacks,
+    )
+
+    with patch(
+        "integrations.tasks.IntegrationRegistry.get_orchestrator"
+    ) as get_orchestrator:
+        sync_object_to_integrations.call_local(*scheduled_args[:4])
+
+    get_orchestrator.assert_not_called()
+
+
+def test_failed_integration_callback_does_not_block_later_webhook_callback(
+    root_folder,
+    servicenow_provider,
+    django_capture_on_commit_callbacks,
+):
+    _config(
+        servicenow_provider,
+        {"asset": {"table_name": "cmdb_ci", "field_map": {"name": "u_name"}}},
+    )
+    callback_order = []
+
+    def failed_schedule(*_args, **_kwargs):
+        callback_order.append("integration")
+        raise RuntimeError("scheduler unavailable")
+
+    with (
+        patch(
+            "integrations.tasks.sync_object_to_integrations.schedule",
+            side_effect=failed_schedule,
+        ),
+        django_capture_on_commit_callbacks(execute=True),
+        transaction.atomic(),
+    ):
+        asset = Asset.objects.create(
+            name="Committed despite scheduler failure",
+            folder=root_folder,
+            type="PR",
+        )
+        transaction.on_commit(
+            lambda: callback_order.append("webhook"),
+            robust=True,
+        )
+
+    assert Asset.objects.filter(id=asset.id).exists()
+    assert callback_order == ["integration", "webhook"]
 
 
 def test_applied_control_push_not_gated_by_mapping_config(

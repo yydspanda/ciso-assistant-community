@@ -9,6 +9,11 @@ entry via a non-destructive shim.
 
 from __future__ import annotations
 
+import json
+
+from django.core.serializers.json import DjangoJSONEncoder
+from django.utils.crypto import salted_hmac
+
 # Top-level settings keys that, on legacy configs, constitute the implicit
 # "applied_control" mapping.
 _LEGACY_MODEL_KEYS = (
@@ -47,6 +52,45 @@ def is_model_configured(config_settings: dict | None, model_key: str) -> bool:
     """
     ms = get_model_settings(config_settings, model_key)
     return bool(ms.get("table_name") or ms.get("project_key"))
+
+
+def integration_sync_fingerprint(configuration, model_key: str) -> str:
+    """Bind queued outbound work to one reviewed connector configuration state.
+
+    Credentials and settings can repoint an integration without changing its
+    primary key.  Hash their canonical representation so delayed tasks can
+    fail closed on that change without putting credential values on the queue.
+    Provider and folder identity are included because they are part of the
+    outbound authority boundary too.
+    """
+
+    provider = configuration.provider
+    payload = {
+        "configuration_id": str(configuration.id),
+        "configuration_active": configuration.is_active,
+        "folder_id": str(configuration.folder_id),
+        "provider_id": str(configuration.provider_id),
+        "provider_folder_id": str(provider.folder_id),
+        "provider_name": provider.name,
+        "provider_type": provider.provider_type,
+        "provider_active": provider.is_active,
+        "model_key": model_key,
+        "credentials": configuration.credentials or {},
+        "settings": configuration.settings or {},
+    }
+    canonical = json.dumps(
+        payload,
+        cls=DjangoJSONEncoder,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    digest = salted_hmac(
+        "integrations.sync.configuration.v1",
+        canonical,
+        algorithm="sha256",
+    ).hexdigest()
+    return f"v1:{digest}"
 
 
 def configured_model_keys(config_settings: dict | None) -> list[str]:
