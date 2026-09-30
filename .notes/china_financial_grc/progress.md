@@ -27,7 +27,7 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
 | Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
 | Production acceptance | Legal, privacy, security, records, audit, operations, and production acceptance have not been performed. |
-| Hosted project governance | PR #4 remains open on submitted head `0c4c66820`: 190 checks passed, 25 failed, and one skipped. The authenticated CLI session is restored. A fresh canonical HTTPS fetch resolved `dcce0c55d`; dedicated pure merge `426d685da` measures 45 ahead / zero behind. Follow-up authority regressions, full backend/browser, and exact-head hosted gates remain open; the no-bypass ruleset and weekly read-only monitor remain active. |
+| Hosted project governance | PR #4 remains open on submitted head `0c4c66820`: 190 checks passed, 25 failed, and one skipped. The authenticated CLI session is restored. A fresh canonical HTTPS fetch resolved `dcce0c55d`; dedicated pure merge `426d685da` measures 45 ahead / zero behind. Bounded authority regressions passed; immutable full backend/browser and exact-head hosted gates remain open. Ruleset 21569001 was independently verified active with zero bypass actors and strict governance checks; the weekly read-only monitor remains active. |
 
 ## Current verification summary
 
@@ -59,6 +59,12 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   [CFGRC-REC-20260930-10](progress-archive/2026-09.md#cfgrc-rec-20260930-10)
   and
   [CFGRC-REC-20260930-09](progress-archive/2026-09.md#cfgrc-rec-20260930-09).
+- Final quick-form authority regressions passed **37 focused / 93 related tests**
+  with zero skips, preserving the separate CA authority path and unchanged-null
+  contract. Independent review accepted the bounded parent/action/folder/locked
+  recheck implementation; wider status-writer and permission-revocation races
+  remain explicit. See
+  [CFGRC-REC-20260930-11](progress-archive/2026-09.md#cfgrc-rec-20260930-11).
 - Fresh PostgreSQL technical acceptance passed **82 regulatory tests**, bounded
   role probes, migration/rollback checks, synthetic backup/restore fingerprint
   equality, and a restored successor write. The separate fork-upgrade path
@@ -183,17 +189,17 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
     attested here. No secret is stored in the ledger or candidate diff. Local
     checkpoint `fd27104e7` remains unpushed and its immutable full-backend
     diagnostic failed; it is not a full pass.
-19. **Additional questionnaire/deletion review is open.** Passing quick-form
-    read/requester regressions do not close unscoped creation, moved-parent
-    folder consistency, or submit-versus-mutation races. Bounded TPRM ownership,
-    retained validation-flow history, preview read IAM, and SET_NULL regressions
-    now passed; concurrent clone/link/delete ownership is not claimed safe.
+19. **Wider questionnaire/deletion concurrency remains open.** Bounded
+    quick-form creation/action IAM, moved-parent read/write consistency, and
+    locked-save rechecks passed. QFR submit/status writers still do not share
+    that lock protocol; concurrent team/IAM revocation has no shared epoch.
+    TPRM ownership/history/preview/SET_NULL regressions passed, but concurrent
+    clone/link/delete ownership is not claimed safe.
 
 ## Current next action
 
-Complete the remaining questionnaire/cascade authority regressions without
-weakening native IAM or aggregate ownership. Run the unexcluded immutable PostgreSQL
-suite and the proportional merged-tree frontend/browser matrix, and monitor
+Run the unexcluded immutable PostgreSQL suite and the proportional frozen-
+candidate browser matrix, preserving native IAM and aggregate ownership. Monitor
 every hosted check triggered for the submitted PR #4 head. Merge through the
 no-bypass protected-main path only after those checks pass. Keep the current
 stage/task pointers until reconciliation completes; target-environment and
@@ -219,6 +225,7 @@ the ten most recent records and does not duplicate their evidence.
 
 | Completed | Record | Task IDs | Result |
 | --- | --- | --- | --- |
+| 2026-09-30 | [CFGRC-REC-20260930-11](progress-archive/2026-09.md#cfgrc-rec-20260930-11) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Quick-form authority 37 focused / 93 related regressions passed and bounded independent review accepted; wider races and release gates remain open. |
 | 2026-09-30 | [CFGRC-REC-20260930-10](progress-archive/2026-09.md#cfgrc-rec-20260930-10) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Merged frontend 640 tests and both CI builds passed; 31 deletion/rollback and ten test-only seed regressions passed; final gates remain open. |
 | 2026-09-30 | [CFGRC-REC-20260930-09](progress-archive/2026-09.md#cfgrc-rec-20260930-09) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Pure canonical successor merge matches computed tree; fresh behind zero and pre-merge 640 frontend tests passed; final acceptance remains open. |
 | 2026-09-30 | [CFGRC-REC-20260930-08](progress-archive/2026-09.md#cfgrc-rec-20260930-08) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Bounded PostgreSQL compatibility/fixture suites passed; further authority review and full acceptance remain open. |
@@ -228,7 +235,6 @@ the ten most recent records and does not duplicate their evidence.
 | 2026-09-30 | [CFGRC-REC-20260930-04](progress-archive/2026-09.md#cfgrc-rec-20260930-04) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Answer-parent validator and caller-scoped mutation-response compatibility verified on PostgreSQL; full acceptance remains open. |
 | 2026-09-30 | [CFGRC-REC-20260930-03](progress-archive/2026-09.md#cfgrc-rec-20260930-03) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Merged-working-tree migration, PostgreSQL authority, and frontend checkpoint; full backend/browser/hosted gates still open. |
 | 2026-09-30 | [CFGRC-REC-20260930-02](progress-archive/2026-09.md#cfgrc-rec-20260930-02) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Nested creation bound to route-owned assessment authority; all 370 frontend tests passed before the next upstream merge. |
-| 2026-09-30 | [CFGRC-REC-20260930-01](progress-archive/2026-09.md#cfgrc-rec-20260930-01) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Pre-merge backend security checkpoint committed with local regression evidence; reconciliation remains active. |
 
 ## Ledger update rules
 

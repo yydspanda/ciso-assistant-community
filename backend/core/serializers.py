@@ -17,6 +17,10 @@ from core.questionnaire_visibility import (
     QuestionnaireVisibilityContext,
     project_questionnaire_payload,
 )
+from core.quick_form_answer_visibility import (
+    QuickFormAnswerAuthority,
+    QuickFormAnswerAuthorityUnavailable,
+)
 from core.requirement_assessment_relationships import (
     GovernedRequirementAssessmentPrimaryKeyRelatedField,
     RequirementAssessmentRelationshipAuthorityMixin,
@@ -5467,20 +5471,9 @@ class AnswerAuthorityPrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
         super().__init__(*args, **kwargs)
 
     def _quick_form_response(self):
-        """Return the quick-form parent named by this Answer write, if any."""
+        """Return only a parent already proven by this serializer request."""
 
-        instance = getattr(self.root, "instance", None)
-        if instance is not None and getattr(instance, "response_id", None):
-            return instance.response
-        initial_data = getattr(self.root, "initial_data", None) or {}
-        raw_response_id = initial_data.get("response")
-        if not raw_response_id:
-            return None
-        try:
-            response_id = UUID(str(raw_response_id))
-        except TypeError, ValueError, AttributeError:
-            return None
-        return QuickFormResponse.objects.filter(id=response_id).first()
+        return getattr(self.root, "_quick_form_authorized_response", None)
 
     def _visible_queryset(self, user, object_id):
         response = self._quick_form_response()
@@ -5561,6 +5554,13 @@ class AnswerAuthorityPrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
             current_id = getattr(instance, f"{self.field_name}_id", None)
             if submitted_id != current_id:
                 raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
+            if self.authority_model is QuickFormResponse:
+                authorized_response = getattr(
+                    self.root, "_quick_form_authorized_response", None
+                )
+                if authorized_response is None:
+                    raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
+                return authorized_response
             return getattr(instance, self.field_name)
 
         request = self.context.get("request")
@@ -5568,6 +5568,11 @@ class AnswerAuthorityPrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
         if not getattr(user, "is_authenticated", False):
             raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
         object_id = _normalize_related_uuid(data, detail=_ANSWER_RELATION_UNAVAILABLE)
+        if self.authority_model is QuickFormResponse:
+            try:
+                return self.root._resolve_quick_form_response_for_create(object_id)
+            except (AttributeError, QuickFormAnswerAuthorityUnavailable) as exc:
+                raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE) from exc
         try:
             related = self._visible_queryset(user, object_id).first()
         except (NotImplementedError, Permission.DoesNotExist) as exc:
@@ -6546,8 +6551,10 @@ class AnswerWriteSerializer(BaseModelSerializer):
         # on create; updates must keep using the persisted immutable parent.
         default=serializers.CreateOnlyDefault(None),
     )
-    response = serializers.PrimaryKeyRelatedField(
+    response = AnswerAuthorityPrimaryKeyRelatedField(
         queryset=QuickFormResponse.objects.all(),
+        authority_model=QuickFormResponse,
+        immutable_on_update=True,
         required=False,
         allow_null=True,
         default=serializers.CreateOnlyDefault(None),
@@ -6565,15 +6572,59 @@ class AnswerWriteSerializer(BaseModelSerializer):
         required=False,
     )
 
+    def _quick_form_authority(self) -> QuickFormAnswerAuthority:
+        request = self.context.get("request")
+        try:
+            return QuickFormAnswerAuthority.for_user(getattr(request, "user", None))
+        except QuickFormAnswerAuthorityUnavailable as exc:
+            raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE) from exc
+
+    def _cache_quick_form_response(
+        self, response: QuickFormResponse
+    ) -> QuickFormResponse:
+        # Serializer-instance/request local only. Never reuse authority across
+        # requests or treat this parse-time proof as the locked save-time proof.
+        self._quick_form_authorized_response = response
+        return response
+
+    def _resolve_quick_form_response_for_create(self, response_id) -> QuickFormResponse:
+        response = self._quick_form_authority().resolve_response(
+            response_id, action="add"
+        )
+        return self._cache_quick_form_response(response)
+
+    def _authorize_existing_quick_form_response(self) -> QuickFormResponse:
+        response = self._quick_form_authority().resolve_existing_response(
+            self.instance.response_id,
+            answer_id=self.instance.id,
+            action="change",
+        )
+        return self._cache_quick_form_response(response)
+
     def to_internal_value(self, data):
         request = self.context.get("request")
-        if not getattr(getattr(request, "user", None), "is_authenticated", False):
+        user = getattr(request, "user", None)
+        if not (
+            getattr(user, "is_authenticated", False)
+            and getattr(user, "is_active", False)
+        ):
             raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
-        # The requester rule must use the persisted response, not a replacement
-        # chosen by the caller to make somebody else's Answer appear their own.
-        # Reject before related-object lookup so hidden/missing UUIDs are alike.
-        if self.instance is not None and self.instance.response_id:
-            _assert_raw_immutable_relation_ids(self.instance, data, ("response",))
+        if self.instance is not None:
+            # Every Answer update rejects a response transition before DRF can
+            # resolve the submitted UUID. This covers the null response on a CA
+            # Answer as well as a persisted quick-form response. An explicit
+            # null on an already-null CA parent is unchanged and needs no lookup.
+            if not (
+                self.instance.response_id is None
+                and "response" in data
+                and data.get("response") is None
+            ):
+                _assert_raw_immutable_relation_ids(self.instance, data, ("response",))
+            if self.instance.response_id:
+                try:
+                    self._authorize_existing_quick_form_response()
+                except QuickFormAnswerAuthorityUnavailable as exc:
+                    raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE) from exc
         return super().to_internal_value(data)
 
     def to_representation(self, instance):
@@ -6606,6 +6657,90 @@ class AnswerWriteSerializer(BaseModelSerializer):
             content_type__model="answer",
             codename=f"{action}_answer",
         )
+
+    def _assert_quick_form_business_rules(self, response: QuickFormResponse) -> None:
+        """Keep requester/state failures distinct after IAM has been proven."""
+
+        if response.status != QuickFormResponse.Status.DRAFT:
+            raise serializers.ValidationError(
+                "Answers can only be modified while the response is in progress."
+            )
+        request = self.context.get("request")
+        if request is None or not response.is_requester(request.user):
+            raise serializers.ValidationError(
+                "Only the requester can change the answers."
+            )
+
+    @staticmethod
+    def _lock_quick_form_definition(
+        *,
+        response: QuickFormResponse,
+        question_id,
+        desired_choice_ids=(),
+        expected_choice_urns_by_id=None,
+        expected_question_urn=None,
+        expected_question_type=None,
+    ):
+        """Lock a definition only after its response authority was proven."""
+
+        question = (
+            Question.objects.select_for_update(of=("self",))
+            .filter(
+                id=question_id,
+                requirement_node__isnull=True,
+                page__quick_form_id=response.quick_form_id,
+            )
+            .first()
+        )
+        if question is None:
+            raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
+        if (
+            expected_question_urn is not None and question.urn != expected_question_urn
+        ) or (
+            expected_question_type is not None
+            and question.type != expected_question_type
+        ):
+            raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
+
+        desired_choice_ids = set(desired_choice_ids)
+        choices = list(
+            QuestionChoice.objects.select_for_update(of=("self",))
+            .filter(id__in=desired_choice_ids)
+            .order_by("pk")
+        )
+        if {choice.id for choice in choices} != desired_choice_ids or any(
+            choice.question_id != question.id for choice in choices
+        ):
+            raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
+        if expected_choice_urns_by_id is not None and (
+            set(expected_choice_urns_by_id) != desired_choice_ids
+            or any(
+                choice.urn != expected_choice_urns_by_id[choice.id]
+                for choice in choices
+            )
+        ):
+            raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
+        return question, choices
+
+    def _lock_quick_form_answer_mutation(
+        self,
+        *,
+        response_id,
+        action,
+        answer_id=None,
+        expected_folder_id=None,
+        expected_quick_form_id=None,
+    ):
+        try:
+            return self._quick_form_authority().lock_mutation(
+                response_id,
+                action=action,
+                answer_id=answer_id,
+                expected_folder_id=expected_folder_id,
+                expected_quick_form_id=expected_quick_form_id,
+            )
+        except QuickFormAnswerAuthorityUnavailable as exc:
+            raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE) from exc
 
     def _lock_answer_scopes(
         self,
@@ -7252,19 +7387,9 @@ class AnswerWriteSerializer(BaseModelSerializer):
                         "question": f"Question '{question}' does not belong to quick form response '{response}'."
                     }
                 )
-            from core.models import QuickFormResponse
-
-            if response.status != QuickFormResponse.Status.DRAFT:
-                raise serializers.ValidationError(
-                    "Answers can only be modified while the response is in progress."
-                )
-            # Same rule as the `answers` dict on the response itself: folder-level rights
-            # on Answer are not rights over someone else's request.
-            request = self.context.get("request")
-            if request is not None and not response.is_requester(request.user):
-                raise serializers.ValidationError(
-                    "Only the requester can change the answers."
-                )
+            # Same rule as the `answers` dict on the response itself: folder-level
+            # rights on Answer are not rights over someone else's request.
+            self._assert_quick_form_business_rules(response)
             visible_choice_ids = QuestionChoice.objects.filter(
                 question__page__quick_form_id=response.quick_form_id,
             ).values_list("id", flat=True)
@@ -7578,11 +7703,44 @@ class AnswerWriteSerializer(BaseModelSerializer):
         if question is None:
             raise serializers.ValidationError({"question": "This field is required."})
         if response is not None:
-            validated_data["folder"] = response.folder
+            desired_choice_ids = {
+                choice.id for choice in (m2m_choices if m2m_choices is not None else [])
+            }
             with transaction.atomic():
+                scope = self._lock_quick_form_answer_mutation(
+                    response_id=response.id,
+                    action="add",
+                    expected_folder_id=response.folder_id,
+                    expected_quick_form_id=response.quick_form_id,
+                )
+                self._assert_quick_form_business_rules(scope.response)
+                existing_answer = (
+                    Answer.objects.select_for_update()
+                    .filter(
+                        response_id=scope.response.id,
+                        question_id=question.id,
+                    )
+                    .order_by("pk")
+                    .first()
+                )
+                if existing_answer is not None:
+                    raise serializers.ValidationError(
+                        "An answer already exists for this response and question."
+                    )
+                locked_question, locked_choices = self._lock_quick_form_definition(
+                    response=scope.response,
+                    question_id=question.id,
+                    desired_choice_ids=desired_choice_ids,
+                    expected_choice_urns_by_id=expected_choice_urns_by_id,
+                    expected_question_urn=question.urn,
+                    expected_question_type=question.type,
+                )
+                validated_data["response"] = scope.response
+                validated_data["question"] = locked_question
+                validated_data["folder"] = scope.response.folder
                 instance = super().create(validated_data)
                 if m2m_choices is not None:
-                    instance.selected_choices.set(m2m_choices)
+                    instance.selected_choices.set(locked_choices)
                     instance.save()
                 return instance
         if requirement_assessment is None:
@@ -7648,10 +7806,37 @@ class AnswerWriteSerializer(BaseModelSerializer):
         validated_data.pop("_m2m_visible_choice_ids", None)
         validated_data.pop("selected_choices", None)
         if instance.response_id:
+            desired_choice_ids = {
+                choice.id for choice in (m2m_choices if m2m_choices is not None else [])
+            }
+            expected_question_id = instance.question_id
+            expected_question_urn = instance.question.urn
+            expected_question_type = instance.question.type
             with transaction.atomic():
-                instance = super().update(instance, validated_data)
+                scope = self._lock_quick_form_answer_mutation(
+                    response_id=instance.response_id,
+                    action="change",
+                    answer_id=instance.id,
+                )
+                if scope.answer.question_id != expected_question_id:
+                    raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
+                self._assert_quick_form_business_rules(scope.response)
+                locked_question, locked_choices = self._lock_quick_form_definition(
+                    response=scope.response,
+                    question_id=scope.answer.question_id,
+                    desired_choice_ids=desired_choice_ids,
+                    expected_choice_urns_by_id=expected_choice_urns_by_id,
+                    expected_question_urn=expected_question_urn,
+                    expected_question_type=expected_question_type,
+                )
+                self.instance = scope.answer
+                if "response" in validated_data:
+                    validated_data["response"] = scope.response
+                if "question" in validated_data:
+                    validated_data["question"] = locked_question
+                instance = super().update(scope.answer, validated_data)
                 if m2m_choices is not None:
-                    instance.selected_choices.set(m2m_choices)
+                    instance.selected_choices.set(locked_choices)
                     instance.save()
                 return instance
         desired_choice_ids = {
@@ -7709,17 +7894,22 @@ class AnswerWriteSerializer(BaseModelSerializer):
 
     def delete(self, instance):
         if instance.response_id:
-            self._check_object_perm(instance, "delete")
-            if instance.response.status != QuickFormResponse.Status.DRAFT:
-                raise serializers.ValidationError(
-                    "Answers can only be modified while the response is in progress."
+            expected_question_id = instance.question_id
+            with transaction.atomic():
+                scope = self._lock_quick_form_answer_mutation(
+                    response_id=instance.response_id,
+                    action="delete",
+                    answer_id=instance.id,
                 )
-            request = self.context.get("request")
-            if request is None or not instance.response.is_requester(request.user):
-                raise serializers.ValidationError(
-                    "Only the requester can change the answers."
+                if scope.answer.question_id != expected_question_id:
+                    raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
+                self._assert_quick_form_business_rules(scope.response)
+                self._lock_quick_form_definition(
+                    response=scope.response,
+                    question_id=scope.answer.question_id,
                 )
-            return super().delete(instance)
+                self.instance = scope.answer
+                return super().delete(scope.answer)
         with transaction.atomic():
             scope = self._lock_answer_scope(
                 requirement_assessment_id=instance.requirement_assessment_id,
