@@ -27,18 +27,20 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
 | Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
 | Production acceptance | Legal, privacy, security, records, audit, operations, and production acceptance have not been performed. |
-| Hosted project governance | PR #4 remains open on old remote head `122e5d696` (165 successes / nine failures). Local reconciliation targets `e6ba85f8`; a new explicit fetch found one artifact-only successor `555225678`, to be reviewed separately. Full backend, browser, and exact-head hosted gates remain open. The old remote governance pass does not approve the new candidate. The no-bypass ruleset and weekly read-only upstream monitor remain active. |
+| Hosted project governance | PR #4 remains open on old remote head `122e5d696` (165 successes / nine failures). Local commits `78e546e5b` and `835a8c772` join canonical upstream through `555225678`; `df7738176` adds attribution-only metadata. After explicit fresh fetch, that code head measured 40 ahead / zero behind. Full backend, browser, loader, and exact-head hosted gates remain open. The old remote governance pass does not approve the new candidate. The no-bypass ruleset and weekly read-only upstream monitor remain active. |
 
 ## Current verification summary
 
-- The current reconciliation candidate joins
-  first parent `491130e9` and freshly fetched canonical upstream `e6ba85f8`.
-  A new explicit canonical fetch found one artifact-only successor
-  `555225678`; its separate merge/loader gate remains open. Bounded verified
+- Local merge `78e546e5b` joins first parent `491130e9` and canonical upstream
+  `e6ba85f8`. The separate artifact-only merge `835a8c772` joins its successor
+  `555225678` with a tree identical to Git's pure merge result. Attribution-only
+  correction `df7738176` leaves all object/content identities unchanged.
+  The loader gate remains open. Bounded verified
   evidence is recorded in
   [CFGRC-REC-20260930-03](progress-archive/2026-09.md#cfgrc-rec-20260930-03)
   [CFGRC-REC-20260930-04](progress-archive/2026-09.md#cfgrc-rec-20260930-04),
-  and [CFGRC-REC-20260930-05](progress-archive/2026-09.md#cfgrc-rec-20260930-05).
+  [CFGRC-REC-20260930-05](progress-archive/2026-09.md#cfgrc-rec-20260930-05),
+  and [CFGRC-REC-20260930-06](progress-archive/2026-09.md#cfgrc-rec-20260930-06).
 - Fresh PostgreSQL technical acceptance passed **82 regulatory tests**, bounded
   role probes, migration/rollback checks, synthetic backup/restore fingerprint
   equality, and a restored successor write. The separate fork-upgrade path
@@ -96,9 +98,10 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 9. **Only local synthetic PostgreSQL evidence exists.** Representative plans,
    complete upstream-table privileges, production topology, monitoring,
    encryption/key custody, PITR/RPO/RTO, and operations approval remain open.
-10. **The upstream gate remains open.** Newly fetched upstream `555225678`
-    is one artifact-only commit beyond the `e6ba85f8` reconciliation candidate.
-    It needs a separate reviewed merge. Migration paths and bounded regressions passed;
+10. **The upstream acceptance gate remains open.** Explicit fresh fetch of
+    upstream `555225678` measured code head `df7738176` 40 ahead / zero behind.
+    Its separate pure merge and source-attribution correction are committed;
+    the new artifact loader/update gate remains open. Migration paths and bounded regressions passed;
     full backend, browser, and every hosted check on the exact submitted head
     remain open. The task remains active until that branch
     lands through protected `main`; weekly fresh-fetch monitoring stays enabled.
@@ -171,6 +174,7 @@ the ten most recent records and does not duplicate their evidence.
 
 | Completed | Record | Task IDs | Result |
 | --- | --- | --- | --- |
+| 2026-09-30 | [CFGRC-REC-20260930-06](progress-archive/2026-09.md#cfgrc-rec-20260930-06) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Local two-parent merge checkpoints and attribution-only correction committed; freshly fetched upstream behind count is zero, not release approval. |
 | 2026-09-30 | [CFGRC-REC-20260930-05](progress-archive/2026-09.md#cfgrc-rec-20260930-05) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Forward TaskTemplate projection and Policy contract verified; synthetic real Huey/SMTP delivery passed; full and new-upstream gates remain open. |
 | 2026-09-30 | [CFGRC-REC-20260930-04](progress-archive/2026-09.md#cfgrc-rec-20260930-04) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Answer-parent validator and caller-scoped mutation-response compatibility verified on PostgreSQL; full acceptance remains open. |
 | 2026-09-30 | [CFGRC-REC-20260930-03](progress-archive/2026-09.md#cfgrc-rec-20260930-03) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Merged-working-tree migration, PostgreSQL authority, and frontend checkpoint; full backend/browser/hosted gates still open. |
@@ -180,7 +184,6 @@ the ten most recent records and does not duplicate their evidence.
 | 2026-08-27 | [CFGRC-REC-20260827-01](progress-archive/2026-08.md#cfgrc-rec-20260827-01) | `CFGRC-P1-READ-REVIEW` | Regulatory audit events isolated from generic workflows without weakening auditlog. |
 | 2026-08-26 | [CFGRC-REC-20260826-04](progress-archive/2026-08.md#cfgrc-rec-20260826-04) | `CFGRC-GOV-LEDGER`, `CFGRC-GOV-UPSTREAM` | Protected-main ruleset and hosted governance/upstream checks activated with retained run evidence. |
 | 2026-08-26 | [CFGRC-REC-20260826-03](progress-archive/2026-08.md#cfgrc-rec-20260826-03) | `CFGRC-P1-READ-REVIEW` | Read-only regulatory register/viewer implemented with fail-closed temporal, metadata, IAM, and non-binding presentation contracts. |
-| 2026-08-26 | [CFGRC-REC-20260826-02](progress-archive/2026-08.md#cfgrc-rec-20260826-02) | `CFGRC-GOV-LEDGER`, `CFGRC-GOV-UPSTREAM` | Bounded ledger, monthly archive, reproducible-experiment checks, and upstream monitoring implemented. |
 
 ## Ledger update rules
 
