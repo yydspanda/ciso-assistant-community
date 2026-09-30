@@ -1,4 +1,4 @@
-import { handleErrorResponse, nestedWriteFormAction } from '$lib/utils/actions';
+import { nestedWriteFormAction } from '$lib/utils/actions';
 import { BASE_API_URL } from '$lib/utils/constants';
 import { getModelInfo, urlParamModelVerboseName } from '$lib/utils/crud';
 import { safeTranslate } from '$lib/utils/i18n';
@@ -401,58 +401,48 @@ export const actions: Actions = {
 		redirect(302, postUpdateRedirect!);
 	},
 	createAppliedControl: async (event) => {
-		const URLModel = 'applied-controls';
-		const schema = modelSchema(URLModel);
-		const endpoint = `${BASE_API_URL}/${URLModel}/`;
-		const form = await superValidate(event.request, zod(schema));
-
-		if (!form.valid) {
-			return fail(400, { form: form });
-		}
-
-		const requestInitOptions: RequestInit = {
-			method: 'POST',
-			body: JSON.stringify(form.data)
-		};
-
-		const response = await event.fetch(endpoint, requestInitOptions);
-
-		if (!response.ok) return handleErrorResponse({ event, response, form });
-
-		const measure = await response.json();
-
-		const requirementAssessmentEndpoint = `${BASE_API_URL}/requirement-assessments/${event.params.id}/`;
-		const requirementAssessment = await event
-			.fetch(`${requirementAssessmentEndpoint}object/`)
-			.then((res) => res.json());
-
-		const measures = [...requirementAssessment.applied_controls, measure.id];
-
-		const patchRequestInitOptions: RequestInit = {
-			method: 'PATCH',
-			body: JSON.stringify({ applied_controls: measures })
-		};
-
-		const patchRes = await event.fetch(requirementAssessmentEndpoint, patchRequestInitOptions);
-		if (!patchRes.ok) return handleErrorResponse({ event, response: patchRes, form });
-
-		const model: string = urlParamModelVerboseName(URLModel);
-		setFlash(
-			{
-				type: 'success',
-				message: m.successfullyUpdatedObject({ object: model })
-			},
-			event
-		);
-		return { form, newControls: [measure.id] };
+		const result = await nestedWriteFormAction({
+			event,
+			action: 'create',
+			expectedUrlModel: 'applied-controls',
+			boundRelationship: {
+				field: 'requirement_assessments',
+				value: [event.params.id ?? '']
+			}
+		});
+		if (!('form' in result)) return result;
+		const newControl = uuidId(result.form.message?.object?.id);
+		return newControl ? { form: result.form, newControls: [newControl] } : { form: result.form };
 	},
 	createEvidence: async (event) => {
-		const result = await nestedWriteFormAction({ event, action: 'create' });
-		return { form: result.form, newEvidence: result.form.message.object.id };
+		const result = await nestedWriteFormAction({
+			event,
+			action: 'create',
+			expectedUrlModel: 'evidences',
+			boundRelationship: {
+				field: 'requirement_assessments',
+				value: [event.params.id ?? '']
+			}
+		});
+		if (!('form' in result)) return result;
+		const newEvidence = uuidId(result.form.message?.object?.id);
+		return newEvidence ? { form: result.form, newEvidence } : { form: result.form };
 	},
 	createSecurityException: async (event) => {
-		const result = await nestedWriteFormAction({ event, action: 'create' });
-		return { form: result.form, newSecurityException: result.form.message.object.id };
+		const result = await nestedWriteFormAction({
+			event,
+			action: 'create',
+			expectedUrlModel: 'security-exceptions',
+			boundRelationship: {
+				field: 'requirement_assessments',
+				value: [event.params.id ?? '']
+			}
+		});
+		if (!('form' in result)) return result;
+		const newSecurityException = uuidId(result.form.message?.object?.id);
+		return newSecurityException
+			? { form: result.form, newSecurityException }
+			: { form: result.form };
 	},
 	createSuggestedControls: async (event) => {
 		const formData = await event.request.formData();

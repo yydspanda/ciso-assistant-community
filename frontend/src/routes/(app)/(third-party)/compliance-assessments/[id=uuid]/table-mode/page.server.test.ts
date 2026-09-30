@@ -1,16 +1,18 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('$lib/utils/actions', () => ({
-	handleErrorResponse: vi.fn(),
-	nestedWriteFormAction: vi.fn()
+const { setFlashMock } = vi.hoisted(() => ({ setFlashMock: vi.fn() }));
+
+vi.mock('sveltekit-flash-message/server', () => ({
+	setFlash: setFlashMock
 }));
 
 vi.mock('$lib/utils/crud', () => ({
-	getModelInfo: (name: string) => ({ name, localName: name })
+	getModelInfo: (name: string) => ({ name, localName: name, urlModel: name }),
+	urlParamModelVerboseName: (name: string) => name
 }));
 
 vi.mock('$lib/utils/schemas', () => ({
-	modelSchema: (name: string) => ({ name })
+	modelSchema: (name: string) => ({ name, shape: {} })
 }));
 
 vi.mock('$lib/utils/i18n', () => ({
@@ -25,23 +27,50 @@ vi.mock('sveltekit-superforms', () => ({
 	fail: (status: number, data: unknown) => ({ status, data }),
 	message: (form: Record<string, unknown>, value: unknown) => {
 		form.message = value;
-		return { form };
+		return form.valid ? { form } : { status: 400, data: { form } };
 	},
-	setError: (form: { errors: Record<string, string[]> }, field: string, value: string) => {
+	setError: (
+		form: { valid: boolean; errors: Record<string, string[]> },
+		field: string,
+		value: string
+	) => {
+		form.valid = false;
 		form.errors[field] = [value];
 	},
-	superValidate: async (dataOrAdapter: Record<string, unknown>) => ({
-		valid: true,
-		data: dataOrAdapter?.syntheticAdapter ? {} : dataOrAdapter,
-		errors: {}
-	})
+	superValidate: async (dataOrAdapter: unknown) => {
+		let data: Record<string, unknown>;
+		if (
+			dataOrAdapter !== null &&
+			typeof dataOrAdapter === 'object' &&
+			typeof (dataOrAdapter as { getAll?: unknown }).getAll === 'function' &&
+			typeof (dataOrAdapter as { keys?: unknown }).keys === 'function'
+		) {
+			const formData = dataOrAdapter as FormData;
+			data = {};
+			for (const key of new Set(formData.keys())) {
+				if (key === 'urlmodel' || key.startsWith('__superform_')) continue;
+				const values = formData.getAll(key);
+				data[key] = key === 'requirement_assessments' ? values : values.at(-1);
+			}
+		} else if (dataOrAdapter !== null && typeof dataOrAdapter === 'object') {
+			const record = dataOrAdapter as Record<string, unknown>;
+			data = record.syntheticAdapter ? {} : record;
+		} else {
+			data = {};
+		}
+		return { valid: true, data, errors: {} };
+	}
 }));
 
 import { actions, load } from './+page.server';
 
 const assessmentId = '4819de76-fce4-4a1c-bb3b-e97d80b61ab7';
 const requirementAssessmentId = '7fe956d8-a98e-43f2-bdd6-2d48922c41f7';
+const forgedRequirementAssessmentId = '468fd310-197e-4763-87a1-f0f18a7ed8af';
 const requirementId = '84ac7fdd-a01f-421d-bb76-d3cc783d9876';
+const otherAssessmentId = '58e12951-75c3-42f3-a49d-8373a30a159b';
+const evidenceId = 'c8ac9b69-5c9e-42d2-b74b-3f64fa53e276';
+const controlId = '3855f6c7-4692-4d37-995a-4bc56374ad07';
 const endpoint = `http://localhost:8000/api/compliance-assessments/${assessmentId}/`;
 const requirementAssessmentEndpoint = `http://localhost:8000/api/requirement-assessments/${requirementAssessmentId}/`;
 
@@ -69,6 +98,30 @@ function scalarRequest(body: unknown): Request {
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify(body)
 	});
+}
+
+function nestedCreateRequest(
+	urlModel: string,
+	requirementAssessmentIds: string[] = [requirementAssessmentId]
+): Request {
+	const data = new FormData();
+	data.set('urlmodel', urlModel);
+	data.set('name', `New ${urlModel}`);
+	for (const id of requirementAssessmentIds) data.append('requirement_assessments', id);
+	return new Request(`http://localhost/table-mode?/create-${urlModel}`, {
+		method: 'POST',
+		body: data
+	});
+}
+
+function nestedCreateEvent(request: Request, fetchFn: typeof fetch) {
+	return {
+		request,
+		fetch: fetchFn,
+		params: { id: assessmentId },
+		url: new URL(request.url),
+		cookies: { set: vi.fn() }
+	} as never;
 }
 
 describe('table-mode server loader authorization boundary', () => {
@@ -121,6 +174,205 @@ describe('table-mode server loader authorization boundary', () => {
 		expect(row.evidenceCreateForm).toBeNull();
 		expect(row.object).not.toHaveProperty('folder');
 	});
+});
+
+describe('table-mode governed nested creates', () => {
+	const createCases = [
+		{
+			label: 'evidence',
+			action: 'createEvidence' as const,
+			urlModel: 'evidences',
+			createdId: evidenceId,
+			resultField: 'newEvidence'
+		},
+		{
+			label: 'applied control',
+			action: 'createAppliedControl' as const,
+			urlModel: 'applied-controls',
+			createdId: controlId,
+			resultField: null
+		}
+	];
+
+	beforeEach(() => {
+		setFlashMock.mockClear();
+	});
+
+	it.each(createCases)(
+		'binds a valid $label create to the submitted route-owned requirement assessment',
+		async ({ action, urlModel, createdId, resultField }) => {
+			const createEndpoint = `http://localhost:8000/api/${urlModel}/`;
+			const fetchFn = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+				const url = String(input);
+				if (url === requirementAssessmentEndpoint && !init) {
+					return Response.json(boundRequirementAssessment());
+				}
+				if (url === createEndpoint && init?.method === 'POST') {
+					expect(JSON.parse(String(init.body))).toMatchObject({
+						requirement_assessments: [requirementAssessmentId]
+					});
+					return Response.json({ id: createdId });
+				}
+				throw new Error(`Unexpected request: ${url}`);
+			}) as unknown as typeof fetch;
+
+			const result = await actions[action]!(
+				nestedCreateEvent(nestedCreateRequest(urlModel), fetchFn)
+			);
+
+			expect(fetchFn).toHaveBeenNthCalledWith(1, requirementAssessmentEndpoint);
+			expect(fetchFn).toHaveBeenNthCalledWith(
+				2,
+				createEndpoint,
+				expect.objectContaining({ method: 'POST' })
+			);
+			expect(result).toMatchObject({ form: { message: { object: { id: createdId } } } });
+			if (resultField) expect(result).toHaveProperty(resultField, { id: createdId });
+		}
+	);
+
+	it.each(createCases)(
+		'rejects a forged urlmodel for $label before any API request',
+		async ({ action, urlModel }) => {
+			const forgedUrlModel = urlModel === 'evidences' ? 'applied-controls' : 'evidences';
+			const fetchFn = vi.fn() as unknown as typeof fetch;
+
+			const result = await actions[action]!(
+				nestedCreateEvent(nestedCreateRequest(forgedUrlModel), fetchFn)
+			);
+
+			expect(fetchFn).not.toHaveBeenCalled();
+			expect(result).toMatchObject({
+				status: 400,
+				data: { form: { errors: { urlmodel: ['Error'] } } }
+			});
+		}
+	);
+
+	it.each(createCases)(
+		'rejects a malformed or ambiguous requirement assessment for $label before any API request',
+		async ({ action, urlModel }) => {
+			for (const submittedIds of [
+				['not-a-uuid'],
+				[requirementAssessmentId, '468fd310-197e-4763-87a1-f0f18a7ed8af']
+			]) {
+				const fetchFn = vi.fn() as unknown as typeof fetch;
+				const result = await actions[action]!(
+					nestedCreateEvent(nestedCreateRequest(urlModel, submittedIds), fetchFn)
+				);
+
+				expect(fetchFn).not.toHaveBeenCalled();
+				expect(result).toMatchObject({
+					status: 400,
+					data: { form: { errors: { requirement_assessments: ['Error'] } } }
+				});
+			}
+		}
+	);
+
+	it.each(createCases)(
+		'rejects a forged requirement assessment UUID before creating a $label',
+		async ({ action, urlModel }) => {
+			const forgedEndpoint = `http://localhost:8000/api/requirement-assessments/${forgedRequirementAssessmentId}/`;
+			const fetchFn = vi.fn(async () =>
+				Response.json({ detail: 'Not found' }, { status: 404, statusText: 'Not Found' })
+			) as unknown as typeof fetch;
+
+			const result = await actions[action]!(
+				nestedCreateEvent(nestedCreateRequest(urlModel, [forgedRequirementAssessmentId]), fetchFn)
+			);
+
+			expect(fetchFn).toHaveBeenCalledTimes(1);
+			expect(fetchFn).toHaveBeenCalledWith(forgedEndpoint);
+			expect(result).toMatchObject({
+				status: 404,
+				data: { form: { errors: { requirement_assessments: ['Not found'] } } }
+			});
+		}
+	);
+
+	it.each(createCases)(
+		'rejects a cross-assessment requirement assessment before creating a $label',
+		async ({ action, urlModel }) => {
+			const fetchFn = vi.fn(async () =>
+				Response.json(
+					boundRequirementAssessment({ compliance_assessment: { id: otherAssessmentId } })
+				)
+			) as unknown as typeof fetch;
+
+			const result = await actions[action]!(
+				nestedCreateEvent(nestedCreateRequest(urlModel), fetchFn)
+			);
+
+			expect(fetchFn).toHaveBeenCalledTimes(1);
+			expect(fetchFn).toHaveBeenCalledWith(requirementAssessmentEndpoint);
+			expect(result).toMatchObject({ status: 403 });
+		}
+	);
+
+	it.each(createCases)(
+		'preserves a backend denial as a form failure for $label without throwing',
+		async ({ action, urlModel }) => {
+			const fetchFn = vi
+				.fn()
+				.mockResolvedValueOnce(Response.json(boundRequirementAssessment()))
+				.mockResolvedValueOnce(
+					Response.json({ detail: 'Permission denied' }, { status: 403, statusText: 'Forbidden' })
+				) as unknown as typeof fetch;
+
+			const result = await actions[action]!(
+				nestedCreateEvent(nestedCreateRequest(urlModel), fetchFn)
+			);
+
+			expect(fetchFn).toHaveBeenCalledTimes(2);
+			expect(result).toMatchObject({
+				status: 400,
+				data: { form: { message: { error: 'Permission denied' } } }
+			});
+		}
+	);
+
+	it.each(createCases)(
+		'returns a form failure when the $label create request has a network error',
+		async ({ action, urlModel }) => {
+			const fetchFn = vi
+				.fn()
+				.mockResolvedValueOnce(Response.json(boundRequirementAssessment()))
+				.mockRejectedValueOnce(new TypeError('connection closed')) as unknown as typeof fetch;
+
+			const result = await actions[action]!(
+				nestedCreateEvent(nestedCreateRequest(urlModel), fetchFn)
+			);
+
+			expect(fetchFn).toHaveBeenCalledTimes(2);
+			expect(result).toMatchObject({
+				status: 400,
+				data: { form: { message: { error: 'Error' } } }
+			});
+		}
+	);
+
+	it.each(createCases)(
+		'fails closed on a malformed successful $label response',
+		async ({ action, urlModel }) => {
+			const fetchFn = vi
+				.fn()
+				.mockResolvedValueOnce(Response.json(boundRequirementAssessment()))
+				.mockResolvedValueOnce(
+					Response.json({ name: 'Missing canonical id' })
+				) as unknown as typeof fetch;
+
+			const result = await actions[action]!(
+				nestedCreateEvent(nestedCreateRequest(urlModel), fetchFn)
+			);
+
+			expect(fetchFn).toHaveBeenCalledTimes(2);
+			expect(result).toMatchObject({
+				status: 400,
+				data: { form: { message: { error: 'Error' } } }
+			});
+		}
+	);
 });
 
 describe('table-mode update action', () => {

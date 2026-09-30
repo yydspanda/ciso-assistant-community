@@ -1,11 +1,11 @@
 import { nestedWriteFormAction } from '$lib/utils/actions';
 import { BASE_API_URL } from '$lib/utils/constants';
 import { getModelInfo } from '$lib/utils/crud';
-import { modelSchema } from '$lib/utils/schemas';
+import { modelSchema, type FormDataShape } from '$lib/utils/schemas';
 import { m } from '$paraglide/messages';
 import { safeTranslate } from '$lib/utils/i18n';
 import { fail, type Actions, type RequestEvent } from '@sveltejs/kit';
-import { message, setError, superValidate } from 'sveltekit-superforms';
+import { message, setError, superValidate, type SuperValidated } from 'sveltekit-superforms';
 import { zod4 as zod } from 'sveltekit-superforms/adapters';
 import { z } from 'zod';
 import type { ModelInfo } from '$lib/utils/types';
@@ -54,6 +54,9 @@ const scalarUpdateSchema = z.union([
 
 type RouteBoundRequirementAssessment =
 	{ ok: true; object: Record<string, unknown> } | { ok: false; status: number; message: string };
+
+type RouteBoundNestedCreate =
+	{ ok: true; requirementAssessmentId: string } | { ok: false; result: ReturnType<typeof fail> };
 
 function apiFailureStatus(status: number): number {
 	return status >= 400 && status <= 599 ? status : 502;
@@ -128,6 +131,57 @@ async function fetchRouteBoundRequirementAssessment(
 	return { ok: true, object: record };
 }
 
+async function prepareRouteBoundNestedCreate(
+	event: RequestEvent,
+	expectedUrlModel: 'evidences' | 'applied-controls'
+): Promise<RouteBoundNestedCreate> {
+	let formData: FormData;
+	try {
+		formData = await event.request.clone().formData();
+	} catch {
+		return { ok: false, result: fail(400, { form: null }) };
+	}
+
+	let form: SuperValidated<FormDataShape>;
+	try {
+		form = (await superValidate(
+			formData,
+			zod(modelSchema(expectedUrlModel))
+		)) as SuperValidated<FormDataShape>;
+	} catch {
+		return { ok: false, result: fail(400, { form: null }) };
+	}
+
+	if (formData.get('urlmodel') !== expectedUrlModel) {
+		setError(form, 'urlmodel', m.error());
+		return { ok: false, result: fail(400, { form }) };
+	}
+	if (!form.valid) return { ok: false, result: fail(400, { form }) };
+
+	const relationship = z.array(uuidSchema).length(1).safeParse(form.data.requirement_assessments);
+	if (!relationship.success) {
+		setError(form, 'requirement_assessments', m.error());
+		return { ok: false, result: fail(400, { form }) };
+	}
+
+	const requirementAssessmentId = relationship.data[0];
+	const binding = await fetchRouteBoundRequirementAssessment(event, requirementAssessmentId);
+	if (!binding.ok) {
+		setError(form, 'requirement_assessments', binding.message);
+		return { ok: false, result: fail(binding.status, { form }) };
+	}
+	return { ok: true, requirementAssessmentId };
+}
+
+function createdObject(result: unknown): Record<string, unknown> | null {
+	if (!result || typeof result !== 'object' || !('form' in result)) return null;
+	const form = (result as { form?: Record<string, any> }).form;
+	const object: unknown = form?.message?.object;
+	if (!object || typeof object !== 'object' || Array.isArray(object)) return null;
+	const parsed = uuidSchema.safeParse((object as Record<string, unknown>).id);
+	return parsed.success ? (object as Record<string, unknown>) : null;
+}
+
 function jsonValuesEqual(expected: unknown, actual: unknown): boolean {
 	if (Array.isArray(expected) && Array.isArray(actual)) {
 		if (expected.length !== actual.length) return false;
@@ -198,7 +252,7 @@ function sameRelationshipIds(left: Set<string>, right: Set<string>): boolean {
 
 async function failRelationshipUpdate(
 	response: Response,
-	form: Record<string, any>,
+	form: SuperValidated<FormDataShape>,
 	field: RelationshipUpdateField
 ) {
 	let messageText = response.statusText || m.error();
@@ -391,11 +445,34 @@ export const actions: Actions = {
 		return { object };
 	},
 	createEvidence: async (event) => {
-		const result = await nestedWriteFormAction({ event, action: 'create' });
-		return { form: result.form, newEvidence: result.form.message.object };
+		const binding = await prepareRouteBoundNestedCreate(event, 'evidences');
+		if (!binding.ok) return binding.result;
+
+		const result = await nestedWriteFormAction({
+			event,
+			action: 'create',
+			expectedUrlModel: 'evidences',
+			boundRelationship: {
+				field: 'requirement_assessments',
+				value: [binding.requirementAssessmentId]
+			}
+		});
+		const newEvidence = createdObject(result);
+		return newEvidence && 'form' in result ? { form: result.form, newEvidence } : result;
 	},
 	createAppliedControl: async (event) => {
-		return nestedWriteFormAction({ event, action: 'create' });
+		const binding = await prepareRouteBoundNestedCreate(event, 'applied-controls');
+		if (!binding.ok) return binding.result;
+
+		return nestedWriteFormAction({
+			event,
+			action: 'create',
+			expectedUrlModel: 'applied-controls',
+			boundRelationship: {
+				field: 'requirement_assessments',
+				value: [binding.requirementAssessmentId]
+			}
+		});
 	},
 	update: async (event) => {
 		// This action is used only by the relationship pickers in table mode. Keep

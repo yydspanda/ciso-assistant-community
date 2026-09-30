@@ -19,13 +19,12 @@ const { setFlashMock, submittedForm } = vi.hoisted(() => ({
 	}
 }));
 
-vi.mock('$lib/utils/actions', () => ({
-	handleErrorResponse: vi.fn(),
-	nestedWriteFormAction: vi.fn()
-}));
-
 vi.mock('$lib/utils/crud', () => ({
-	getModelInfo: vi.fn(),
+	getModelInfo: vi.fn((urlModel: string) => ({
+		urlModel,
+		localName: urlModel,
+		fileFields: urlModel === 'evidences' ? ['attachment'] : []
+	})),
 	urlParamModelVerboseName: () => 'Requirement assessment'
 }));
 
@@ -52,6 +51,8 @@ vi.mock('$lib/utils/table', () => ({
 vi.mock('$paraglide/messages', () => ({
 	m: {
 		error: () => 'Error',
+		successfullyCreatedObject: ({ object }: { object: string }) =>
+			`The ${object} object has been successfully created`,
 		successfullySavedObject: ({ object }: { object: string }) =>
 			`The ${object} object has been successfully saved`
 	}
@@ -68,7 +69,7 @@ vi.mock('sveltekit-superforms/adapters', () => ({
 vi.mock('sveltekit-superforms', () => ({
 	message: (form: Record<string, unknown>, value: unknown) => {
 		form.message = value;
-		return { form };
+		return form.valid ? { form } : { status: 400, data: { form } };
 	},
 	setError: (
 		form: { valid: boolean; errors: Record<string, string[]> },
@@ -78,9 +79,14 @@ vi.mock('sveltekit-superforms', () => ({
 		form.valid = false;
 		form.errors[key] = [...(form.errors[key] ?? []), value];
 	},
-	superValidate: vi.fn(async () => structuredClone(submittedForm))
+	superValidate: vi.fn(async () => ({
+		...submittedForm,
+		data: { ...submittedForm.data },
+		errors: { ...submittedForm.errors }
+	}))
 }));
 
+import { nestedWriteFormAction } from '$lib/utils/actions';
 import { actions } from './+page.server';
 
 const requirementAssessmentId = '7fe956d8-a98e-43f2-bdd6-2d48922c41f7';
@@ -92,6 +98,22 @@ function actionEvent(fetchFn: ReturnType<typeof vi.fn>) {
 		request: new Request('http://localhost/save', { method: 'POST' }),
 		params: { id: requirementAssessmentId },
 		url: new URL(`http://localhost/requirement-assessments/${requirementAssessmentId}/edit`),
+		fetch: fetchFn,
+		cookies: { set: vi.fn() }
+	} as never;
+}
+
+function nestedActionEvent(
+	fetchFn: ReturnType<typeof vi.fn>,
+	urlModel: string,
+	boundRequirementAssessmentId = requirementAssessmentId
+) {
+	const formData = new FormData();
+	formData.set('urlmodel', urlModel);
+	return {
+		request: new Request('http://localhost/save', { method: 'POST', body: formData }),
+		params: { id: boundRequirementAssessmentId },
+		url: new URL(`http://localhost/requirement-assessments/${boundRequirementAssessmentId}/edit`),
 		fetch: fetchFn,
 		cookies: { set: vi.fn() }
 	} as never;
@@ -330,5 +352,479 @@ describe('requirement-assessment save-and-stay action', () => {
 			}
 		});
 		expect(setFlashMock).not.toHaveBeenCalled();
+	});
+});
+
+describe('requirement-assessment governed nested creates', () => {
+	const evidenceId = 'c8ac9b69-5c9e-42d2-b74b-3f64fa53e276';
+	const securityExceptionId = '8722845f-a8f7-46bd-a13c-66af4f859598';
+	const folderId = '468fd310-197e-4763-87a1-f0f18a7ed8af';
+
+	beforeEach(() => {
+		setFlashMock.mockClear();
+		submittedForm.valid = true;
+		submittedForm.data = {};
+		submittedForm.errors = {};
+		submittedForm.message = undefined;
+	});
+
+	it('creates evidence with the server-bound relationship, then uploads its file', async () => {
+		const attachment = new File(['evidence'], 'evidence.txt', { type: 'text/plain' });
+		submittedForm.data = {
+			folder: folderId,
+			name: 'Evidence',
+			attachment,
+			requirement_assessments: ['4819de76-fce4-4a1c-bb3b-e97d80b61ab7']
+		};
+		const fetchFn = vi
+			.fn()
+			.mockResolvedValueOnce(Response.json({ id: evidenceId, name: 'Evidence' }))
+			.mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+		const result = await actions.createEvidence(nestedActionEvent(fetchFn, 'evidences'));
+
+		expect(fetchFn).toHaveBeenCalledTimes(2);
+		expect(fetchFn).toHaveBeenNthCalledWith(1, 'http://localhost:8000/api/evidences/', {
+			method: 'POST',
+			body: JSON.stringify({
+				folder: folderId,
+				name: 'Evidence',
+				requirement_assessments: [requirementAssessmentId]
+			})
+		});
+		expect(fetchFn).toHaveBeenNthCalledWith(
+			2,
+			`http://localhost:8000/api/evidences/${evidenceId}/upload/`,
+			{
+				headers: { 'Content-Disposition': 'attachment; filename=evidence.txt' },
+				method: 'POST',
+				body: attachment
+			}
+		);
+		expect(result).toMatchObject({
+			newEvidence: evidenceId,
+			form: {
+				valid: true,
+				data: {
+					attachment: undefined,
+					requirement_assessments: [requirementAssessmentId]
+				}
+			}
+		});
+		expect(setFlashMock).toHaveBeenCalledTimes(1);
+		expect(setFlashMock).toHaveBeenCalledWith(
+			{
+				type: 'success',
+				message: 'The requirement assessment object has been successfully created'
+			},
+			expect.anything()
+		);
+	});
+
+	it('creates a security exception and its server-bound relationship in one request', async () => {
+		submittedForm.data = {
+			folder: folderId,
+			name: 'Exception',
+			requirement_assessments: [requirementAssessmentId]
+		};
+		const fetchFn = vi.fn().mockResolvedValueOnce(Response.json({ id: securityExceptionId }));
+
+		const result = await actions.createSecurityException(
+			nestedActionEvent(fetchFn, 'security-exceptions')
+		);
+
+		expect(fetchFn).toHaveBeenCalledTimes(1);
+		expect(fetchFn).toHaveBeenNthCalledWith(1, 'http://localhost:8000/api/security-exceptions/', {
+			method: 'POST',
+			body: JSON.stringify({
+				folder: folderId,
+				name: 'Exception',
+				requirement_assessments: [requirementAssessmentId]
+			})
+		});
+		expect(result).toMatchObject({
+			newSecurityException: securityExceptionId,
+			form: { valid: true }
+		});
+		expect(setFlashMock).toHaveBeenCalledTimes(1);
+	});
+
+	it('creates an applied control and its server-bound relationship in one request', async () => {
+		const controlId = '3855f6c7-4692-4d37-995a-4bc56374ad07';
+		submittedForm.data = {
+			folder: folderId,
+			name: 'Control',
+			requirement_assessments: ['4819de76-fce4-4a1c-bb3b-e97d80b61ab7']
+		};
+		const fetchFn = vi.fn().mockResolvedValueOnce(Response.json({ id: controlId }));
+
+		const result = await actions.createAppliedControl(
+			nestedActionEvent(fetchFn, 'applied-controls')
+		);
+
+		expect(fetchFn).toHaveBeenCalledTimes(1);
+		expect(fetchFn).toHaveBeenCalledWith('http://localhost:8000/api/applied-controls/', {
+			method: 'POST',
+			body: JSON.stringify({
+				folder: folderId,
+				name: 'Control',
+				requirement_assessments: [requirementAssessmentId]
+			})
+		});
+		expect(result).toMatchObject({
+			newControls: [controlId],
+			form: { valid: true }
+		});
+		expect(setFlashMock).toHaveBeenCalledTimes(1);
+	});
+
+	it('does not dereference a missing object when validation fails before POST', async () => {
+		submittedForm.valid = false;
+		submittedForm.errors = { name: ['Required'] };
+		const fetchFn = vi.fn();
+
+		const result = await actions.createEvidence(nestedActionEvent(fetchFn, 'evidences'));
+
+		expect(fetchFn).not.toHaveBeenCalled();
+		expect(result).toMatchObject({ status: 400, data: { form: { valid: false } } });
+		expect(result).not.toHaveProperty('newEvidence');
+		expect(setFlashMock).not.toHaveBeenCalled();
+	});
+
+	it('fails visibly without constructing a target URL from a non-UUID create response', async () => {
+		submittedForm.data = {
+			folder: folderId,
+			name: 'Evidence',
+			requirement_assessments: [requirementAssessmentId]
+		};
+		const fetchFn = vi.fn().mockResolvedValueOnce(Response.json({ id: '../not-an-object' }));
+
+		const result = await actions.createEvidence(nestedActionEvent(fetchFn, 'evidences'));
+
+		expect(fetchFn).toHaveBeenCalledTimes(1);
+		expect(result).toMatchObject({
+			status: 400,
+			data: {
+				form: {
+					valid: false,
+					message: { error: 'Error' }
+				}
+			}
+		});
+		expect(result).not.toHaveProperty('newEvidence');
+		expect(setFlashMock).toHaveBeenCalledTimes(1);
+		expect(setFlashMock).toHaveBeenCalledWith(
+			{ type: 'error', message: 'Error', timeout: 10000 },
+			expect.anything()
+		);
+	});
+
+	it('rejects a non-UUID canonical relationship before creating an object', async () => {
+		submittedForm.data = {
+			folder: folderId,
+			name: 'Evidence',
+			requirement_assessments: [requirementAssessmentId]
+		};
+		const fetchFn = vi.fn();
+
+		const result = await actions.createEvidence(
+			nestedActionEvent(fetchFn, 'evidences', 'not-a-uuid')
+		);
+
+		expect(fetchFn).not.toHaveBeenCalled();
+		expect(result).toMatchObject({
+			status: 400,
+			data: {
+				form: {
+					valid: false,
+					message: { error: 'Error' }
+				}
+			}
+		});
+		expect(result).not.toHaveProperty('newEvidence');
+		expect(setFlashMock).toHaveBeenCalledTimes(1);
+	});
+
+	it('rejects a forged evidence urlmodel before any fetch', async () => {
+		submittedForm.data = {
+			folder: folderId,
+			name: 'Evidence',
+			requirement_assessments: [requirementAssessmentId]
+		};
+		const fetchFn = vi.fn();
+
+		const result = await actions.createEvidence(nestedActionEvent(fetchFn, 'security-exceptions'));
+
+		expect(fetchFn).not.toHaveBeenCalled();
+		expect(result).toMatchObject({
+			status: 400,
+			data: {
+				form: {
+					valid: false,
+					errors: { urlmodel: ['Error'] },
+					message: { error: 'Error' }
+				}
+			}
+		});
+		expect(result).not.toHaveProperty('newEvidence');
+		expect(setFlashMock).toHaveBeenCalledTimes(1);
+	});
+
+	it('rejects a relative-path security-exception urlmodel before any fetch', async () => {
+		submittedForm.data = {
+			folder: folderId,
+			name: 'Exception',
+			requirement_assessments: [requirementAssessmentId]
+		};
+		const fetchFn = vi.fn();
+
+		const result = await actions.createSecurityException(
+			nestedActionEvent(fetchFn, '../evidences')
+		);
+
+		expect(fetchFn).not.toHaveBeenCalled();
+		expect(result).toMatchObject({
+			status: 400,
+			data: {
+				form: {
+					valid: false,
+					errors: { urlmodel: ['Error'] },
+					message: { error: 'Error' }
+				}
+			}
+		});
+		expect(result).not.toHaveProperty('newSecurityException');
+		expect(setFlashMock).toHaveBeenCalledTimes(1);
+	});
+
+	it('returns an invalid ActionFailure without cleanup when the initial POST is denied', async () => {
+		submittedForm.data = {
+			folder: folderId,
+			name: 'Exception',
+			requirement_assessments: [requirementAssessmentId]
+		};
+		const fetchFn = vi
+			.fn()
+			.mockResolvedValueOnce(
+				Response.json({ detail: 'Create denied' }, { status: 403, statusText: 'Forbidden' })
+			);
+
+		const result = await actions.createSecurityException(
+			nestedActionEvent(fetchFn, 'security-exceptions')
+		);
+
+		expect(fetchFn).toHaveBeenCalledTimes(1);
+		expect(fetchFn).toHaveBeenCalledWith('http://localhost:8000/api/security-exceptions/', {
+			method: 'POST',
+			body: JSON.stringify({
+				folder: folderId,
+				name: 'Exception',
+				requirement_assessments: [requirementAssessmentId]
+			})
+		});
+		expect(result).toMatchObject({
+			status: 400,
+			data: {
+				form: {
+					valid: false,
+					message: { error: 'Create denied' }
+				}
+			}
+		});
+		expect(result).not.toHaveProperty('newSecurityException');
+		expect(setFlashMock).toHaveBeenCalledTimes(1);
+		expect(setFlashMock).toHaveBeenCalledWith(
+			{ type: 'error', message: 'Create denied', timeout: 10000 },
+			expect.anything()
+		);
+	});
+
+	it('returns an invalid ActionFailure when the initial POST has a network error', async () => {
+		submittedForm.data = {
+			folder: folderId,
+			name: 'Exception',
+			requirement_assessments: [requirementAssessmentId]
+		};
+		const fetchFn = vi.fn().mockRejectedValueOnce(new TypeError('create connection closed'));
+
+		const result = await actions.createSecurityException(
+			nestedActionEvent(fetchFn, 'security-exceptions')
+		);
+
+		expect(fetchFn).toHaveBeenCalledTimes(1);
+		expect(result).toMatchObject({
+			status: 400,
+			data: {
+				form: {
+					valid: false,
+					message: { error: 'Error' }
+				}
+			}
+		});
+		expect(result).not.toHaveProperty('newSecurityException');
+		expect(setFlashMock).toHaveBeenCalledTimes(1);
+		expect(setFlashMock).toHaveBeenCalledWith(
+			{ type: 'error', message: 'Error', timeout: 10000 },
+			expect.anything()
+		);
+		expect(setFlashMock).not.toHaveBeenCalledWith(
+			expect.objectContaining({ type: 'success' }),
+			expect.anything()
+		);
+	});
+
+	it('returns an invalid ActionFailure for a non-JSON successful initial POST', async () => {
+		submittedForm.data = {
+			folder: folderId,
+			name: 'Exception',
+			requirement_assessments: [requirementAssessmentId]
+		};
+		const fetchFn = vi
+			.fn()
+			.mockResolvedValueOnce(new Response('created without an object body', { status: 201 }));
+
+		const result = await actions.createSecurityException(
+			nestedActionEvent(fetchFn, 'security-exceptions')
+		);
+
+		expect(fetchFn).toHaveBeenCalledTimes(1);
+		expect(result).toMatchObject({
+			status: 400,
+			data: {
+				form: {
+					valid: false,
+					message: { error: 'Error' }
+				}
+			}
+		});
+		expect(result).not.toHaveProperty('newSecurityException');
+		expect(setFlashMock).toHaveBeenCalledTimes(1);
+		expect(setFlashMock).toHaveBeenCalledWith(
+			{ type: 'error', message: 'Error', timeout: 10000 },
+			expect.anything()
+		);
+		expect(setFlashMock).not.toHaveBeenCalledWith(
+			expect.objectContaining({ type: 'success' }),
+			expect.anything()
+		);
+	});
+
+	it('cleans up and fails closed when file upload is denied with an empty body', async () => {
+		const attachment = new File(['evidence'], 'evidence.txt', { type: 'text/plain' });
+		submittedForm.data = {
+			folder: folderId,
+			name: 'Evidence',
+			attachment,
+			requirement_assessments: [requirementAssessmentId]
+		};
+		const fetchFn = vi
+			.fn()
+			.mockResolvedValueOnce(Response.json({ id: evidenceId }))
+			.mockResolvedValueOnce(new Response(null, { status: 502, statusText: 'Bad Gateway' }))
+			.mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+		const result = await actions.createEvidence(nestedActionEvent(fetchFn, 'evidences'));
+
+		expect(fetchFn).toHaveBeenCalledTimes(3);
+		expect(fetchFn).toHaveBeenNthCalledWith(
+			2,
+			`http://localhost:8000/api/evidences/${evidenceId}/upload/`,
+			expect.objectContaining({ method: 'POST', body: attachment })
+		);
+		expect(fetchFn).toHaveBeenNthCalledWith(
+			3,
+			`http://localhost:8000/api/evidences/${evidenceId}/`,
+			{ method: 'DELETE' }
+		);
+		expect(result).toMatchObject({
+			status: 400,
+			data: {
+				form: {
+					valid: false,
+					message: { error: 'Error' }
+				}
+			}
+		});
+		expect(result).not.toHaveProperty('newEvidence');
+		expect(setFlashMock).toHaveBeenCalledTimes(1);
+		expect(setFlashMock).toHaveBeenCalledWith(
+			{ type: 'error', message: 'Error', timeout: 10000 },
+			expect.anything()
+		);
+	});
+
+	it('cleans up and returns an invalid ActionFailure when file upload has a network error', async () => {
+		const attachment = new File(['evidence'], 'evidence.txt', { type: 'text/plain' });
+		submittedForm.data = {
+			folder: folderId,
+			name: 'Evidence',
+			attachment,
+			requirement_assessments: [requirementAssessmentId]
+		};
+		const fetchFn = vi
+			.fn()
+			.mockResolvedValueOnce(Response.json({ id: evidenceId }))
+			.mockRejectedValueOnce(new TypeError('upload connection closed'))
+			.mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+		const result = await actions.createEvidence(nestedActionEvent(fetchFn, 'evidences'));
+
+		expect(fetchFn).toHaveBeenCalledTimes(3);
+		expect(fetchFn).toHaveBeenNthCalledWith(
+			2,
+			`http://localhost:8000/api/evidences/${evidenceId}/upload/`,
+			expect.objectContaining({ method: 'POST', body: attachment })
+		);
+		expect(fetchFn).toHaveBeenNthCalledWith(
+			3,
+			`http://localhost:8000/api/evidences/${evidenceId}/`,
+			{ method: 'DELETE' }
+		);
+		expect(result).toMatchObject({
+			status: 400,
+			data: {
+				form: {
+					valid: false,
+					message: { error: 'Error' }
+				}
+			}
+		});
+		expect(result).not.toHaveProperty('newEvidence');
+		expect(setFlashMock).toHaveBeenCalledTimes(1);
+		expect(setFlashMock).toHaveBeenCalledWith(
+			{ type: 'error', message: 'Error', timeout: 10000 },
+			expect.anything()
+		);
+		expect(setFlashMock).not.toHaveBeenCalledWith(
+			expect.objectContaining({ type: 'success' }),
+			expect.anything()
+		);
+	});
+
+	it('leaves ordinary nested creates on their existing unbound path', async () => {
+		submittedForm.data = {
+			folder: folderId,
+			name: 'Ordinary nested object',
+			requirement_assessments: [requirementAssessmentId]
+		};
+		const fetchFn = vi.fn().mockResolvedValueOnce(Response.json({ id: 'legacy-object-id' }));
+
+		const result = await nestedWriteFormAction({
+			event: nestedActionEvent(fetchFn, 'security-exceptions'),
+			action: 'create'
+		});
+
+		expect(fetchFn).toHaveBeenCalledTimes(1);
+		expect(fetchFn).toHaveBeenCalledWith('http://localhost:8000/api/security-exceptions/', {
+			method: 'POST',
+			body: JSON.stringify(submittedForm.data)
+		});
+		expect(result).toMatchObject({
+			form: {
+				valid: true,
+				message: { object: { id: 'legacy-object-id' } }
+			}
+		});
+		expect(setFlashMock).toHaveBeenCalledTimes(1);
 	});
 });
