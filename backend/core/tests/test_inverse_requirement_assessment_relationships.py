@@ -1171,6 +1171,8 @@ def test_applied_control_list_projection_queries_do_not_scale_per_row(
             "owner": [],
             "filtering_labels": [],
             "assets": [],
+            "findings": [],
+            "commitments": [],
         }
 
     def serialize_and_count(items):
@@ -2558,6 +2560,9 @@ def test_evidence_create_rolls_back_when_revision_creation_fails(
         data={
             "name": name,
             "folder": str(world["folder"].id),
+            # Empty metadata no longer creates a revision. Deposit an artifact
+            # annotation so this test actually reaches the failing revision.
+            "observation": "Synthetic deposited artifact",
         },
         context={"request": _request_for(world["respondent"])},
     )

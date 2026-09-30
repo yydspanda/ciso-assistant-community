@@ -129,7 +129,7 @@ def test_tree_surfaces_omit_requirement_nodes_outside_generic_iam(
     assert "R-ASSIGNED" not in {node.get("ref_id") for node in _all_nodes(tree)}
 
 
-def test_direct_ra_masks_hidden_framework_and_perimeter(
+def test_direct_ra_denies_hidden_framework_without_exposing_existence(
     audit_iam_world,
 ):
     world = audit_iam_world
@@ -140,11 +140,27 @@ def test_direct_ra_masks_hidden_framework_and_perimeter(
     response = _client(world["respondent"]).get(
         f"/api/requirement-assessments/{world['assigned_ra'].id}/"
     )
+    missing = _client(world["respondent"]).get(
+        f"/api/requirement-assessments/{uuid.uuid4()}/"
+    )
+    # Direct RA reads require the full framework/requirement/assessment chain.
+    # A hidden parent and a nonexistent RA must have the same public response.
+    assert response.status_code == missing.status_code == 404
+    assert response.json() == missing.json()
+
+
+def test_direct_ra_masks_perimeter_without_independent_perimeter_iam(
+    audit_iam_world,
+):
+    world = audit_iam_world
+    response = _client(world["respondent"]).get(
+        f"/api/requirement-assessments/{world['assigned_ra'].id}/"
+    )
     assert response.status_code == 200, response.content
     data = response.json()
     assert data["requirement"]["id"] == str(world["assigned_requirement"].id)
     assert data["perimeter"] is None
-    assert data["compliance_assessment"]["framework"] is None
+    assert data["compliance_assessment"]["framework"] is not None
 
 
 def _assert_folder_is_hidden_from_respondent(world: dict) -> None:

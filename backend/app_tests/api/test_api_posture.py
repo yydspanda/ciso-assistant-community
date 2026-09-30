@@ -1980,14 +1980,25 @@ class TestRunLifecycle:
         assert not storage.exists(name)
 
     def test_pruning_spares_annotated_runs(self, setup):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
         s = setup
         first = upload(
             s["client"], s["pa"], s["asset1"], [{"ref_id": "1.1", "result": "fail"}]
         ).json()["run_id"]
-        s["client"].patch(
+        annotated = s["client"].patch(
             f"/api/automation/posture-assessments/{s['pa'].id}/runs/{first}/",
             {"observation": "investigated manually"},
             format="json",
+        )
+        assert annotated.status_code == 200
+        # Pruning is ordered by the result timestamp.  Make the annotated run
+        # unambiguously older instead of depending on wall-clock monotonicity
+        # across several HTTP requests.
+        PostureResult.objects.filter(run_id=first).update(
+            timestamp=timezone.now() - timedelta(days=1)
         )
         # history_depth is 2, so three more runs age the first one's results out
         for _ in range(3):

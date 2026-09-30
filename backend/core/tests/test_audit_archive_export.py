@@ -101,6 +101,22 @@ def audit(app_config, settings, tmp_path):
         framework=framework,
         folder=folder,
         perimeter=perimeter,
+        # Formal exports require the complete audited fields to be visible;
+        # direct ORM creation does not populate the API's visibility snapshot.
+        field_visibility={
+            field: {"auditor": "read", "respondent": "hidden"}
+            for field in (
+                "result",
+                "status",
+                "score",
+                "is_scored",
+                "documentation_score",
+                "observation",
+                "answers",
+                "evidences",
+                "applied_controls",
+            )
+        },
     )
     ca.create_requirement_assessments()
     return ca

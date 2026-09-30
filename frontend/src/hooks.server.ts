@@ -26,14 +26,35 @@ installJsonConsole();
 const fallbackLocaleStore = new WeakMap<Request, string>();
 
 defineCustomServerStrategy('custom-fallback', {
-	getLocale: (request) => fallbackLocaleStore.get(request) ?? DEFAULT_LANGUAGE
+	getLocale: (request) =>
+		(request ? fallbackLocaleStore.get(request) : undefined) ?? DEFAULT_LANGUAGE
 });
 
 const RETRYABLE_STATUSES = new Set([429, 502, 503, 504]);
+const loginPageRegex = /^[a-zA-Z0-9]+:\/\/[^/]+\/login\/?.*$/;
 
 function memoize<T>(fn: () => Promise<T>): () => Promise<T> {
 	let pending: Promise<T> | undefined;
 	return () => (pending ??= fn());
+}
+
+function isPageRequest(event: RequestEvent): boolean {
+	const headers = event.request.headers;
+	return (
+		event.isDataRequest ||
+		headers.get('x-sveltekit-action') === 'true' ||
+		headers.get('accept')?.includes('text/html') === true
+	);
+}
+
+function markNavigationFromLogin(event: RequestEvent, user: User | null) {
+	if (!user || !loginPageRegex.test(event.request.headers.get('referer') ?? '')) return;
+	event.cookies.set('from_login', 'true', {
+		httpOnly: false,
+		sameSite: 'lax',
+		path: '/',
+		secure: true
+	});
 }
 
 async function fetchWithRetry(
@@ -277,6 +298,15 @@ const handleRequest: Handle = async ({ event, resolve }) => {
 			return event.locals.featureflags;
 		});
 
+		// Page loads run concurrently. Resolve the identity — and every cookie write
+		// derived from it — before entering that concurrent phase, otherwise a fast
+		// sibling error can finish the response while getUser() is still applying the
+		// user's locale. JSON endpoints stay lazy and keep the lightweight proxy path.
+		if (isPageRequest(event)) {
+			const user = await event.locals.getUser();
+			markNavigationFromLogin(event, user);
+		}
+
 		return await resolve(event, {
 			transformPageChunk: ({ html }) => {
 				return html
@@ -320,7 +350,7 @@ export const handleFetch: HandleFetch = async ({ request, fetch, event }) => {
 	// Not awaiting getUser(): the LOCALE cookie carries the same preference.
 	const currentLang =
 		event.locals.user?.preferences?.lang || event.cookies.get('LOCALE') || DEFAULT_LANGUAGE;
-	const toBackend = request.url.startsWith(BASE_API_URL);
+	const toBackend = typeof BASE_API_URL === 'string' && request.url.startsWith(BASE_API_URL);
 	if (toBackend) {
 		// Default to JSON unless the request is already a multipart upload (FormData)
 		const ct = request.headers.get('Content-Type') || '';

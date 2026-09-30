@@ -203,6 +203,7 @@ from core.models import (
     Team,
 )
 from core.pagination import CustomLimitOffsetPagination
+from core.quick_form_answer_visibility import QuickFormAnswerVisibility
 from core.serializers import ComplianceAssessmentReadSerializer
 from core.utils import (
     build_answers_dict,
@@ -216,6 +217,7 @@ from core.utils import (
     has_full_view_compliance_assessment,
     is_field_editable_by,
     is_field_visible_to,
+    resolve_visibility_from_overrides,
     scope_requirement_assessments_for_user,
     render_answers_cell,
     respondent_progress_counts,
@@ -1645,6 +1647,8 @@ def _optimized_applied_control_action_queryset(queryset):
         "incidents",
         "stakeholders",
         "task_templates",
+        "control_documents",
+        "commitments__committed_by",
         Prefetch(
             "custom_field_values",
             queryset=CustomFieldValue.objects.select_related("definition"),
@@ -8178,7 +8182,7 @@ class AppliedControlViewSet(CommitmentActionsMixin, ExportMixin, BaseModelViewSe
 
         with transaction.atomic():
             applied_control = get_object_or_404(
-                self.get_queryset().select_for_update(),
+                self.get_queryset().select_for_update(of=("self",)),
                 id=UUID(pk),
             )
             if not RoleAssignment.is_object_accessible(
@@ -20843,6 +20847,7 @@ class RequirementAssessmentViewSet(BaseModelViewSet):
                 "applied_controls",  # ManyToManyField to AppliedControl
                 "security_exceptions",  # ManyToManyField serialized as FieldsRelatedField
                 "findings",  # Reverse FK from Finding serialized as FieldsRelatedField
+                "task_templates__commitments__committed_by",
                 "answers",  # Reverse FK from Answer, used by get_answers() in read serializer
                 "answers__question",  # Needed by build_answers_dict() to get question.urn and question.type
                 "answers__selected_choices",  # Needed by build_answers_dict() to get choice ref_ids
@@ -25431,6 +25436,7 @@ class AnswerViewSet(BaseModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
+        quick_form_scope = QuickFormAnswerVisibility.for_user(user)
         visible_question_ids = RoleAssignment.get_viewable_object_ids(user, Question)
         visible_requirement_node_ids = RoleAssignment.get_viewable_object_ids(
             user, RequirementNode
@@ -25439,19 +25445,25 @@ class AnswerViewSet(BaseModelViewSet):
         visible_choice_ids = RoleAssignment.get_viewable_object_ids(
             user, QuestionChoice
         )
-        visible_choices = QuestionChoice.objects.filter(
+        compliance_choice_filter = Q(
             id__in=visible_choice_ids,
             question_id__in=visible_question_ids,
             question__requirement_node_id__in=visible_requirement_node_ids,
             question__requirement_node__framework_id__in=visible_framework_ids,
         )
+        visible_choices = QuestionChoice.objects.filter(
+            compliance_choice_filter | quick_form_scope.choice_filter()
+        ).distinct()
         qs = (
             super()
             .get_queryset()
             .select_related(
                 "requirement_assessment",
                 "requirement_assessment__compliance_assessment",
+                "response",
+                "response__quick_form",
                 "question",
+                "question__page",
                 "folder",
             )
             .prefetch_related(
@@ -25484,28 +25496,29 @@ class AnswerViewSet(BaseModelViewSet):
         )
         full_view = Q(requirement_assessment__compliance_assessment_id__in=full_ca_ids)
         respondent_view = ~full_view & Q(_has_matching_assignment=True)
+        compliance_answer_filter = Q(
+            requirement_assessment_id__in=visible_ra_ids,
+            requirement_assessment__compliance_assessment_id__in=visible_ca_ids,
+            question_id__in=visible_question_ids,
+            question__requirement_node_id__in=visible_requirement_node_ids,
+            question__requirement_node__framework_id__in=visible_framework_ids,
+            question__requirement_node_id=F("requirement_assessment__requirement_id"),
+            requirement_assessment__requirement__framework_id=F(
+                "requirement_assessment__compliance_assessment__framework_id"
+            ),
+        )
+        compliance_field_filter = (full_view & ~Q(_answer_auditor_access="hidden")) | (
+            respondent_view & ~Q(_answer_respondent_access="hidden")
+        )
         return (
-            qs.filter(
-                requirement_assessment_id__in=visible_ra_ids,
-                requirement_assessment__compliance_assessment_id__in=visible_ca_ids,
-                question_id__in=visible_question_ids,
-                question__requirement_node_id__in=visible_requirement_node_ids,
-                question__requirement_node__framework_id__in=visible_framework_ids,
-                question__requirement_node_id=F(
-                    "requirement_assessment__requirement_id"
-                ),
-                requirement_assessment__requirement__framework_id=F(
-                    "requirement_assessment__compliance_assessment__framework_id"
-                ),
-            )
-            .alias(
+            qs.alias(
                 _has_matching_assignment=Exists(assigned_ra_ids),
                 _answer_auditor_access=_answer_field_access_expression("auditor"),
                 _answer_respondent_access=_answer_field_access_expression("respondent"),
             )
             .filter(
-                (full_view & ~Q(_answer_auditor_access="hidden"))
-                | (respondent_view & ~Q(_answer_respondent_access="hidden"))
+                (compliance_answer_filter & compliance_field_filter)
+                | quick_form_scope.answer_filter()
             )
             .distinct()
         )

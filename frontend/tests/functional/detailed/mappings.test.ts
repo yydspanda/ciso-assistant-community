@@ -55,11 +55,22 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 	};
 
 	const OrgContextScore = {
-		value: 75 / 5 + 1
+		value: 75 / 5 + 1,
+		progress: '75'
 	};
 
 	const applyMappingButton = page.getByTestId('apply-mapping-button');
 	const scoreProgress = page.getByTestId('score-field').getByTestId('progress-ring-svg');
+	let sourceAssessmentDetailUrl = '';
+	let mappedAssessmentDetailUrl = '';
+	const reopenAuditDetail = async (detailUrl: string) => {
+		expect(detailUrl).toMatch(/\/compliance-assessments\/[0-9a-f-]{36}$/i);
+		const response = await page.goto(detailUrl, { waitUntil: 'domcontentloaded' });
+		expect(response?.ok()).toBe(true);
+		const expandAllButton = page.getByRole('button', { name: /Expand all/ });
+		await expect(expandAllButton).toBeVisible();
+		await expandAllButton.click();
+	};
 
 	//NOTE: The form fields can't be passed to the PageContent constructor because the form is not an usual one
 	const applyMappingForm = new FormContent(page, 'Create audit from baseline', [
@@ -89,6 +100,8 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 		}
 		await page.getByTestId('visibility-score-everyone').click();
 		await page.getByTestId('save-button').click();
+		await page.waitForURL(/\/compliance-assessments\/[0-9a-f-]{36}$/i);
+		sourceAssessmentDetailUrl = page.url();
 
 		await page.waitForTimeout(5000);
 
@@ -114,9 +127,12 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 
 		await page.getByTestId('save-no-continue-button').click();
 		await complianceAssessmentsPage.isToastVisible('successfully saved', 'i');
-		await page.goBack();
-		await page.waitForURL(complianceAssessmentsPage.url + '/**');
-		await expect(OrgContextTree.progressRadial).toHaveAttribute(
+		await reopenAuditDetail(sourceAssessmentDetailUrl);
+		const refreshedOrgContextTree = await complianceAssessmentsPage.itemDetail.treeViewItem(
+			'4.1 - Understanding the organization and its context',
+			['core - Clauses', '4 - Context of the organization']
+		);
+		await expect(refreshedOrgContextTree.progressRadial).toHaveAttribute(
 			'data-value',
 			OrgContextScore.progress
 		);
@@ -148,6 +164,8 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 			'The audit object has been successfully created',
 			'i'
 		);
+		await page.waitForURL(/\/compliance-assessments\/[0-9a-f-]{36}$/i);
+		mappedAssessmentDetailUrl = page.url();
 	});
 	await test.step('verify that mapping worked correctly', async () => {
 		const IDAM1TreeViewItem = await complianceAssessmentsPage.itemDetail.treeViewItem('ID.AM-1', [
@@ -168,8 +186,7 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 
 		await page.getByTestId('save-no-continue-button').click();
 		await complianceAssessmentsPage.isToastVisible('successfully saved', 'i');
-		await page.goBack();
-		await page.waitForURL(complianceAssessmentsPage.url + '/**');
+		await reopenAuditDetail(mappedAssessmentDetailUrl);
 	});
 
 	// Map-from = inbound direction (pull a source audit's results INTO the

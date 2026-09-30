@@ -5,9 +5,8 @@ These tests exercise map_audit_results, best_mapping_inferences, and
 _most_restrictive_result using plain dicts — no database required.
 """
 
-import pytest
 from collections import defaultdict
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 # Patch DB access before importing the module (module-level `engine = MappingEngine()`)
 with (
@@ -756,8 +755,17 @@ class TestTargetAuditRange:
             }
         )
         rescaled, _ = engine.best_mapping_inferences(
-            source, "urn:fw:A", "urn:fw:B", target_range=(1, 5)
+            source,
+            "urn:fw:A",
+            "urn:fw:B",
+            target_range=(1, 5),
+            authorization=None,
         )
         assert rescaled["requirement_assessments"]["urn:req:B1"]["score"] == 4
-        allowed, _ = engine.best_mapping_inferences(source, "urn:fw:A", "urn:fw:B")
+        allowed, _ = engine.best_mapping_inferences(
+            source,
+            "urn:fw:A",
+            "urn:fw:B",
+            authorization=None,
+        )
         assert allowed["requirement_assessments"]["urn:req:B1"]["score"] == 80

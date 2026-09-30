@@ -68,7 +68,7 @@ def fetch_flow(folder, **extra):
 
 @pytest.fixture
 def unreachable(monkeypatch):
-    """The SSRF guard would refuse first; this is about what happens after."""
+    """Refuse both transports used after the SSRF guard accepts a URL."""
     monkeypatch.setattr(
         "core.net_safety.assert_public_url_unless_dev", lambda *a, **k: None
     )
@@ -77,6 +77,7 @@ def unreachable(monkeypatch):
         raise requests.ConnectionError("connection refused")
 
     monkeypatch.setattr("requests.request", refuse)
+    monkeypatch.setattr("requests.get", refuse)
 
 
 @pytest.mark.django_db

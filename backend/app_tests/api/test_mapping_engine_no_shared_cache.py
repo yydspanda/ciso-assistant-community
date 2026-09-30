@@ -57,16 +57,20 @@ def test_a_new_engine_sees_a_library_stored_without_its_signal():
 
 
 @pytest.mark.django_db
-def test_creating_an_audit_from_a_baseline_with_no_mapping_path_does_not_fail(
+def test_creating_an_audit_from_a_baseline_with_no_authorized_mapping_path_fails_closed(
     authenticated_client,
 ):
-    """#4791: the audit is created, it is simply not pre-filled.
+    """#4791: an unrelated baseline cannot bypass mapping authorization.
 
-    `best_mapping_inferences` legitimately returns an empty dict when the two
-    frameworks are unrelated, and the result used to be indexed without a
-    guard.
+    An empty inference is ambiguous with an unavailable mapping path.  The
+    request therefore fails closed and must not leave a partial audit behind.
     """
-    from core.models import ComplianceAssessment, Framework, Perimeter
+    from core.models import (
+        ComplianceAssessment,
+        Framework,
+        Perimeter,
+        RequirementAssessment,
+    )
     from iam.models import Folder
 
     folder = Folder.objects.create(
@@ -82,6 +86,12 @@ def test_creating_an_audit_from_a_baseline_with_no_mapping_path_does_not_fail(
     baseline = ComplianceAssessment.objects.create(
         name="baseline", perimeter=perimeter, framework=source, folder=folder
     )
+    assessment_ids_before = set(
+        ComplianceAssessment.objects.values_list("id", flat=True)
+    )
+    requirement_ids_before = set(
+        RequirementAssessment.objects.values_list("id", flat=True)
+    )
 
     response = authenticated_client.post(
         "/api/compliance-assessments/",
@@ -94,7 +104,16 @@ def test_creating_an_audit_from_a_baseline_with_no_mapping_path_does_not_fail(
         format="json",
     )
 
-    assert response.status_code == status.HTTP_201_CREATED, response.data
+    assert response.status_code == status.HTTP_403_FORBIDDEN, response.data
+    assert response.data["detail"] == (
+        "No authorized mapping path is available for this caller."
+    )
+    assert set(ComplianceAssessment.objects.values_list("id", flat=True)) == (
+        assessment_ids_before
+    )
+    assert set(RequirementAssessment.objects.values_list("id", flat=True)) == (
+        requirement_ids_before
+    )
 
 
 @pytest.mark.django_db

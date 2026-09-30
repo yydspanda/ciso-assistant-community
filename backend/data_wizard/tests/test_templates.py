@@ -8,9 +8,11 @@ the response and a spot-checked record are asserted against the template
 content.
 """
 
+import io
 from pathlib import Path
 
 import pytest
+from openpyxl import load_workbook
 
 from core.models import (
     AppliedControl,
@@ -180,7 +182,7 @@ class TestSimpleTemplates:
         assert first.name == "alpha"
         assert first.type == Asset.Type.PRIMARY
 
-    def test_applied_controls_template(
+    def test_mixed_applied_controls_template_stops_at_the_policy_boundary(
         self, api_client, domain_folder, template_domains, all_accessible
     ):
         resp = _post_template(
@@ -191,10 +193,57 @@ class TestSimpleTemplates:
         )
         assert resp.status_code == 200, resp.json()
         results = resp.json()["results"]
-        assert results["created"] == 20
+        # The upstream example mixes model types. Policy rows must not pass
+        # through AppliedControl permissions, even for an administrator.
+        assert results["created"] == 1
+        assert results["failed"] == 1
+        assert results["stopped"] is True
+        assert "Policies must be created and changed through the policy API." in str(
+            results["errors"]
+        )
+        assert not AppliedControl.objects.filter(ref_id="AC-002").exists()
+        assert not AppliedControl.objects.filter(ref_id="AC-003").exists()
         firewall = AppliedControl.objects.get(ref_id="AC-001")
         assert firewall.name == "Firewall"
         assert firewall.csf_function == "protect"
+
+    def test_non_policy_rows_of_applied_controls_template_are_supported(
+        self, api_client, domain_folder, template_domains, all_accessible
+    ):
+        # Preserve the shipped artifact. Build the documented model-specific
+        # input in memory and verify every non-policy row, not just the first.
+        workbook = load_workbook(
+            io.BytesIO(_read_template("applied_controls_template.xlsx"))
+        )
+        sheet = workbook.active
+        header = [cell.value for cell in sheet[1]]
+        category_column = header.index("category") + 1
+        policy_count = 0
+        for row_index in range(sheet.max_row, 1, -1):
+            if (
+                str(sheet.cell(row_index, category_column).value).strip().lower()
+                == "policy"
+            ):
+                sheet.delete_rows(row_index)
+                policy_count += 1
+        assert policy_count == 4
+        content = io.BytesIO()
+        workbook.save(content)
+        response = api_client.post(
+            URL,
+            data=content.getvalue(),
+            content_type="application/octet-stream",
+            HTTP_X_MODEL_TYPE="AppliedControl",
+            HTTP_X_FOLDER_ID=str(domain_folder.id),
+            HTTP_CONTENT_DISPOSITION="attachment; filename=applied_controls_template.xlsx",
+        )
+        assert response.status_code == 200, response.json()
+        results = response.json()["results"]
+        assert results["created"] == 16
+        assert results["failed"] == 0
+        assert results["stopped"] is False
+        assert results["errors"] == []
+        assert not Policy.objects.exists()
 
     def test_perimeters_template(
         self, api_client, domain_folder, template_domains, all_accessible

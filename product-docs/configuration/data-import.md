@@ -94,6 +94,13 @@ Unless marked as mandatory, ref\_id fields can be left blank but the column must
 
 ## Applied controls
 
+In this fork, import policy rows using the dedicated **Policy** model/import
+and its permissions, not **AppliedControl**. The inherited applied-controls
+example workbook mixes both types: split rows whose category is `policy` before
+uploading it. With the default stop mode, the unsplit example stops at its first
+policy row; preceding valid rows remain created, so the whole import is not an
+atomic rollback. No permission is inferred from a row's category.
+
 ### Template
 
 {% file src="../.gitbook/assets/applied_controls_sample (2).xlsx" %}
@@ -111,7 +118,6 @@ Unless marked as mandatory, ref\_id fields can be left blank but the column must
   * `active`
   * `deprecated`
 * category
-  * `policy`
   * `process`
   * `technical`
   * `physical`

@@ -51,6 +51,25 @@ def _levels(*scores):
     return [{"score": s, "translations": {"fr": {"name": f"n{s}"}}} for s in scores]
 
 
+def _auditor_score_visibility():
+    """Opt into the score projection without exposing it to respondents."""
+
+    auditor_read = {"auditor": "read", "respondent": "hidden"}
+    return {
+        field_name: dict(auditor_read)
+        for field_name in ("score", "is_scored", "documentation_score")
+    }
+
+
+def _enable_auditor_score_read(ca):
+    ca.field_visibility = {
+        **(ca.field_visibility or {}),
+        **_auditor_score_visibility(),
+    }
+    ca.save(update_fields=["field_visibility"])
+    return ca
+
+
 @pytest.mark.django_db
 class TestScoreScalePreset:
     def test_new_audit_inherits_framework_scale(self, setup):
@@ -890,7 +909,7 @@ class TestBaselineCopy:
         ra = setup["ra"]
         ra.is_scored, ra.score, ra.documentation_score = True, 80, 40
         ra.save()
-        return setup["ca"]
+        return _enable_auditor_score_read(setup["ca"])
 
     def _create(self, setup, **extra):
         response = self._api().post(
@@ -900,6 +919,7 @@ class TestBaselineCopy:
                 "folder": str(setup["folder"].id),
                 "framework": str(setup["fw"].id),
                 "baseline": str(setup["ca"].id),
+                "field_visibility": _auditor_score_visibility(),
                 **extra,
             },
             format="json",
@@ -1094,12 +1114,19 @@ class TestTargetOnCreation:
         )
         api = APIClient()
         api.force_authenticate(admin)
+        if extra.get("baseline"):
+            _enable_auditor_score_read(setup["ca"])
         return api.post(
             "/api/compliance-assessments/",
             {
                 "name": "Created",
                 "folder": str(setup["folder"].id),
                 "framework": str(setup["fw"].id),
+                **(
+                    {"field_visibility": _auditor_score_visibility()}
+                    if extra.get("baseline")
+                    else {}
+                ),
                 **extra,
             },
             format="json",
@@ -1167,6 +1194,7 @@ class TestAuditCopyIsTheOnlyLabelSource:
         admin = User.objects.create_superuser(email="gs-admin@test.local", password="x")
         api = APIClient()
         api.force_authenticate(admin)
+        _enable_auditor_score_read(ca)
         response = api.get(f"/api/compliance-assessments/{ca.id}/global_score/")
         assert response.status_code == 200, response.json()
         return response.json()["scores_definition"]
@@ -1321,7 +1349,7 @@ class TestHalfUpRounding:
 
 @pytest.mark.django_db
 class TestGlobalScoreScaleSummary:
-    def test_includes_framework_and_preset(self, setup):
+    def test_includes_visible_preset_without_framework_identity(self, setup):
         from iam.models import User
         from rest_framework.test import APIClient
 
@@ -1331,9 +1359,15 @@ class TestGlobalScoreScaleSummary:
         )
         api = APIClient()
         api.force_authenticate(admin)
-        body = api.get(
+        _enable_auditor_score_read(setup["ca"])
+        response = api.get(
             f"/api/compliance-assessments/{setup['ca'].id}/global_score/"
-        ).json()
-        assert body["framework"] == str(setup["fw"].id)
+        )
+        assert response.status_code == 200, response.json()
+        body = response.json()
+        # The assessment detail already binds this score projection to a
+        # framework.  Keep global_score focused on visible score data instead
+        # of making it a second framework-identity oracle.
+        assert "framework" not in body
         assert body["score_scale_preset"] == "1-4"
         assert (body["min_score"], body["max_score"]) == (1, 4)

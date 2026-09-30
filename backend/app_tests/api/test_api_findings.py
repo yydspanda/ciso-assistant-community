@@ -242,13 +242,13 @@ class TestPickingExistingFindings:
             RequirementNode,
         )
 
-        framework = Framework.objects.create(name="F", folder=Folder.get_root_folder())
+        framework = Framework.objects.create(name="F", folder=setup["domain"])
         node = RequirementNode.objects.create(
             framework=framework,
             urn="urn:test:req:1",
             ref_id="1",
             assessable=True,
-            folder=Folder.get_root_folder(),
+            folder=setup["domain"],
         )
         assessment = ComplianceAssessment.objects.create(
             name="ISO audit", folder=setup["domain"], framework=framework
@@ -375,6 +375,13 @@ class TestPickingExistingFindings:
         assignment.perimeter_folders.add(setup["domain"])
         client = APIClient()
         client.force_authenticate(analyst)
+
+        # Reach the governed assessment and both of its parent objects before
+        # exercising the Finding-specific permission boundary.  Otherwise an
+        # unrelated parent-visibility 404 can masquerade as the intended
+        # change_finding denial.
+        reachable = client.get(f"/api/requirement-assessments/{audit.id}/")
+        assert reachable.status_code == 200, reachable.json()
 
         foreign = Finding.objects.create(
             name="Foreign",

@@ -2,9 +2,7 @@ import type { LayoutServerLoad } from './$types';
 import { redirect } from '@sveltejs/kit';
 import { loadFlash } from 'sveltekit-flash-message/server';
 
-const loginPageRegex = /^[a-zA-Z0-9]+:\/\/[^\/]+\/login\/?.*$/;
-
-export const load = loadFlash(async ({ locals, url, cookies, request }) => {
+export const load = loadFlash(async ({ locals, url }) => {
 	const user = await locals.getUser();
 	if (!user && !url.pathname.includes('/login')) {
 		redirect(302, `/login?next=${url.pathname}`);
@@ -27,17 +25,5 @@ export const load = loadFlash(async ({ locals, url, cookies, request }) => {
 		redirect(302, '/setup-mfa');
 	}
 
-	if (user) {
-		const referer = request.headers.get('referer') ?? '';
-		const fromLogin = loginPageRegex.test(referer);
-		if (fromLogin) {
-			cookies.set('from_login', 'true', {
-				httpOnly: false,
-				sameSite: 'lax',
-				path: '/',
-				secure: true
-			});
-		}
-	}
 	return { user, settings, featureflags };
 }) satisfies LayoutServerLoad;

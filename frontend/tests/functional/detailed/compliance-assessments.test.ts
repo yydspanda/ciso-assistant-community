@@ -77,6 +77,15 @@ test('compliance assessments scoring is working properly', async ({
 	await page.getByTestId('save-button').click();
 	await page.waitForURL((url) => /^\/compliance-assessments\/[0-9a-f-]+$/i.test(url.pathname));
 	const complianceAssessmentDetailUrl = page.url();
+	const reopenComplianceAssessment = async () => {
+		const response = await page.goto(complianceAssessmentDetailUrl, {
+			waitUntil: 'domcontentloaded'
+		});
+		expect(response?.ok()).toBe(true);
+		const expandAllButton = page.getByRole('button', { name: /Expand all/ });
+		await expect(expandAllButton).toBeVisible({ timeout: 60_000 });
+		await expandAllButton.click();
+	};
 
 	// Click on the ID.AM-1 tree view item
 	const IDAM1TreeViewItem = await complianceAssessmentsPage.itemDetail.treeViewItem('ID.AM-1', [
@@ -110,10 +119,7 @@ test('compliance assessments scoring is working properly', async ({
 	);
 	await page.getByTestId('save-button').click();
 	await saveNextNavigation;
-	await page.goto(complianceAssessmentDetailUrl, { waitUntil: 'domcontentloaded' });
-	const expandAllButton = page.getByRole('button', { name: /Expand all/ });
-	await expect(expandAllButton).toBeVisible({ timeout: 60_000 });
-	await expandAllButton.click();
+	await reopenComplianceAssessment();
 	await expect(page.getByRole('link', { name: 'ID.AM-1', exact: true })).toBeVisible({
 		timeout: 60_000
 	});
@@ -147,9 +153,12 @@ test('compliance assessments scoring is working properly', async ({
 
 	await page.getByTestId('save-no-continue-button').click();
 	await complianceAssessmentsPage.isToastVisible('successfully saved', 'i');
-	await page.goBack();
-	await page.waitForURL(complianceAssessmentsPage.url + '/**');
-	await expect(IDAM2TreeViewItem.progressRadial).toHaveAttribute(
+	await reopenComplianceAssessment();
+	const refreshedIDAM2TreeViewItem = await complianceAssessmentsPage.itemDetail.treeViewItem(
+		'ID.AM-2',
+		['ID - Identify', 'ID.AM - Asset Management']
+	);
+	await expect(refreshedIDAM2TreeViewItem.progressRadial).toHaveAttribute(
 		'data-value',
 		toPercent(IDAM2Score.value)
 	);
@@ -175,9 +184,12 @@ test('compliance assessments scoring is working properly', async ({
 
 	await page.getByTestId('save-no-continue-button').click();
 	await complianceAssessmentsPage.isToastVisible('successfully saved', 'i');
-	await page.goBack();
-	await page.waitForURL(complianceAssessmentsPage.url + '/**');
-	await expect(IDBE1TreeViewItem.progressRadial).toHaveAttribute(
+	await reopenComplianceAssessment();
+	const refreshedIDBE1TreeViewItem = await complianceAssessmentsPage.itemDetail.treeViewItem(
+		'ID.BE-1',
+		['ID - Identify', 'ID.BE - Business Environment']
+	);
+	await expect(refreshedIDBE1TreeViewItem.progressRadial).toHaveAttribute(
 		'data-value',
 		toPercent(IDBE1Score.value)
 	);
@@ -203,9 +215,12 @@ test('compliance assessments scoring is working properly', async ({
 
 	await page.getByTestId('save-no-continue-button').click();
 	await complianceAssessmentsPage.isToastVisible('successfully saved', 'i');
-	await page.goBack();
-	await page.waitForURL(complianceAssessmentsPage.url + '/**');
-	await expect(PRAC1TreeViewItem.progressRadial).toHaveAttribute(
+	await reopenComplianceAssessment();
+	const refreshedPRAC1TreeViewItem = await complianceAssessmentsPage.itemDetail.treeViewItem(
+		'PR.AC-1',
+		['PR - Protect', 'PR.AC - Identity Management, Authentication and Access Control']
+	);
+	await expect(refreshedPRAC1TreeViewItem.progressRadial).toHaveAttribute(
 		'data-value',
 		toPercent(PRAC1Score.value)
 	);

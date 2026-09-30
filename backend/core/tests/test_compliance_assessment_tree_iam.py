@@ -2187,8 +2187,10 @@ def _build_batched_questionnaire_rows(world: dict, count: int):
 
 def test_questionnaire_visibility_context_is_request_bound_scoped_and_batched(
     audit_iam_world,
+    monkeypatch,
 ):
     from core.questionnaire_visibility import QuestionnaireVisibilityContext
+    from global_settings.utils import get_instance_feature_flags
 
     world = audit_iam_world
     _grant_questionnaire_read(world["respondent"], world["child_folder"])
@@ -2224,8 +2226,21 @@ def test_questionnaire_visibility_context_is_request_bound_scoped_and_batched(
         folder=world["child_folder"],
     )
 
+    # Exclude the unrelated process-local feature-flag cold read, not any IAM
+    # query. Folder roots and permission grants must still resolve freshly.
+    get_instance_feature_flags()
+    original_get_viewable_ids = RoleAssignment.get_viewable_object_ids
+    iam_calls = Counter()
+
+    def count_iam_resolution(user, model, folder=None):
+        iam_calls[model] += 1
+        return original_get_viewable_ids(user, model, folder)
+
+    monkeypatch.setattr(RoleAssignment, "get_viewable_object_ids", count_iam_resolution)
+
     def build_and_consume(rows, requirement_nodes):
         request = SimpleNamespace(user=world["respondent"])
+        previous_iam_calls = iam_calls.copy()
         with CaptureQueriesContext(connection) as captured:
             context = QuestionnaireVisibilityContext.build(
                 request=request,
@@ -2236,16 +2251,33 @@ def test_questionnaire_visibility_context_is_request_bound_scoped_and_batched(
                 assert context.answer_values_for(request, assessment)
                 assert context.counts_for(request, assessment) == (1, 1)
                 assert context.translated_questions_for(request, assessment.requirement)
-        return request, context, len(captured.captured_queries)
+        return (
+            request,
+            context,
+            len(captured.captured_queries),
+            iam_calls - previous_iam_calls,
+        )
 
-    _, _, one_row_queries = build_and_consume(assessments[:1], nodes[:1])
-    request, context, eight_row_queries = build_and_consume(assessments, nodes)
+    _, _, one_row_queries, one_row_iam_calls = build_and_consume(
+        assessments[:1], nodes[:1]
+    )
+    request, context, eight_row_queries, eight_row_iam_calls = build_and_consume(
+        assessments, nodes
+    )
 
     # The fixed full-chain budget resolves permission and recursive folder scope
     # once for each of Framework, RequirementNode, Question, QuestionChoice and
-    # Answer (10 queries), then executes six bounded row/prefetch queries.  The
-    # important invariant is that consuming 8 rows adds no query at all.
-    assert one_row_queries <= 16
+    # Answer. IAM also resolves the non-cached root folder once per model:
+    # 5 root + 5 permission + 5 grant queries, followed by six bounded
+    # row/prefetch queries. No shared authorization cache is introduced.
+    expected_iam_calls = Counter(
+        {
+            model: 1
+            for model in (Framework, RequirementNode, Question, QuestionChoice, Answer)
+        }
+    )
+    assert one_row_iam_calls == eight_row_iam_calls == expected_iam_calls
+    assert one_row_queries <= 21
     assert eight_row_queries == one_row_queries
 
     # A context cannot be replayed in another request, even for the same user,

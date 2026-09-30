@@ -6530,7 +6530,7 @@ class AnswerReadSerializer(BaseModelSerializer):
 
 
 class AnswerWriteSerializer(BaseModelSerializer):
-    # The RequirementAssessment is the only security-domain authority.  Keeping
+    # The owning assessment/response is the only security-domain authority. Keeping
     # this read-only also prevents an arbitrary client-supplied Folder UUID from
     # becoming an existence oracle during DRF field resolution.
     folder = serializers.PrimaryKeyRelatedField(read_only=True)
@@ -6569,6 +6569,11 @@ class AnswerWriteSerializer(BaseModelSerializer):
         request = self.context.get("request")
         if not getattr(getattr(request, "user", None), "is_authenticated", False):
             raise PermissionDenied(_ANSWER_RELATION_UNAVAILABLE)
+        # The requester rule must use the persisted response, not a replacement
+        # chosen by the caller to make somebody else's Answer appear their own.
+        # Reject before related-object lookup so hidden/missing UUIDs are alike.
+        if self.instance is not None and self.instance.response_id:
+            _assert_raw_immutable_relation_ids(self.instance, data, ("response",))
         return super().to_internal_value(data)
 
     def to_representation(self, instance):
@@ -7704,6 +7709,16 @@ class AnswerWriteSerializer(BaseModelSerializer):
 
     def delete(self, instance):
         if instance.response_id:
+            self._check_object_perm(instance, "delete")
+            if instance.response.status != QuickFormResponse.Status.DRAFT:
+                raise serializers.ValidationError(
+                    "Answers can only be modified while the response is in progress."
+                )
+            request = self.context.get("request")
+            if request is None or not instance.response.is_requester(request.user):
+                raise serializers.ValidationError(
+                    "Only the requester can change the answers."
+                )
             return super().delete(instance)
         with transaction.atomic():
             scope = self._lock_answer_scope(

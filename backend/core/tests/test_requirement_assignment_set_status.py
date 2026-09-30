@@ -4,17 +4,15 @@ Covers the transition matrix for reopening a submitted/changes_requested/
 in_progress/closed assignment back to "draft", plus the EDITABLE_STATUSES
 guard on update/partial_update/destroy.
 
-reviewer_only / actor_only are exercised by monkeypatching the same seams
-used elsewhere in this test suite (get_respondent_scoped_folder_ids,
-Actor.get_all_for_user) rather than wiring full RBAC role assignments, to
-keep the tests focused on RequirementAssignmentViewSet's own logic.
+The respondent denial uses a real narrow IAM grant without full-audit read
+authority; membership of the reviewer/admin group cannot simulate a respondent.
 """
 
 import pytest
+from django.contrib.auth.models import Permission
 from rest_framework.test import APIClient
 from knox.models import AuthToken
 
-import core.views as core_views
 from core.apps import startup
 from core.models import (
     ComplianceAssessment,
@@ -23,7 +21,7 @@ from core.models import (
     RequirementAssignment,
     RequirementAssignmentEvent,
 )
-from iam.models import Folder, User, UserGroup
+from iam.models import Folder, Role, RoleAssignment, User, UserGroup
 
 
 @pytest.fixture
@@ -169,22 +167,41 @@ class TestSetStatusTransitions:
         )
         assert response.status_code == 400
 
-    def test_respondent_cannot_reopen_to_draft(self, assignment_fixture, monkeypatch):
-        """reviewer_only transitions must be forbidden to respondent-scoped users."""
+    def test_respondent_cannot_reopen_to_draft(self, assignment_fixture):
+        """A transition grant and actor membership do not grant reviewer authority."""
         assignment = assignment_fixture["assignment"]
         assignment.status = "submitted"
         assignment.save(update_fields=["status"])
         folder = assignment_fixture["folder"]
 
-        monkeypatch.setattr(
-            core_views,
-            "get_respondent_scoped_folder_ids",
-            lambda user: {folder.id},
+        respondent = User.objects.create_user("assignment_respondent@tests.invalid")
+        role = Role.objects.create(name="Assignment narrow respondent", folder=folder)
+        role.permissions.set(
+            Permission.objects.filter(
+                content_type__app_label="core",
+                codename__in=(
+                    "view_complianceassessment",
+                    "view_requirementassignment",
+                    "transition_requirementassignment",
+                ),
+            )
+        )
+        grant = RoleAssignment.objects.create(user=respondent, role=role, folder=folder)
+        grant.perimeter_folders.add(folder)
+        assignment.actor.add(respondent.actor)
+        from core.utils import has_full_view_compliance_assessment
+
+        assert not has_full_view_compliance_assessment(
+            respondent, assignment.compliance_assessment
+        )
+        client = APIClient()
+        client.force_authenticate(respondent)
+        assert (
+            client.get(f"/api/requirement-assignments/{assignment.id}/").status_code
+            == 200
         )
 
-        response = _set_status(
-            assignment_fixture["actor_client"], assignment.id, "draft"
-        )
+        response = _set_status(client, assignment.id, "draft")
 
         assert response.status_code == 403
         assignment.refresh_from_db()
