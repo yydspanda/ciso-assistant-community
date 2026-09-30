@@ -11,8 +11,16 @@ description: |-
 
   Assessment (Essential Eight assessment process guide): a mitigation strategy is implemented at a maturity level only when all of its controls for that level are assessed as effective or alternate control; if one or more mitigation strategies are not implemented, the target maturity level for the system cannot be claimed.
   https://www.cyber.gov.au/business-government/asds-cyber-security-frameworks/essential-eight/essential-eight-maturity-model
-copyright: © Commonwealth of Australia. Material from cyber.gov.au is provided under a Creative Commons
-  Attribution 4.0 International licence and is attributed to the Australian Signals Directorate.
+copyright: |-
+  Essential Eight maturity model (November 2023): © Commonwealth of Australia 2023.
+  Essential Eight assessment process guide and Essential Eight maturity model and ISM mapping (October 2024): © Commonwealth of Australia 2024.
+  Source material is attributed to the Australian Signals Directorate (ASD) and licensed under Creative Commons Attribution 4.0 International (CC BY 4.0): https://creativecommons.org/licenses/by/4.0/
+  Sources:
+  https://www.cyber.gov.au/sites/default/files/2025-03/Essential%20Eight%20maturity%20model%20(November%202023).pdf
+  https://www.cyber.gov.au/business-government/asds-cyber-security-frameworks/essential-eight/essential-eight-assessment-process-guide
+  https://www.cyber.gov.au/business-government/asds-cyber-security-frameworks/essential-eight/essential-eight-maturity-model-and-ism-mapping
+  The source material has been adapted and restructured as a YAML framework with maturity-level tags, ISM identifiers, and assessment guidance. This adaptation is not endorsed by ASD or the Commonwealth of Australia. No Coat of Arms, ASD logo, or third-party material is included.
+  The source publications provide general guidance, not legal advice; the Commonwealth disclaims responsibility for reliance on that guidance. Independent professional advice should be sought for specific circumstances.
 version: 1
 publication_date: '2026-09-29'
 provider: Australian Signals Directorate (ASD)
