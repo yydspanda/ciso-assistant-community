@@ -1,7 +1,7 @@
-import type { Locator } from '@playwright/test';
+import type { Locator, Page } from '@playwright/test';
 import { LoginPage } from '../../utils/login-page.js';
 import { PageContent } from '../../utils/page-content.js';
-import { TestContent, test, expect } from '../../utils/test-utils.js';
+import { TestContent, test, expect, getUniqueValue } from '../../utils/test-utils.js';
 import { m } from '$paraglide/messages';
 import { SideBar } from '../../utils/sidebar.js';
 
@@ -17,6 +17,113 @@ const entityAssessment = {
 	framework: vars.questionnaire.name,
 	representatives: 'third-party@tests.com'
 };
+
+const BACKEND_API_URL = process.env.PUBLIC_BACKEND_API_URL ?? 'http://localhost:8000/api';
+const TEMPLATE_READER_ROLE = 'CFGRC synthetic TPRM template reader 20260930';
+const TEMPLATE_READ_PERMISSIONS = [
+	'view_framework',
+	'view_requirementnode',
+	'view_question',
+	'view_questionchoice'
+];
+const createdRoleAssignmentIds: string[] = [];
+
+type ApiList<T> = T[] | { results: T[] };
+type RelatedObject = { id: string };
+type TemplateReaderRole = {
+	id: string;
+	name: string;
+	builtin: boolean;
+	folder: RelatedObject;
+	permissions: { str: string }[];
+};
+type RootFolder = { id: string; builtin: boolean; parent_folder: null };
+type Respondent = { id: string; email: string; is_active: boolean; is_third_party: boolean };
+type TemplateReadAssignment = {
+	id: string;
+	user: RelatedObject;
+	user_group: null;
+	role: RelatedObject;
+	folder: RelatedObject;
+	perimeter_folders: RelatedObject[];
+	is_recursive: boolean;
+};
+
+async function adminAuthHeaders(page: Page) {
+	const cookies = await page.context().cookies();
+	const token = cookies.find((cookie) => cookie.name === 'token')?.value;
+	if (!token) throw new Error('Admin session is required for the scoped questionnaire fixture');
+	return { 'Content-Type': 'application/json', Authorization: `Token ${token}` };
+}
+
+async function fixtureApiGet<T>(page: Page, path: string): Promise<T> {
+	const response = await page.request.get(`${BACKEND_API_URL}${path}`, {
+		headers: await adminAuthHeaders(page)
+	});
+	expect(response.ok(), `GET ${path} failed with status ${response.status()}`).toBeTruthy();
+	return response.json();
+}
+
+function listItems<T>(response: ApiList<T>): T[] {
+	return Array.isArray(response) ? response : response.results;
+}
+
+async function grantQuestionnaireTemplateRead(page: Page) {
+	// The backend test setup seeds this role because Community's role API is
+	// read-only. Keep its Root template grant separate from native enclave IAM.
+	const roots = listItems(
+		await fixtureApiGet<ApiList<RootFolder>>(page, '/folders/?content_type=GL')
+	);
+	expect(roots).toHaveLength(1);
+	const root = roots[0]!;
+	expect(root.builtin).toBe(true);
+	expect(root.parent_folder).toBeNull();
+	const roles = listItems(
+		await fixtureApiGet<ApiList<TemplateReaderRole>>(
+			page,
+			`/roles/?search=${encodeURIComponent(TEMPLATE_READER_ROLE)}`
+		)
+	).filter((role) => role.name === TEMPLATE_READER_ROLE);
+	expect(roles, 'The backend synthetic template-reader fixture must be seeded').toHaveLength(1);
+	const role = roles[0]!;
+	expect(role.builtin).toBe(false);
+	expect(role.folder.id).toBe(root.id);
+	expect(role.permissions.map((permission) => permission.str).sort()).toEqual(
+		[...TEMPLATE_READ_PERMISSIONS].sort()
+	);
+	const respondents = listItems(
+		await fixtureApiGet<ApiList<Respondent>>(
+			page,
+			`/users/?search=${encodeURIComponent(entityAssessment.representatives)}`
+		)
+	).filter((user) => user.email === entityAssessment.representatives);
+	expect(respondents).toHaveLength(1);
+	const respondent = respondents[0]!;
+	expect(respondent.is_active).toBe(true);
+	expect(respondent.is_third_party).toBe(true);
+	const response = await page.request.post(`${BACKEND_API_URL}/role-assignments/`, {
+		headers: await adminAuthHeaders(page),
+		data: {
+			name: getUniqueValue('TPRM synthetic questionnaire template read'),
+			folder: root.id,
+			role: role.id,
+			user: respondent.id,
+			user_group: null,
+			is_recursive: false,
+			perimeter_folders: [root.id]
+		}
+	});
+	expect(response.ok(), `Template assignment failed with status ${response.status()}`).toBeTruthy();
+	const { id } = (await response.json()) as { id: string };
+	createdRoleAssignmentIds.push(id);
+	const assignment = await fixtureApiGet<TemplateReadAssignment>(page, `/role-assignments/${id}/`);
+	expect(assignment.user.id).toBe(respondent.id);
+	expect(assignment.user_group).toBeNull();
+	expect(assignment.role.id).toBe(role.id);
+	expect(assignment.folder.id).toBe(root.id);
+	expect(assignment.is_recursive).toBe(false);
+	expect(assignment.perimeter_folders.map((folder) => folder.id)).toEqual([root.id]);
+}
 
 test('user can create representatives, solutions and entity assessments inside entity', async ({
 	logedPage,
@@ -139,6 +246,10 @@ test('user can create representatives, solutions and entity assessments inside e
 		await page.getByTestId('compliance-assessment-field-value').locator('a').first().click();
 		await complianceAssessmentsPage.hasUrl();
 		await complianceAssessmentsPage.hasTitle(entityAssessment.name);
+	});
+
+	await test.step('grant the respondent read-only access to Root questionnaire templates', async () => {
+		await grantQuestionnaireTemplateRead(page);
 	});
 
 	await test.step('send questionnaire to third party representatives', async () => {
@@ -323,6 +434,15 @@ test.afterAll('cleanup', async ({ browser }) => {
 
 	await loginPage.goto();
 	await loginPage.login();
+	for (const id of createdRoleAssignmentIds) {
+		const response = await page.request.delete(`${BACKEND_API_URL}/role-assignments/${id}/`, {
+			headers: await adminAuthHeaders(page)
+		});
+		expect(
+			[204, 404],
+			`Template assignment cleanup failed with status ${response.status()}`
+		).toContain(response.status());
+	}
 	await foldersPage.goto();
 
 	await foldersPage.deleteItemButton(vars.folderName).click();

@@ -1267,6 +1267,15 @@ class EntityAssessmentViewSet(BaseModelViewSet):
         audit = instance.compliance_assessment
         if not audit:
             return None
+        # The normal API gives each round its own questionnaire, but legacy or
+        # direct ORM data can still point several rounds at one audit.  In that
+        # shape the audit is not owned exclusively by the round being deleted.
+        if (
+            EntityAssessment.objects.filter(compliance_assessment_id=audit.pk)
+            .exclude(pk=instance.pk)
+            .exists()
+        ):
+            return None
         folder = audit.folder
         if folder.content_type != Folder.ContentType.ENCLAVE:
             return None
@@ -1291,8 +1300,9 @@ class EntityAssessmentViewSet(BaseModelViewSet):
                 target = self._owned_audit_deletion(instance)
                 if target is None:
                     logger.warning(
-                        "Compliance assessment folder is not an Enclave, skipping deletion",
-                        folder=audit.folder,
+                        "keeping_linked_compliance_assessment",
+                        audit_id=str(audit.pk),
+                        folder_id=str(audit.folder_id),
                     )
                 elif isinstance(target, Folder):
                     logger.info(

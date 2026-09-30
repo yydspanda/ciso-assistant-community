@@ -569,6 +569,9 @@ else
 fi
 
 "${UV_RUN[@]}" python3 manage.py createsuperuser --noinput "${DJANGO_ARGS[@]}" || exit $?
+# The browser-only template role is explicit test data, never a startup/default grant.
+"${UV_RUN[@]}" python3 manage.py shell "${DJANGO_ARGS[@]}" -c \
+  "from app_tests.browser_fixtures import seed_tprm_template_reader; seed_tprm_template_reader(synthetic_test_database=True)" || exit $?
 if [[ -n "$STORE_BACKEND_OUTPUT" ]]; then
   nohup "${UV_RUN[@]}" python3 manage.py runserver "$BACKEND_PORT" --noreload "${DJANGO_ARGS[@]}" >"$APP_DIR"/frontend/tests/utils/.testbackendoutput.out 2>&1 &
   echo "You can view the backend server output at $APP_DIR/frontend/tests/utils/.testbackendoutput.out"

@@ -2415,9 +2415,20 @@ class BaseModelViewSet(SparseFieldsMixin, AutocompleteMixin, viewsets.ModelViewS
         folder = Folder.get_folder(obj)
         if folder is None:
             return False
+        # Policy is a permission-bearing proxy over AppliedControl's table;
+        # collector instances use the concrete model, not necessarily Policy.
+        permission_model = (
+            Policy
+            if isinstance(obj, AppliedControl) and obj.category == "policy"
+            else type(obj)
+        )
         try:
-            perm = Permission.objects.get(codename=f"view_{obj._meta.model_name}")
-        except Permission.DoesNotExist:
+            perm = Permission.objects.get(
+                content_type__app_label=permission_model._meta.app_label,
+                content_type__model=permission_model._meta.model_name,
+                codename=f"view_{permission_model._meta.model_name}",
+            )
+        except (Permission.DoesNotExist, Permission.MultipleObjectsReturned):
             return False
         return RoleAssignment.is_access_allowed(
             user=self.request.user, perm=perm, folder=folder
@@ -2702,9 +2713,14 @@ class BaseModelViewSet(SparseFieldsMixin, AutocompleteMixin, viewsets.ModelViewS
         def is_visible(obj):
             folder = Folder.get_folder(obj)
             if folder is None:
-                return True
+                return False
             folder_id = str(folder.id)
-            return folder_id in in_scope_folder_ids or folder_id in viewable_folder_ids
+            in_visible_folder = (
+                folder_id in in_scope_folder_ids or folder_id in viewable_folder_ids
+            )
+            # Aggregate delete or folder read authority does not grant the
+            # permission to disclose every child model's identity/name.
+            return in_visible_folder and self._is_visible_to_requester(obj)
 
         skip_model_names = {
             "Token",
@@ -2739,6 +2755,10 @@ class BaseModelViewSet(SparseFieldsMixin, AutocompleteMixin, viewsets.ModelViewS
             extra_collector.collect(extra_roots)
             for model, objs in extra_collector.model_objs.items():
                 collector.model_objs.setdefault(model, set()).update(objs)
+            # These extra roots also cause SET_NULL/DEFAULT updates outside
+            # their cascade. The affected bucket must report those survivors.
+            for key, updates in extra_collector.field_updates.items():
+                collector.field_updates.setdefault(key, []).extend(updates)
             # PROTECT/RESTRICT blockers on the extra roots stop the real
             # delete too, so they belong in the blocked bucket with the rest.
             collector.protected.update(extra_collector.protected)
@@ -2754,7 +2774,7 @@ class BaseModelViewSet(SparseFieldsMixin, AutocompleteMixin, viewsets.ModelViewS
 
         def add_grouped(bucket, obj):
             model = obj.__class__
-            if is_hidden_model(model):
+            if is_hidden_model(model) or is_the_subject(model, obj):
                 return
             if not is_visible(obj):
                 return

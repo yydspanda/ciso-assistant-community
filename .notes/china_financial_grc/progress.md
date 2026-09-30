@@ -27,7 +27,7 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
 | Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
 | Production acceptance | Legal, privacy, security, records, audit, operations, and production acceptance have not been performed. |
-| Hosted project governance | PR #4 remains open on submitted head `0c4c66820`: 190 checks passed, 25 failed, and one skipped. The authenticated CLI session is restored. A fresh canonical HTTPS fetch resolved `dcce0c55d`; local checkpoint `e6806884a` measures 43 ahead / three behind. The three new upstream commits require a separate reviewed merge. Full backend/browser and exact-head hosted gates remain open; the no-bypass ruleset and weekly read-only monitor remain active. |
+| Hosted project governance | PR #4 remains open on submitted head `0c4c66820`: 190 checks passed, 25 failed, and one skipped. The authenticated CLI session is restored. A fresh canonical HTTPS fetch resolved `dcce0c55d`; dedicated pure merge `426d685da` measures 45 ahead / zero behind. Follow-up authority regressions, full backend/browser, and exact-head hosted gates remain open; the no-bypass ruleset and weekly read-only monitor remain active. |
 
 ## Current verification summary
 
@@ -48,6 +48,17 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   with no skips. Counts overlap and are not full-suite acceptance. Evidence and
   still-open quick-form write/upstream deletion review findings are canonical in
   [CFGRC-REC-20260930-08](progress-archive/2026-09.md#cfgrc-rec-20260930-08).
+- A separate pure two-parent merge now incorporates canonical `dcce0c55d`,
+  with exactly Git's computed merge tree and fresh behind count zero. The
+  pre-merge frontend passed all **46 files / 640 tests** with unchanged source.
+  The merged-tree full **640-test** suite and Community/isolated Enterprise CI
+  builds passed; final browser/full-backend/hosted gates remain open. Separate
+  PostgreSQL deletion/preview/rollback regressions passed **31 tests**, and the
+  explicitly unassigned test-only browser role seed passed **ten tests**.
+  Evidence is in
+  [CFGRC-REC-20260930-10](progress-archive/2026-09.md#cfgrc-rec-20260930-10)
+  and
+  [CFGRC-REC-20260930-09](progress-archive/2026-09.md#cfgrc-rec-20260930-09).
 - Fresh PostgreSQL technical acceptance passed **82 regulatory tests**, bounded
   role probes, migration/rollback checks, synthetic backup/restore fingerprint
   equality, and a restored successor write. The separate fork-upgrade path
@@ -120,10 +131,10 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
    complete upstream-table privileges, production topology, monitoring,
    encryption/key custody, PITR/RPO/RTO, and operations approval remain open.
 10. **The upstream acceptance gate remains open.** Explicit fresh fetch of
-    canonical upstream `dcce0c55d` measured local `e6806884a` 43 ahead / three
-    behind after a successful explicit HTTPS fetch. The previously reviewed
-    merge through `555225678` and attribution correction are committed;
-    the new three-commit successor requires a separate reviewed merge.
+    canonical upstream `dcce0c55d` and pure two-parent merge `426d685da`
+    measured 45 ahead / zero behind. The previously reviewed merge through
+    `555225678` and attribution correction remain intact; the new three-commit
+    successor was incorporated without hiding extension fixes in the merge.
     The local artifact loader/update gate passed. Migration paths and bounded regressions passed;
     full backend, browser, and every hosted check on the exact submitted head
     remain open. The task remains active until that branch
@@ -174,15 +185,14 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
     diagnostic failed; it is not a full pass.
 19. **Additional questionnaire/deletion review is open.** Passing quick-form
     read/requester regressions do not close unscoped creation, moved-parent
-    folder consistency, or submit-versus-mutation races. The freshly fetched
-    upstream TPRM deletion/preview changes require separate ownership and
-    validation-flow review before final acceptance.
+    folder consistency, or submit-versus-mutation races. Bounded TPRM ownership,
+    retained validation-flow history, preview read IAM, and SET_NULL regressions
+    now passed; concurrent clone/link/delete ownership is not claimed safe.
 
 ## Current next action
 
-Converge the diagnosed backend/frontend failures without weakening authority,
-then reconcile the freshly fetched three-commit canonical successor in a
-separate reviewed two-parent merge. Run the unexcluded immutable PostgreSQL
+Complete the remaining questionnaire/cascade authority regressions without
+weakening native IAM or aggregate ownership. Run the unexcluded immutable PostgreSQL
 suite and the proportional merged-tree frontend/browser matrix, and monitor
 every hosted check triggered for the submitted PR #4 head. Merge through the
 no-bypass protected-main path only after those checks pass. Keep the current
@@ -209,6 +219,8 @@ the ten most recent records and does not duplicate their evidence.
 
 | Completed | Record | Task IDs | Result |
 | --- | --- | --- | --- |
+| 2026-09-30 | [CFGRC-REC-20260930-10](progress-archive/2026-09.md#cfgrc-rec-20260930-10) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Merged frontend 640 tests and both CI builds passed; 31 deletion/rollback and ten test-only seed regressions passed; final gates remain open. |
+| 2026-09-30 | [CFGRC-REC-20260930-09](progress-archive/2026-09.md#cfgrc-rec-20260930-09) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Pure canonical successor merge matches computed tree; fresh behind zero and pre-merge 640 frontend tests passed; final acceptance remains open. |
 | 2026-09-30 | [CFGRC-REC-20260930-08](progress-archive/2026-09.md#cfgrc-rec-20260930-08) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Bounded PostgreSQL compatibility/fixture suites passed; further authority review and full acceptance remain open. |
 | 2026-09-30 | [CFGRC-REC-20260930-07](progress-archive/2026-09.md#cfgrc-rec-20260930-07) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Three artifact/loader/update tests and 94 CA API/immutable-parent tests passed; no complete acceptance claimed. |
 | 2026-09-30 | [CFGRC-REC-20260930-06](progress-archive/2026-09.md#cfgrc-rec-20260930-06) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Local two-parent merge checkpoints and attribution-only correction committed; freshly fetched upstream behind count is zero, not release approval. |
@@ -217,8 +229,6 @@ the ten most recent records and does not duplicate their evidence.
 | 2026-09-30 | [CFGRC-REC-20260930-03](progress-archive/2026-09.md#cfgrc-rec-20260930-03) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Merged-working-tree migration, PostgreSQL authority, and frontend checkpoint; full backend/browser/hosted gates still open. |
 | 2026-09-30 | [CFGRC-REC-20260930-02](progress-archive/2026-09.md#cfgrc-rec-20260930-02) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Nested creation bound to route-owned assessment authority; all 370 frontend tests passed before the next upstream merge. |
 | 2026-09-30 | [CFGRC-REC-20260930-01](progress-archive/2026-09.md#cfgrc-rec-20260930-01) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Pre-merge backend security checkpoint committed with local regression evidence; reconciliation remains active. |
-| 2026-08-28 | [CFGRC-REC-20260828-01](progress-archive/2026-08.md#cfgrc-rec-20260828-01) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Canonical historical PR #4 reconciliation/check evidence; old failing head is not release approval. |
-| 2026-08-27 | [CFGRC-REC-20260827-01](progress-archive/2026-08.md#cfgrc-rec-20260827-01) | `CFGRC-P1-READ-REVIEW` | Regulatory audit events isolated from generic workflows without weakening auditlog. |
 
 ## Ledger update rules
 
