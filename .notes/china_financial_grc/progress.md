@@ -27,10 +27,17 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
 | Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
 | Production acceptance | Legal, privacy, security, records, audit, operations, and production acceptance have not been performed. |
-| Hosted project governance | PR #4's last hosted checkpoint remains `54fc8c944`: 16 successful workflows / 215 successful checks / one tag-only skip, zero failures/cancellations. Local candidate `35b76ed2e` passed 749 units, CE/isolated EE builds and all 24 authenticated browser cases; it has not been pushed or hosted-accepted. Explicit canonical fetch on 2026-10-01 at 09:36 UTC resolves `bf3b5d34f`, measuring 54 ahead / one behind for that local candidate. The new dependency upgrade is not silently merged. Publication-owner policy and protected-main merge remain open; strict governance and the weekly read-only monitor remain enabled. |
+| Hosted project governance | PR #4's last hosted checkpoint remains `54fc8c944`: 16 successful workflows / 215 successful checks / one tag-only skip, zero failures/cancellations. Local candidate `35b76ed2e` passed 749 units, CE/isolated EE builds and all 24 authenticated browser cases; it has not been pushed or hosted-accepted. Explicit canonical fetch on 2026-10-01 at 09:36 UTC resolves `bf3b5d34f`, measuring 54 ahead / one behind for that local candidate. The new dependency upgrade is not silently merged. The owner chose a Helm-only canonical-repository guard and allowed fork image mirroring; the verified local policy has not been pushed or deployed to main. New-head hosted checks and protected-main merge remain open; strict governance and the weekly read-only monitor remain enabled. |
 
 ## Current verification summary
 
+- Owner-approved publication policy is implemented locally: the entire Helm
+  publisher requires exact canonical repository identity; fork image mirroring
+  remains repository-scoped and unchanged. Three new dependency-free tests and
+  seven negative controls join the existing CI test entrypoint; local YAML
+  semantics and unchanged mirror/test/monitor bytes are verified. This does not
+  protect old remote refs or mean a publisher was executed. See
+  [CFGRC-REC-20261001-10](progress-archive/2026-10.md#cfgrc-rec-20261001-10).
 - Exact local candidate `35b76ed2e` passed fresh **68 focused / 54 files,
   749 complete frontend units**, scoped types/format, CE and isolated native
   EE builds with all 100 overlay files matching. Actual source/build hashes
@@ -113,24 +120,29 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
     merges `cd09e055d` and `426d685da` preserve canonical ancestry and computed
     trees; extension fixes are not hidden in them. Unexcluded backend-content
     evidence is verified; the locally browser-accepted two-test follow-up is not
-    submitted. Every triggered exact-head hosted gate and publication-owner
-    policy remain open. The new upstream dependency change needs a separate
+    submitted. Every triggered exact-head hosted gate and protected-main merge
+    remain open; the approved Helm-only policy is locally verified, not deployed.
+    The new upstream dependency change needs a separate
     clean reconciliation, not a hidden merge or a rewritten counter. The task stays active until protected
     `main` merge, and weekly fresh-fetch monitoring remains enabled.
-11. **Inherited workflow activation still needs an owner policy.** Opening PR #1
+11. **Approved publication policy is not yet deployed.** Opening PR #1
     registered inherited validation workflows as well as the three fork jobs.
     The write-scoped CLA and OIDC/security-events Plumber workflows were
     explicitly disabled; no CLA was signed. A fresh read-only inventory now
-    confirms `mirror-images.yml` is registered and active, with `packages: write`.
+    confirmed `mirror-images.yml` is registered and active, with `packages: write`.
     Protected main uses a weekly schedule; this PR changes it to daily. Five
     past weekly runs have successful metadata, not independently verified
     package-write contents. Its earlier unregistered API result is historical.
     The Helm publisher targets official `ghcr.io/intuitem/helm-charts/ce`, not
     the fork; its direct API 404 does not prove post-merge inactivity. This PR
-    changes both publishers' main-push path selectors. Explicit owner choice
-    must guard both publishers to the canonical repository, or guard Helm and
-    expressly allow fork mirror writes, or defer main merge. Neither
-    publisher has been dispatched or disabled during this audit.
+    changes both publishers' main-push path selectors. On 2026-10-01 the owner
+    explicitly chose to guard only Helm and allow the existing fork mirror's
+    repository-scoped image writes. The entire local Helm job now requires
+    `intuitem/ciso-assistant-community`, before checkout or registry login;
+    mirror triggers, permissions, pins and destination are unchanged. This
+    decision does not attest successful registry writes, protect old refs/runs,
+    or approve other publishers. Neither publisher was dispatched or disabled;
+    submission, new-head hosted checks and protected-main deployment remain open.
 12. **Historical workflow payloads need a read-only deployment inventory.** New
     regulatory audit entries cannot create generic workflow instances, but no
     target database was inspected for instances created before this boundary.
@@ -178,13 +190,13 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 
 ## Current next action
 
-Obtain the publication-owner choice before the separate publisher-policy change,
-candidate submission and every exact-head hosted/protected-main gate. Keep the
-failed strict dependency-link supplement open for a bounded separate follow-up,
-not a weakened checker or a rewritten pass. Keep the one-behind dependency
-upgrade as a separate clean upstream change and preserve backend-content and
-historical evidence. Named-owner, legal/privacy/security and production
-acceptance remain later work.
+Prepare the final candidate submission and every exact-head hosted/protected-main
+gate with the locally verified Helm-only policy; the owner choice is recorded.
+Keep the failed strict dependency-link supplement open for a bounded separate
+follow-up, not a weakened checker or a rewritten pass. Keep the one-behind
+dependency upgrade as a separate clean upstream change and preserve backend-
+content and historical evidence. Named-owner, legal/privacy/security and
+production acceptance remain later work.
 
 ## Active task board
 
@@ -206,6 +218,7 @@ the ten most recent records and does not duplicate their evidence.
 
 | Completed | Record | Task IDs | Result |
 | --- | --- | --- | --- |
+| 2026-10-01 | [CFGRC-REC-20261001-10](progress-archive/2026-10.md#cfgrc-rec-20261001-10) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Owner chose Helm-only canonical guard and allowed fork image mirroring. Minimal local publisher guard, three CI-discovered tests/seven negative controls and YAML/source-isolation checks passed; no publication/push/main merge. Existing type/packaging failures remain open. |
 | 2026-10-01 | [CFGRC-REC-20261001-09](progress-archive/2026-10.md#cfgrc-rec-20261001-09) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Locked public-dependency acquisition, offline native EE build, actual private store, 100 overlays and source/build freeze passed. Strict dependency-link audit failed on a missing optional native package; overall exit one remains failed, publisher/new-head/main gates remain open. |
 | 2026-10-01 | [CFGRC-REC-20261001-08](progress-archive/2026-10.md#cfgrc-rec-20261001-08) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Local `35b76ed2e`: 68/749 units, CE/isolated EE and actual 24/24 browser cases passed with frozen source/runtime. Full types retain 2061 errors; stricter private-cache packaging supplement failed before building. Latest fresh upstream count 54/1; new-head hosted/publication/main gates remain open. |
 | 2026-10-01 | [CFGRC-REC-20261001-07](progress-archive/2026-10.md#cfgrc-rec-20261001-07) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Two-test follow-up passed 68/749 and 24-case collection with original business/cleanup preserved. Click experiment measured two selected tabs but failed its Actor cleanup assumption; separate exact cleanup passed. Original 18/2/2 and new-candidate/owner gates remain open. |
@@ -215,7 +228,6 @@ the ten most recent records and does not duplicate their evidence.
 | 2026-10-01 | [CFGRC-REC-20261001-03](progress-archive/2026-10.md#cfgrc-rec-20261001-03) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Checkpoint CE/EE and 682 units passed; browser diagnosis and 42 final focused correction tests verified; final-candidate full/browser/hosted gates remain open. |
 | 2026-10-01 | [CFGRC-REC-20261001-02](progress-archive/2026-10.md#cfgrc-rec-20261001-02) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Pure canonical successor merge verified; frozen PostgreSQL 156/69 and merged frontend 682 tests passed; build, type, full backend/browser and hosted release gates remain open. |
 | 2026-10-01 | [CFGRC-REC-20261001-01](progress-archive/2026-10.md#cfgrc-rec-20261001-01) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Fresh frontend 661 tests passed; exact E3 hosted checks ended 203 passed / 12 failed / one skipped; rebooted full-backend outcome unverified, successor and release gates open. |
-| 2026-09-30 | [CFGRC-REC-20260930-11](progress-archive/2026-09.md#cfgrc-rec-20260930-11) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Quick-form authority 37 focused / 93 related regressions passed and bounded independent review accepted; wider races and release gates remain open. |
 
 ## Ledger update rules
 

@@ -16,6 +16,8 @@ concurrency:
 
 jobs:
   publish:
+    # This chart is published to the canonical organisation's registry.
+    if: github.repository == 'intuitem/ciso-assistant-community'
     runs-on: ubuntu-latest
     permissions:
       contents: read

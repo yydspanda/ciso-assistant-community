@@ -675,5 +675,67 @@ Older completed record.
         self.assertIn("FAIL —", stderr.getvalue())
 
 
+class PublicationWorkflowPolicyTests(unittest.TestCase):
+    """Keep the owner's Helm-only guard in the existing dependency-free CI gate."""
+
+    WORKFLOWS = Path(__file__).resolve().parents[3] / ".github" / "workflows"
+    HELM_GUARD = "    if: github.repository == 'intuitem/ciso-assistant-community'"
+
+    def assert_helm_guard(self, workflow: str) -> None:
+        # This is an exact contract for the reviewed one-job YAML, not an Actions
+        # expression interpreter. GitHub evaluates this repository allowlist.
+        jobs = workflow.split("\njobs:\n", 1)[1]
+        self.assertEqual(re.findall(r"(?m)^  ([\w-]+):$", jobs), ["publish"])
+        conditions = re.findall(r"(?m)^    if:.*$", jobs)
+        self.assertEqual(conditions, [self.HELM_GUARD])
+        self.assertLess(jobs.index(self.HELM_GUARD), jobs.index("    steps:"))
+
+    def test_helm_publisher_has_canonical_job_guard(self) -> None:
+        workflow = (self.WORKFLOWS / "helm-build-and-push-ce.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assert_helm_guard(workflow)
+        self.assertIn("oci://ghcr.io/intuitem/helm-charts/ce", workflow)
+        self.assertIn("  workflow_dispatch:\n", workflow)
+
+    def test_missing_step_only_or_weakened_helm_guard_is_rejected(self) -> None:
+        workflow = (self.WORKFLOWS / "helm-build-and-push-ce.yml").read_text(
+            encoding="utf-8"
+        )
+        step_only = workflow.replace(self.HELM_GUARD + "\n", "").replace(
+            "      - name: Checkout\n",
+            "      - name: Checkout\n    " + self.HELM_GUARD + "\n",
+            1,
+        )
+        mutations = (
+            workflow.replace(self.HELM_GUARD + "\n", ""),
+            step_only,
+            workflow.replace(self.HELM_GUARD, "    if: true"),
+            workflow.replace(self.HELM_GUARD, self.HELM_GUARD + " || true"),
+            workflow.replace(
+                self.HELM_GUARD, self.HELM_GUARD.replace("intuitem", "fork-owner")
+            ),
+            workflow.replace(
+                self.HELM_GUARD, "    if: github.repository_owner == 'intuitem'"
+            ),
+            workflow.replace(
+                self.HELM_GUARD,
+                "    if: startsWith(github.repository, 'intuitem/')",
+            ),
+        )
+        for index, mutated in enumerate(mutations):
+            with self.subTest(mutation=index), self.assertRaises(AssertionError):
+                self.assert_helm_guard(mutated)
+
+    def test_fork_mirror_remains_ungated_and_repository_scoped(self) -> None:
+        workflow = (self.WORKFLOWS / "mirror-images.yml").read_text(encoding="utf-8")
+        jobs = workflow.split("\njobs:\n", 1)[1]
+        self.assertEqual(re.findall(r"(?m)^  ([\w-]+):$", jobs), ["mirror"])
+        self.assertNotRegex(jobs, r"(?m)^    if:")
+        self.assertIn("DEST_BASE: ghcr.io/${{ github.repository }}/mirror", jobs)
+        self.assertIn("  packages: write\n", workflow)
+        self.assertIn("  workflow_dispatch:\n", workflow)
+
+
 if __name__ == "__main__":
     unittest.main()
