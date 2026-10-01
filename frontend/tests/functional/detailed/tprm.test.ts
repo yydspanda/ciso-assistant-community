@@ -30,6 +30,73 @@ const TEMPLATE_READ_PERMISSIONS = [
 ];
 const createdRoleAssignmentIds: string[] = [];
 
+async function viewEntityWithReadyInitialTable(
+	page: Page,
+	entitiesPage: PageContent,
+	name: string,
+	expectedDetailUrl?: string
+) {
+	const row = await exactNamedObjectRow(page, name, m.name());
+	const href = await row.getByTestId('tablerow-detail-button').getAttribute('href');
+	if (!href) throw new Error('Expected the exact entity detail link');
+	const detail = new URL(href, page.url());
+	const match = detail.pathname.match(
+		/^\/entities\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i
+	);
+	if (
+		detail.origin !== new URL(page.url()).origin ||
+		!match ||
+		detail.search ||
+		detail.hash ||
+		detail.username ||
+		detail.password ||
+		(expectedDetailUrl !== undefined && detail.href !== expectedDetailUrl)
+	) {
+		throw new Error('Expected a same-origin exact entity UUID detail URL');
+	}
+	async function navigate() {
+		await row.getByTestId('tablerow-detail-button').click();
+		entitiesPage.itemDetail.setItem(name);
+		await page.waitForURL(detail.href);
+	}
+	// Register before navigation: an absent skeleton alone could mean the
+	// first fetch has not started, or failed. Wait for this entity's real page.
+	const [response] = await Promise.all([
+		page.waitForResponse((response) => {
+			const url = new URL(response.url());
+			const limit = url.searchParams.get('limit');
+			return (
+				response.request().method() === 'GET' &&
+				url.origin === detail.origin &&
+				url.pathname === '/entity-assessments' &&
+				url.searchParams.getAll('entity').length === 1 &&
+				url.searchParams.get('entity') === match[1] &&
+				url.searchParams.getAll('offset').length === 1 &&
+				url.searchParams.get('offset') === '0' &&
+				url.searchParams.getAll('limit').length === 1 &&
+				limit !== null &&
+				/^[1-9][0-9]*$/.test(limit)
+			);
+		}),
+		navigate()
+	]);
+	await expect(page).toHaveURL(detail.href);
+	expect(response.status()).toBe(200);
+	expect(await response.finished()).toBeNull();
+	const payload = await response.json();
+	expect(Array.isArray(payload.results)).toBe(true);
+	expect(Number.isInteger(payload.count) && payload.count >= 0).toBe(true);
+	await page.locator('body[data-hydrated="true"]').waitFor({ state: 'attached' });
+	const initialTab = page.getByRole('tab', { name: 'Entity assessments', exact: true });
+	await expect(initialTab).toHaveAttribute('aria-selected', 'true');
+	const panel = page.getByRole('tabpanel', { name: 'Entity assessments', exact: true });
+	await expect(panel).toHaveCount(1);
+	await expect(panel).toBeVisible();
+	await expect(panel.getByRole('table')).toHaveCount(1);
+	await expect(panel.getByTestId('row-skeleton')).toHaveCount(0);
+	return detail.href;
+}
+
 type ApiList<T> = T[] | { results: T[] };
 type RelatedObject = { id: string };
 type TemplateReaderRole = {
@@ -142,6 +209,7 @@ test('user can create representatives, solutions and entity assessments inside e
 	mailer,
 	page
 }) => {
+	let entityDetailUrl: string | undefined;
 	await test.step('create required folder', async () => {
 		await foldersPage.goto();
 		await foldersPage.hasUrl();
@@ -185,11 +253,19 @@ test('user can create representatives, solutions and entity assessments inside e
 		await entitiesPage.goto();
 		await entitiesPage.hasUrl();
 		await entitiesPage.createItem(testObjectsData.entitiesPage.build);
-		await entitiesPage.viewItemDetail(testObjectsData.entitiesPage.build.name);
+		entityDetailUrl = await viewEntityWithReadyInitialTable(
+			page,
+			entitiesPage,
+			testObjectsData.entitiesPage.build.name
+		);
 	});
 
 	await test.step('create solution', async () => {
 		await page.getByRole('tab', { name: 'Solutions' }).click();
+		await expect(page.getByRole('tab', { name: 'Solutions' })).toHaveAttribute(
+			'aria-selected',
+			'true'
+		);
 		await solutionsPage.createItem(
 			{
 				name: 'Test solution'
@@ -202,6 +278,10 @@ test('user can create representatives, solutions and entity assessments inside e
 
 	await test.step('create representative', async () => {
 		await page.getByRole('tab', { name: 'Representatives' }).click();
+		await expect(page.getByRole('tab', { name: 'Representatives' })).toHaveAttribute(
+			'aria-selected',
+			'true'
+		);
 		await representativesPage.createItem(
 			{
 				email: 'third-party@tests.com',
@@ -216,6 +296,10 @@ test('user can create representatives, solutions and entity assessments inside e
 
 	await test.step('verify that user was created alongside representative', async () => {
 		await page.getByRole('tab', { name: 'Representatives' }).click();
+		await expect(page.getByRole('tab', { name: 'Representatives' })).toHaveAttribute(
+			'aria-selected',
+			'true'
+		);
 		await representativesPage.viewItemDetail('third-party@tests.com');
 		await expect(page.getByTestId('user-field-value')).not.toBeEmpty();
 		await page.getByTestId('user-field-value').locator('a').first().click();
@@ -225,11 +309,21 @@ test('user can create representatives, solutions and entity assessments inside e
 
 	await test.step('go back to entity detail', async () => {
 		await entitiesPage.goto();
-		await entitiesPage.viewItemDetail(testObjectsData.entitiesPage.build.name);
+		if (!entityDetailUrl) throw new Error('The created entity detail URL was not retained');
+		await viewEntityWithReadyInitialTable(
+			page,
+			entitiesPage,
+			testObjectsData.entitiesPage.build.name,
+			entityDetailUrl
+		);
 	});
 
 	await test.step('create entity assessment', async () => {
 		await page.getByRole('tab', { name: 'Entity assessments' }).click();
+		await expect(page.getByRole('tab', { name: 'Entity assessments' })).toHaveAttribute(
+			'aria-selected',
+			'true'
+		);
 		await entityAssessmentsPage.createItem(
 			entityAssessment,
 			undefined,

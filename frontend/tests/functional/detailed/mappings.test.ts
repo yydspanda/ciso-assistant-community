@@ -1,3 +1,4 @@
+import type { Page } from '@playwright/test';
 import { m } from '$paraglide/messages.js';
 import { FormContent, FormFieldType } from '../../utils/form-content.js';
 import { LoginPage } from '../../utils/login-page.js';
@@ -20,6 +21,31 @@ const BACKEND_API_URL = process.env.PUBLIC_BACKEND_API_URL ?? 'http://localhost:
 // Each serial scenario gets a new page; retain only verified resource URLs.
 let sourceAssessmentDetailUrl: string | undefined;
 let mappedAssessmentDetailUrl: string | undefined;
+let pullTargetAssessmentDetailUrl: string | undefined;
+
+const pullTargetName = 'PullTarget-' + vars.assessmentName;
+
+// The target is excluded from the picker and the mapped source name is unique.
+// The serial repeat uses a fresh page, not the first application's UI state.
+async function openMapFromPreview(
+	page: Page,
+	complianceAssessmentsPage: PageContent,
+	targetDetailUrl: string
+) {
+	await complianceAssessmentsPage.goto();
+	await complianceAssessmentsPage.hasUrl();
+	await complianceAssessmentsPage.viewItemDetail(pullTargetName);
+	await expect(page).toHaveURL(targetDetailUrl);
+	await page.getByTestId('apply-mapping-button').click();
+	await page.getByTestId('map-from-audit-card').click();
+	const mapFromForm = new FormContent(page, m.mapFromAudit(), [
+		{ name: 'source_audit', type: FormFieldType.SELECT_AUTOCOMPLETE }
+	]);
+	await mapFromForm.hasTitle();
+	await mapFromForm.fill({ source_audit: 'Mapped-' + vars.assessmentName });
+	await page.getByTestId('map-from-submit-button').click();
+	await page.waitForURL(/map-from-preview/);
+}
 
 test.describe.configure({ mode: 'serial' });
 
@@ -262,7 +288,7 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 	});
 });
 
-test('user can map from an audit with an idempotent repeat', async ({
+test('user can map from an audit into an empty target', async ({
 	page,
 	logedPage,
 	complianceAssessmentsPage
@@ -272,34 +298,12 @@ test('user can map from an audit with an idempotent repeat', async ({
 		throw new Error('The preceding serial scenario did not retain an exact mapped audit URL');
 	}
 	await reopenAuditDetail(page, mappedDetailUrl);
-	const applyMappingButton = page.getByTestId('apply-mapping-button');
 
 	// Map-from = inbound direction (pull a source audit's results INTO the
 	// current one). We create a fresh, empty target audit and pull the
 	// previously-mapped audit into it twice: the first pull applies the data
 	// (changes exist -> confirm), the second is a no-op (idempotent -> the
 	// no-changes notice shows and confirmation is disabled).
-	const pullTargetName = 'PullTarget-' + vars.assessmentName;
-
-	// Helper: open the empty target audit, run "Apply mapping -> Map from an
-	// audit" sourcing the mapped audit, and land on the preview page. The
-	// target is excluded from the picker, and the mapped audit's name is unique,
-	// so the source selection is unambiguous.
-	async function openMapFromPreview() {
-		await complianceAssessmentsPage.goto();
-		await complianceAssessmentsPage.hasUrl();
-		await complianceAssessmentsPage.viewItemDetail(pullTargetName);
-		await applyMappingButton.click();
-		await page.getByTestId('map-from-audit-card').click();
-		const mapFromForm = new FormContent(page, m.mapFromAudit(), [
-			{ name: 'source_audit', type: FormFieldType.SELECT_AUTOCOMPLETE }
-		]);
-		await mapFromForm.hasTitle();
-		await mapFromForm.fill({ source_audit: 'Mapped-' + vars.assessmentName });
-		await page.getByTestId('map-from-submit-button').click();
-		await page.waitForURL(/map-from-preview/);
-	}
-
 	await test.step('create an empty target audit for map-from', async () => {
 		await complianceAssessmentsPage.goto();
 		await complianceAssessmentsPage.hasUrl();
@@ -309,6 +313,7 @@ test('user can map from an audit with an idempotent repeat', async ({
 			folder: vars.folderName,
 			framework: vars.framework.name
 		});
+		pullTargetAssessmentDetailUrl = await waitForAuditDetail(page, mappedDetailUrl);
 
 		// Enable scoring so the target accepts scored data from the source.
 		await page.getByTestId('edit-button').click();
@@ -322,18 +327,35 @@ test('user can map from an audit with an idempotent repeat', async ({
 		await page.getByTestId('save-button').click();
 		await page.waitForTimeout(5000);
 	});
+	const targetDetailUrl = pullTargetAssessmentDetailUrl;
+	if (!targetDetailUrl || !isAuditDetailUrl(targetDetailUrl)) {
+		throw new Error('Creating the empty target did not retain an exact audit detail URL');
+	}
 
 	await test.step('map from into the empty target: changes are applied', async () => {
-		await openMapFromPreview();
+		await openMapFromPreview(page, complianceAssessmentsPage, targetDetailUrl);
 		// The target is empty, so the mapping produces changes and confirm is enabled.
 		await expect(page.getByTestId('confirm-mapping-button')).toBeEnabled();
 		await page.getByTestId('confirm-mapping-button').click();
 		await page.waitForURL(isAuditDetailUrl);
+		await expect(page).toHaveURL(targetDetailUrl);
 		await complianceAssessmentsPage.isToastVisible('updated successfully', 'i');
 	});
+});
+
+test('reapplying inbound audit mapping makes no changes', async ({
+	page,
+	logedPage,
+	complianceAssessmentsPage
+}) => {
+	const targetDetailUrl = pullTargetAssessmentDetailUrl;
+	if (!targetDetailUrl || !isAuditDetailUrl(targetDetailUrl)) {
+		throw new Error('The preceding serial scenario did not retain an exact pull target audit URL');
+	}
+	await reopenAuditDetail(page, targetDetailUrl);
 
 	await test.step('map from again: no change (idempotent)', async () => {
-		await openMapFromPreview();
+		await openMapFromPreview(page, complianceAssessmentsPage, targetDetailUrl);
 		// The target now mirrors the source, so nothing would change: the
 		// no-changes notice shows and confirmation is disabled.
 		await expect(page.getByTestId('map-from-no-changes')).toBeVisible();

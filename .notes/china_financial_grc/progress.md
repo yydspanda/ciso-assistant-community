@@ -27,34 +27,46 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
 | Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
 | Production acceptance | Legal, privacy, security, records, audit, operations, and production acceptance have not been performed. |
-| Hosted project governance | PR #4 remains open; its last fully audited checkpoint is `cbb524c9e`. All 216 checks at that checkpoint are terminal: 213 successful / two mapping failures / one tag-only skipped; backend coverage passed naturally. Fresh canonical fetch on 2026-10-01 resolves `a88f2c2db`, 52 ahead / zero behind at that checkpoint. Pure merges `cd09e055d` and `426d685da` remain intact. The separate four-file test-only scenario/cleanup correction passed isolated verification and independent review; new-head acceptance, publication-owner policy and protected-main merge remain open. Ruleset 21569001 remains active with zero bypass actors and strict governance; the weekly read-only monitor remains active. |
+| Hosted project governance | PR #4 remains open at audited checkpoint `54fc8c944`. All 16 workflows succeeded; all 216 checks are terminal: 215 successful / one tag-only skipped, with no failures/cancellations; backend coverage passed naturally. Explicit canonical fetch on 2026-10-01 resolves `a88f2c2db`, 53 ahead / zero behind at that checkpoint. Pure merges `cd09e055d` and `426d685da` remain intact. Local browser acceptance still fails 18/2/2. A local two-test follow-up passed isolated verification, not new-candidate browser acceptance. Publication-owner policy and protected-main merge remain open. Ruleset 21569001 remains active with zero bypass actors and strict governance; the weekly read-only monitor remains active. |
 
 ## Current verification summary
 
-- Exact `cbb524c9e` CE and isolated native EE builds passed; its complete
-  frontend unit suite passed **53 files / 732 tests**. Frozen authenticated
-  Chromium/Firefox execution ended **15 passed / three failed / zero not run**.
+- Exact `54fc8c944` CE and isolated native EE builds passed; its complete
+  frontend unit suite passed **54 files / 749 tests**. Frozen authenticated
+  Chromium/Firefox execution ended **18 passed / two failed / two not run**;
+  Chromium passes all 11, Firefox passes seven and skips two TPRM dependencies.
   Light/dark 320px register automation found zero axe violations or horizontal
   overflow, with one manual-review item each. These are not future-candidate
   browser or full accessibility acceptance.
-- Both local mapping failures exhaust the whole-test deadline after valid
-  source/target work. Chromium passes non-default ID.RM-1; Firefox times out
-  earlier and does not reach it. The private serial scenario split preserves
-  all eight steps, 23 business assertions and 96 original business awaits, adds two
-  fresh-page reopens, and collects **22 two-engine cases** without changing
-  timeout/retry defaults. Final four-file follow-up passed **88 focused / 749
-  complete units**, scoped types/format, exact collection and frozen-source
-  independent review; new-head
-  build/browser/hosted verification remains open.
-- Firefox TPRM business steps pass, but `afterAll` fails because the substring
-  first-row helper deletes the prefix-matching `foo` domain twice before
-  refresh, leaving the base domain. A test-only own-Name-column exact locator
-  and deletion-refresh wait are verified in 17 DOM regressions and reused
-  explicitly in mapping cleanup. Both domains require final count zero;
-  production table/IAM stays
-  unchanged. The prior Solutions-tab failure did not recur and is not
-  retroactively claimed fixed. Canonical evidence is in
-  [CFGRC-REC-20261001-05](progress-archive/2026-10.md#cfgrc-rec-20261001-05).
+- Both engines pass source persistence and non-default outbound mapping.
+  Firefox inbound first-pull passes, but its idempotent repeat exceeds the
+  whole-test deadline; assertions after that deadline do not establish a pass.
+  A separate private five-scenario split preserves all eight steps, 23 business
+  assertions and 98 original awaits, adding exact target-URL bindings and a
+  fresh-page reopen. It passed **68 focused / 749 complete units**, scoped
+  types/format, **24-case collection** and independent frozen-source/AST review.
+  Default budgets/retries stay unchanged. That split and a scoped initial-table
+  readiness contract are now copied into the local candidate's two test files,
+  after **68 focused / 749 complete units** and **24-case collection** passed.
+  The final TPRM navigation clicks the verified own-Name row directly; fresh
+  frozen checks and independent five-negative-control review passed again.
+  TPRM retains all three cases / 22 steps and its original cleanup. Actual
+  new-candidate builds/browser/hosted acceptance remain open.
+- Firefox TPRM again fails at the Solutions workflow: its page/component is
+  hydrated, but the clicked tab remains unselected and Add solution is absent.
+  Cleanup independently returns native 204 for two distinct correctly selected
+  domains, yet paginated responses/the DOM retain the workaround domain.
+  This is not the earlier substring-first repeated deletion. The original
+  trace also shows placeholder removal and a 245px scroll change during the
+  tab click; actual mouse-event targets and the mechanism remain unproven.
+  A fresh-context read-only cache-config experiment observes current authorised
+  native and frontend absence, not historical cache cause or repaired browser
+  acceptance. A new n=1-per-condition click experiment selected the tab in
+  both conditions, but exited one at an unreachable Actor cleanup detail.
+  Separate exact native cleanup succeeded without changing settings or IAM;
+  the failed experiment remains immutable. This does not prove the original
+  mechanism or initial-load click reliability. Canonical evidence is in
+  [CFGRC-REC-20261001-07](progress-archive/2026-10.md#cfgrc-rec-20261001-07).
 - Exact-checkpoint full type checking failed with **2061 errors / 857 warnings /
   467 files**; its auditee route retains **11 errors / three warnings**, with no
   new owned-file diagnostic messages/multiplicities. No passing full-type
@@ -103,12 +115,14 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
    complete upstream-table privileges, production topology, monitoring,
    encryption/key custody, PITR/RPO/RTO, and operations approval remain open.
 10. **The upstream acceptance gate remains open.** Explicit fresh fetch resolves
-    canonical `a88f2c2db`; submitted checkpoint `cbb524c9e` measures **52 ahead /
-    zero behind**, but has two failed hosted mapping checks and three local
-    browser failures. Separate pure two-parent
+    canonical `a88f2c2db`; submitted checkpoint `54fc8c944` measures **53 ahead /
+    zero behind** and every runnable exact-head hosted check passed, but its
+    local browser run still has two failures and two dependent cases not run.
+    Separate pure two-parent
     merges `cd09e055d` and `426d685da` preserve canonical ancestry and computed
     trees; extension fixes are not hidden in them. Unexcluded backend-content
-    evidence is verified; the next candidate's unit/build, authenticated browser
+    evidence is verified; the locally verified two-test follow-up is not a
+    submitted or browser-accepted candidate. Its new-head unit/build, authenticated browser
     and every triggered exact-head hosted gate remain open. The task stays active until protected
     `main` merge, and weekly fresh-fetch monitoring remains enabled.
 11. **Inherited workflow activation still needs an owner policy.** Opening PR #1
@@ -119,10 +133,11 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
     Protected main uses a weekly schedule; this PR changes it to daily. Five
     past weekly runs have successful metadata, not independently verified
     package-write contents. Its earlier unregistered API result is historical.
-    The Helm publisher's direct API still returns 404, which does not prove it
-    cannot activate after merge. This PR changes both publishers' main-push
-    path selectors. Explicit owner approval for a fork publication guard or
-    fork package writes is required before protected-main merge; neither
+    The Helm publisher targets official `ghcr.io/intuitem/helm-charts/ce`, not
+    the fork; its direct API 404 does not prove post-merge inactivity. This PR
+    changes both publishers' main-push path selectors. Explicit owner choice
+    must guard both publishers to the canonical repository, or guard Helm and
+    expressly allow fork mirror writes, or defer main merge. Neither
     publisher has been dispatched or disabled during this audit.
 12. **Historical workflow payloads need a read-only deployment inventory.** New
     regulatory audit entries cannot create generic workflow instances, but no
@@ -171,10 +186,11 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 
 ## Current next action
 
-Verify the exact candidate containing the reviewed scenario/cleanup test-only correction
-with fresh CE/isolated EE builds, complete frontend units, all 22 authenticated
-Chromium/Firefox cases and every exact-head hosted check. Bind the complete
-unexcluded backend evidence to its unchanged actual backend bytes.
+Freeze the final local two-test follow-up and verify its candidate with fresh
+CE/isolated EE builds, complete frontend units, all 24 authenticated Chromium/
+Firefox cases and every exact-head hosted check. Preserve any residual initial-
+load click or native cleanup failure instead of claiming its old mechanism fixed.
+Bind the complete unexcluded backend evidence to unchanged actual backend bytes.
 Resolve the outstanding publication-owner decision before merging the precisely verified candidate
 through protected main. Keep the stage/task pointers; named-owner and production
 acceptance remain later work.
@@ -199,6 +215,8 @@ the ten most recent records and does not duplicate their evidence.
 
 | Completed | Record | Task IDs | Result |
 | --- | --- | --- | --- |
+| 2026-10-01 | [CFGRC-REC-20261001-07](progress-archive/2026-10.md#cfgrc-rec-20261001-07) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Two-test follow-up passed 68/749 and 24-case collection with original business/cleanup preserved. Click experiment measured two selected tabs but failed its Actor cleanup assumption; separate exact cleanup passed. Original 18/2/2 and new-candidate/owner gates remain open. |
+| 2026-10-01 | [CFGRC-REC-20261001-06](progress-archive/2026-10.md#cfgrc-rec-20261001-06) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Exact 749 units / CE / EE passed; hosted checks: 215 success / one tag-only skip / zero failures. Local browser failed 18/2/2. Private inbound correction passed 68/749 and 24-case collection; cache-config experiment records current authorised-read absence, not historical cause. Release/owner gates remain open. |
 | 2026-10-01 | [CFGRC-REC-20261001-05](progress-archive/2026-10.md#cfgrc-rec-20261001-05) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Exact 732 units / CE / EE and backend-content evidence passed; browser failed 15/3/0, hosted 213/2/1; separate test-only correction passed 88/749 and 22-case collection; final gates and publication-owner decision remain open. |
 | 2026-10-01 | [CFGRC-REC-20261001-04](progress-archive/2026-10.md#cfgrc-rec-20261001-04) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Exact checkpoint CE/EE and 703 units passed; browser failed 8/6/4, full types remain failed; separate test-only correction passed 71 focused / 732 complete units, final gates remain open. |
 | 2026-10-01 | [CFGRC-REC-20261001-03](progress-archive/2026-10.md#cfgrc-rec-20261001-03) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Checkpoint CE/EE and 682 units passed; browser diagnosis and 42 final focused correction tests verified; final-candidate full/browser/hosted gates remain open. |
@@ -207,8 +225,6 @@ the ten most recent records and does not duplicate their evidence.
 | 2026-09-30 | [CFGRC-REC-20260930-11](progress-archive/2026-09.md#cfgrc-rec-20260930-11) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Quick-form authority 37 focused / 93 related regressions passed and bounded independent review accepted; wider races and release gates remain open. |
 | 2026-09-30 | [CFGRC-REC-20260930-10](progress-archive/2026-09.md#cfgrc-rec-20260930-10) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Merged frontend 640 tests and both CI builds passed; 31 deletion/rollback and ten test-only seed regressions passed; final gates remain open. |
 | 2026-09-30 | [CFGRC-REC-20260930-09](progress-archive/2026-09.md#cfgrc-rec-20260930-09) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Pure canonical successor merge matches computed tree; fresh behind zero and pre-merge 640 frontend tests passed; final acceptance remains open. |
-| 2026-09-30 | [CFGRC-REC-20260930-08](progress-archive/2026-09.md#cfgrc-rec-20260930-08) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Bounded PostgreSQL compatibility/fixture suites passed; further authority review and full acceptance remain open. |
-| 2026-09-30 | [CFGRC-REC-20260930-07](progress-archive/2026-09.md#cfgrc-rec-20260930-07) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Three artifact/loader/update tests and 94 CA API/immutable-parent tests passed; no complete acceptance claimed. |
 
 ## Ledger update rules
 
