@@ -1,15 +1,20 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Locator, Page } from '@playwright/test';
 import {
+	auditFrameworkUuid,
 	ensureAuditTreeExpanded,
 	expandedAuditTreeItem,
 	isAuditDetailUrl,
+	isNewAuditDetailUrl,
 	reopenAuditDetail,
 	waitForAuditDetail
 } from '../../../tests/utils/audit-navigation';
 
 const detailUrl =
 	'http://localhost:4173/compliance-assessments/12345678-1234-1234-1234-123456789abc';
+const targetUrl =
+	'http://localhost:4173/compliance-assessments/87654321-1234-1234-1234-123456789abc';
+const frameworkUuid = '12345678-1234-1234-1234-123456789abc';
 
 function fixture(expanded = false) {
 	const hydrated = { waitFor: vi.fn().mockResolvedValue(undefined) };
@@ -37,6 +42,78 @@ function fixture(expanded = false) {
 }
 
 describe('functional audit navigation', () => {
+	it.each([frameworkUuid, frameworkUuid.toUpperCase(), { id: frameworkUuid }])(
+		'normalizes native scalar/nested framework UUID references: %j',
+		(reference) => expect(auditFrameworkUuid(reference)).toBe(frameworkUuid)
+	);
+
+	it.each([
+		undefined,
+		null,
+		'',
+		{},
+		{ id: null },
+		{ id: 1 },
+		1,
+		`${frameworkUuid}/edit`,
+		'urn:intuitem:risk:framework:nist-csf-1.1'
+	])('rejects missing and malformed framework references: %j', (reference) =>
+		expect(auditFrameworkUuid(reference)).toBeUndefined()
+	);
+
+	it.each([
+		detailUrl,
+		`${detailUrl}?tab=requirements`,
+		detailUrl.toUpperCase().replace('HTTP:', 'http:'),
+		`http://127.0.0.1:4173${new URL(detailUrl).pathname}`
+	])('rejects the old audit identity despite query, case, or origin changes: %s', (url) =>
+		expect(isNewAuditDetailUrl(url, detailUrl)).toBe(false)
+	);
+
+	it.each([targetUrl, `${targetUrl}?tab=requirements`, new URL(targetUrl)])(
+		'accepts a genuinely different exact audit UUID: %s',
+		(url) => expect(isNewAuditDetailUrl(url, detailUrl)).toBe(true)
+	);
+
+	it.each([`${targetUrl}/edit?next=${new URL(targetUrl).pathname}`, `${targetUrl}/`, 'not a URL'])(
+		'rejects non-detail new-target lookalikes: %s',
+		(url) => expect(isNewAuditDetailUrl(url, detailUrl)).toBe(false)
+	);
+
+	it('rejects an invalid source instead of accepting an arbitrary target', () => {
+		expect(isNewAuditDetailUrl(targetUrl, `${detailUrl}/edit`)).toBe(false);
+	});
+
+	it('does not mistake different framework UUIDs for the same identity', () => {
+		expect(auditFrameworkUuid({ id: new URL(targetUrl).pathname.split('/').at(-1) })).not.toBe(
+			auditFrameworkUuid(frameworkUuid)
+		);
+	});
+
+	it('awaits the new UUID before hydration without forcing a navigation', async () => {
+		const { page, hydrated, goto } = fixture();
+		vi.mocked(page.url).mockReturnValue(targetUrl);
+		expect(await waitForAuditDetail(page, detailUrl)).toBe(targetUrl);
+		const predicate = vi.mocked(page.waitForURL).mock.calls[0]![0] as (url: URL) => boolean;
+		expect(predicate(new URL(detailUrl))).toBe(false);
+		expect(predicate(new URL(`${detailUrl}?next=${new URL(targetUrl).pathname}`))).toBe(false);
+		expect(predicate(new URL(targetUrl))).toBe(true);
+		expect(vi.mocked(page.waitForURL).mock.invocationCallOrder[0]).toBeLessThan(
+			hydrated.waitFor.mock.invocationCallOrder[0]!
+		);
+		expect(goto).not.toHaveBeenCalled();
+	});
+
+	it('rejects a non-detail source before waiting or requesting another page', async () => {
+		const { page, hydrated, goto } = fixture();
+		await expect(waitForAuditDetail(page, `${detailUrl}/edit`)).rejects.toThrow(
+			'Expected an exact source audit detail pathname'
+		);
+		expect(page.waitForURL).not.toHaveBeenCalled();
+		expect(hydrated.waitFor).not.toHaveBeenCalled();
+		expect(goto).not.toHaveBeenCalled();
+	});
+
 	it.each([detailUrl, `${detailUrl}?tab=requirements`, new URL(detailUrl)])(
 		'accepts an exact audit detail pathname: %s',
 		(url) => expect(isAuditDetailUrl(url)).toBe(true)

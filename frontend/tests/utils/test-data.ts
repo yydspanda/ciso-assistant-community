@@ -35,6 +35,18 @@ export const mappingPrerequisites = {
 	]
 } as const;
 
+export const questionnaire = {
+	name: 'CMMC version 2.0',
+	ref: 'CMMC-2.0',
+	urn: 'urn:intuitem:risk:framework:cmmc-2.0',
+	firstRequirement: {
+		urn: 'urn:intuitem:risk:req_node:cmmc-2.0:ac.l1-3.1.1',
+		parentUrn: 'urn:intuitem:risk:req_node:cmmc-2.0:ac',
+		ref: 'AC.L1-3.1.1',
+		name: 'Authorized Access Control'
+	}
+} as const;
+
 export default {
 	mappingPrerequisites,
 	assessmentName: 'Test assessment',
@@ -629,11 +641,7 @@ export default {
 		ref: 'NIST-CSF-1.1',
 		urn: 'urn:intuitem:risk:library:nist-csf-1.1'
 	},
-	questionnaire: {
-		name: 'CMMC version 2.0',
-		ref: 'CMMC-2.0',
-		urn: 'urn:intuitem:risk:framework:cmmc-2.0'
-	},
+	questionnaire,
 	matrix: {
 		name: 'Critical risk matrix 5x5',
 		displayName: 'critical 5x5',

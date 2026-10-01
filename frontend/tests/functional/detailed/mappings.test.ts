@@ -5,6 +5,7 @@ import { PageContent } from '../../utils/page-content.js';
 import { expect, test, TestContent } from '../../utils/test-utils.js';
 import { mappingPrerequisites } from '../../utils/test-data.js';
 import {
+	auditFrameworkUuid,
 	expandedAuditTreeItem,
 	isAuditDetailUrl,
 	reopenAuditDetail,
@@ -14,6 +15,7 @@ import {
 const vars = TestContent.generateTestVars();
 const testObjectsData: { [k: string]: any } = TestContent.itemBuilder(vars);
 const FOLDER_WORKAROUND_SUFFIX = ' foo';
+const BACKEND_API_URL = process.env.PUBLIC_BACKEND_API_URL ?? 'http://localhost:8000/api';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -174,7 +176,35 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 			'The audit object has been successfully created',
 			'i'
 		);
-		mappedAssessmentDetailUrl = await waitForAuditDetail(page);
+		// A source detail already satisfies the generic pathname predicate while
+		// the new target's SPA navigation is still pending. Wait for a new UUID.
+		mappedAssessmentDetailUrl = await waitForAuditDetail(page, sourceAssessmentDetailUrl);
+		const mappedId = new URL(mappedAssessmentDetailUrl).pathname.split('/').at(-1);
+		expect(mappedId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i);
+		const token = (await page.context().cookies()).find((cookie) => cookie.name === 'token')?.value;
+		if (!token) throw new Error('The logged-in browser did not expose its API token cookie');
+		const headers = { Authorization: `Token ${token}` };
+		const targetResponse = await page.request.get(
+			`${BACKEND_API_URL}/compliance-assessments/${mappedId}/`,
+			{ headers }
+		);
+		expect(targetResponse.status()).toBe(200);
+		const target = await targetResponse.json();
+		expect(target.id).toBe(mappedId);
+		expect(target.name).toBe('Mapped-' + vars.assessmentName);
+		const targetFrameworkId = auditFrameworkUuid(target.framework);
+		expect(targetFrameworkId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i);
+		expect(target.framework.urn).toBe('urn:intuitem:risk:framework:nist-csf-1.1');
+		const frameworkResponse = await page.request.get(
+			`${BACKEND_API_URL}/frameworks/${targetFrameworkId}/`,
+			{ headers }
+		);
+		expect(frameworkResponse.status()).toBe(200);
+		expect(await frameworkResponse.json()).toMatchObject({
+			id: targetFrameworkId,
+			urn: 'urn:intuitem:risk:framework:nist-csf-1.1',
+			name: vars.framework.name
+		});
 	});
 	await test.step('verify that mapping worked correctly', async () => {
 		const IDAM1TreeViewItem = await expandedAuditTreeItem(

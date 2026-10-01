@@ -4,6 +4,7 @@ import { PageContent } from '../../utils/page-content.js';
 import { TestContent, test, expect, getUniqueValue } from '../../utils/test-utils.js';
 import { m } from '$paraglide/messages';
 import { SideBar } from '../../utils/sidebar.js';
+import { questionnaire } from '../../utils/test-data.js';
 
 let vars = TestContent.generateTestVars();
 let testObjectsData: { [k: string]: any } = TestContent.itemBuilder(vars);
@@ -375,7 +376,10 @@ test('third-party representative can fill their assigned audit', async ({
 		await expect(nextButton).toBeVisible();
 		await nextButton.click();
 		await expect(
-			page.getByRole('heading', { name: 'Authorized Access Control', exact: true })
+			page.getByRole('heading', {
+				name: `${questionnaire.firstRequirement.ref} - ${questionnaire.firstRequirement.name}`,
+				exact: true
+			})
 		).toBeVisible();
 		await expect(page.getByRole('button', { name: 'Yes', exact: true }).first()).toBeVisible();
 

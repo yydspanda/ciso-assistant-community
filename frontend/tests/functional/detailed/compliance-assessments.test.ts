@@ -4,6 +4,7 @@ import { TestContent, test, expect } from '../../utils/test-utils.js';
 import { m } from '$paraglide/messages';
 import type { Locator } from '@playwright/test';
 import {
+	auditFrameworkUuid,
 	expandedAuditTreeItem,
 	isAuditDetailUrl,
 	reopenAuditDetail,
@@ -329,6 +330,8 @@ test('cloning an audit proposes and persists its same-framework custom score sca
 		`baseline scale PATCH failed: ${seedResponse.status()} ${baselineBody}`
 	).toBeTruthy();
 	const baseline = JSON.parse(baselineBody);
+	const baselineFrameworkId = auditFrameworkUuid(baseline.framework);
+	expect(baselineFrameworkId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i);
 	expect(baseline).toMatchObject(customScale);
 	expect(baseline.field_visibility).toMatchObject({
 		score: everyone,
@@ -413,8 +416,10 @@ test('cloning an audit proposes and persists its same-framework custom score sca
 		`clone detail failed: ${cloneResponse.status()} ${cloneBody}`
 	).toBeTruthy();
 	const clone = JSON.parse(cloneBody);
+	const cloneFrameworkId = auditFrameworkUuid(clone.framework);
+	expect(cloneFrameworkId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i);
 	expect(clone.name).toBe(cloneName);
-	expect(clone.framework?.id).toBe(baseline.framework?.id);
+	expect(cloneFrameworkId).toBe(baselineFrameworkId);
 	expect(clone).toMatchObject(customScale);
 	expect(clone.field_visibility).toMatchObject({ documentation_score: auditorOnly });
 	for (const field of baselineCopyFields) {
