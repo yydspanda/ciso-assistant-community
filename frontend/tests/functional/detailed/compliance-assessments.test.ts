@@ -44,12 +44,16 @@ test('compliance assessments scoring is working properly', async ({
 		value: 1
 	};
 	const scoreProgress = page.getByTestId('score-field').getByTestId('progress-ring-svg');
+	const scoreSlider = page.getByTestId('score-field').getByTestId('range-slider-input');
 	const openRequirementAssessment = async (link: Locator) => {
 		const href = await link.getAttribute('href');
 		expect(href).toMatch(/^\/requirement-assessments\/[0-9a-f-]+\/edit(?:\?.*)?$/i);
 		const response = await page.goto(href!, { waitUntil: 'domcontentloaded', timeout: 60_000 });
 		expect(response?.ok()).toBe(true);
 		await expect(page).toHaveURL(/\/requirement-assessments\/[^/]+\/edit(?:\?.*)?$/);
+		// The minimum score can already match the SSR value. It must not let us
+		// submit before Svelte enhances the form and preserves its structured answers.
+		await page.locator('body[data-hydrated="true"]').waitFor({ state: 'attached' });
 	};
 	// Helper to convert raw score to percentage for tree view assertions
 	const toPercent = (score: number) =>
@@ -95,9 +99,9 @@ test('compliance assessments scoring is working properly', async ({
 	await expect(scoreProgress).toBeVisible({ timeout: 60_000 });
 	await expect(scoreProgress).toHaveAttribute('data-value', '1');
 
-	const IDAM1SliderBoundingBox = await page.getByTestId('range-slider-input').boundingBox();
+	const IDAM1SliderBoundingBox = await scoreSlider.boundingBox();
 	IDAM1SliderBoundingBox &&
-		(await page.getByTestId('range-slider-input').click({
+		(await scoreSlider.click({
 			position: {
 				x: IDAM1SliderBoundingBox.width * IDAM1Score.ratio,
 				y: IDAM1SliderBoundingBox.height / 2
@@ -144,9 +148,9 @@ test('compliance assessments scoring is working properly', async ({
 	await expect(scoreProgress).toBeVisible({ timeout: 60_000 });
 	await expect(scoreProgress).toHaveAttribute('data-value', '1');
 
-	const IDAM2SliderBoundingBox = await page.getByTestId('range-slider-input').boundingBox();
+	const IDAM2SliderBoundingBox = await scoreSlider.boundingBox();
 	IDAM2SliderBoundingBox &&
-		(await page.getByTestId('range-slider-input').click({
+		(await scoreSlider.click({
 			position: {
 				x: IDAM2SliderBoundingBox.width * IDAM2Score.ratio,
 				y: IDAM2SliderBoundingBox.height / 2
@@ -179,9 +183,9 @@ test('compliance assessments scoring is working properly', async ({
 	await expect(scoreProgress).toBeVisible({ timeout: 60_000 });
 	await expect(scoreProgress).toHaveAttribute('data-value', '1');
 
-	const IDBE1SliderBoundingBox = await page.getByTestId('range-slider-input').boundingBox();
+	const IDBE1SliderBoundingBox = await scoreSlider.boundingBox();
 	IDBE1SliderBoundingBox &&
-		(await page.getByTestId('range-slider-input').click({
+		(await scoreSlider.click({
 			position: {
 				x: IDBE1SliderBoundingBox.width * IDBE1Score.ratio,
 				y: IDBE1SliderBoundingBox.height / 2
@@ -214,9 +218,9 @@ test('compliance assessments scoring is working properly', async ({
 	await expect(scoreProgress).toBeVisible({ timeout: 60_000 });
 	await expect(scoreProgress).toHaveAttribute('data-value', '1');
 
-	const PRAC1SliderBoundingBox = await page.getByTestId('range-slider-input').boundingBox();
+	const PRAC1SliderBoundingBox = await scoreSlider.boundingBox();
 	PRAC1SliderBoundingBox &&
-		(await page.getByTestId('range-slider-input').click({
+		(await scoreSlider.click({
 			position: {
 				x: PRAC1SliderBoundingBox.width * PRAC1Score.ratio,
 				y: PRAC1SliderBoundingBox.height / 2
@@ -282,6 +286,25 @@ test('cloning an audit proposes and persists its same-framework custom score sca
 		]
 	};
 	const everyone = { auditor: 'edit', respondent: 'edit' };
+	const auditorOnly = { auditor: 'edit', respondent: 'hidden' };
+	const baselineCopyFields = [
+		'result',
+		'status',
+		'score',
+		'is_scored',
+		'documentation_score',
+		'observation',
+		'applied_controls',
+		'evidences'
+	] as const;
+	// Only these four fields use the native EVERYONE_EDIT fallback when absent
+	// from the snapshot. Score fields default to hidden and must be explicit.
+	const defaultEditableCopyFields: readonly string[] = [
+		'result',
+		'observation',
+		'applied_controls',
+		'evidences'
+	];
 
 	const seedResponse = await page.request.patch(
 		`${BACKEND_API_URL}/compliance-assessments/${baselineId}/`,
@@ -290,7 +313,13 @@ test('cloning an audit proposes and persists its same-framework custom score sca
 			data: {
 				...customScale,
 				confirm_rescale: true,
-				field_visibility: { score: everyone, is_scored: everyone }
+				field_visibility: {
+					score: everyone,
+					is_scored: everyone,
+					// Same-framework copying requires auditor read access on both audits.
+					// Keep the synthetic documentation score hidden from respondents.
+					documentation_score: auditorOnly
+				}
 			}
 		}
 	);
@@ -301,7 +330,17 @@ test('cloning an audit proposes and persists its same-framework custom score sca
 	).toBeTruthy();
 	const baseline = JSON.parse(baselineBody);
 	expect(baseline).toMatchObject(customScale);
-	expect(baseline.field_visibility).toMatchObject({ score: everyone, is_scored: everyone });
+	expect(baseline.field_visibility).toMatchObject({
+		score: everyone,
+		is_scored: everyone,
+		documentation_score: auditorOnly
+	});
+	for (const field of baselineCopyFields) {
+		const auditorVisibility =
+			baseline.field_visibility?.[field]?.auditor ??
+			(defaultEditableCopyFields.includes(field) ? 'edit' : undefined);
+		expect(['read', 'edit'], `baseline ${field}`).toContain(auditorVisibility);
+	}
 
 	const globalScoreResponse = await page.request.get(
 		`${BACKEND_API_URL}/compliance-assessments/${baselineId}/global_score/`,
@@ -339,6 +378,12 @@ test('cloning an audit proposes and persists its same-framework custom score sca
 		.click();
 	const scoreEveryone = modal.getByTestId('visibility-score-everyone');
 	if ((await scoreEveryone.getAttribute('aria-checked')) !== 'true') await scoreEveryone.click();
+	const documentationScoreAuditor = modal.getByTestId('visibility-documentation_score-auditor');
+	await expect(documentationScoreAuditor).toBeVisible();
+	if ((await documentationScoreAuditor.getAttribute('aria-checked')) !== 'true') {
+		await documentationScoreAuditor.click();
+	}
+	await expect(documentationScoreAuditor).toHaveAttribute('aria-checked', 'true');
 
 	await expect(modal.getByTestId('score-scale-scoring-hidden')).toHaveCount(0);
 	const baselineOption = modal.getByTestId('score-scale-baseline');
@@ -371,6 +416,13 @@ test('cloning an audit proposes and persists its same-framework custom score sca
 	expect(clone.name).toBe(cloneName);
 	expect(clone.framework?.id).toBe(baseline.framework?.id);
 	expect(clone).toMatchObject(customScale);
+	expect(clone.field_visibility).toMatchObject({ documentation_score: auditorOnly });
+	for (const field of baselineCopyFields) {
+		const auditorVisibility =
+			clone.field_visibility?.[field]?.auditor ??
+			(defaultEditableCopyFields.includes(field) ? 'edit' : undefined);
+		expect(['read', 'edit'], `clone ${field}`).toContain(auditorVisibility);
+	}
 });
 
 // Regression test for CA-1843: clicking the status/result badges used to be a

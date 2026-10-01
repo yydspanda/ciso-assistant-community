@@ -1,4 +1,42 @@
+export const mappingPrerequisites = {
+	framework: {
+		file: 'adobe-ccf-v5.yaml',
+		name: 'Adobe CCF v5',
+		urn: 'urn:intuitem:risk:library:adobe-ccf-v5',
+		frameworkUrn: 'urn:intuitem:risk:framework:adobe-ccf-v5'
+	},
+	libraries: [
+		{
+			file: 'mapping-adobe-ccf-v5-and-iso27001-2022.yaml',
+			name: 'adobe-ccf-v5 <-> ISO/IEC 27001:2022',
+			urn: 'urn:intuitem:risk:library:mapping-adobe-ccf-v5-and-iso27001-2022',
+			dependencies: [
+				'urn:intuitem:risk:library:adobe-ccf-v5',
+				'urn:intuitem:risk:library:iso27001-2022'
+			],
+			frameworkUrns: [
+				'urn:intuitem:risk:framework:adobe-ccf-v5',
+				'urn:intuitem:risk:framework:iso27001-2022'
+			]
+		},
+		{
+			file: 'mapping-adobe-ccf-v5-and-nist-csf-1.1.yaml',
+			name: 'adobe-ccf-v5 <-> NIST-CSF-1.1',
+			urn: 'urn:intuitem:risk:library:mapping-adobe-ccf-v5-and-nist-csf-1.1',
+			dependencies: [
+				'urn:intuitem:risk:library:adobe-ccf-v5',
+				'urn:intuitem:risk:library:nist-csf-1.1'
+			],
+			frameworkUrns: [
+				'urn:intuitem:risk:framework:adobe-ccf-v5',
+				'urn:intuitem:risk:framework:nist-csf-1.1'
+			]
+		}
+	]
+} as const;
+
 export default {
+	mappingPrerequisites,
 	assessmentName: 'Test assessment',
 	assetName: 'Test asset',
 	evidenceName: 'Test evidence',

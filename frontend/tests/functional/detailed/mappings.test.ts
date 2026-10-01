@@ -3,6 +3,7 @@ import { FormContent, FormFieldType } from '../../utils/form-content.js';
 import { LoginPage } from '../../utils/login-page.js';
 import { PageContent } from '../../utils/page-content.js';
 import { expect, test, TestContent } from '../../utils/test-utils.js';
+import { mappingPrerequisites } from '../../utils/test-data.js';
 import {
 	expandedAuditTreeItem,
 	isAuditDetailUrl,
@@ -46,6 +47,14 @@ test('user can import required libraries and create required objects', async ({
 		await librariesPage.goto();
 		await librariesPage.hasUrl();
 		await librariesPage.importLibrary('NIST CSF v1.1', 'urn:intuitem:risk:library:nist-csf-1.1');
+		// The standalone NIST -> ISO artifact has no implicit reverse edge.
+		// Load the declared bidirectional Adobe artifacts through the native loader
+		// to provide the original ISO -> Adobe -> NIST path within depth three.
+		for (const library of [mappingPrerequisites.framework, ...mappingPrerequisites.libraries]) {
+			await librariesPage.goto();
+			await librariesPage.hasUrl();
+			await librariesPage.importLibrary(library.name, library.urn);
+		}
 	});
 });
 
@@ -116,7 +125,7 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 
 		await page.getByTestId('form-input-result').selectOption('compliant');
 
-		const slider = page.getByTestId('range-slider-input');
+		const slider = page.getByTestId('score-field').getByTestId('range-slider-input');
 		await expect(slider).toBeVisible();
 		await slider.focus();
 		for (let i = 1; i < OrgContextScore.value; i++) {
@@ -188,6 +197,19 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 
 		await page.getByTestId('save-no-continue-button').click();
 		await complianceAssessmentsPage.isToastVisible('successfully saved', 'i');
+		await reopenAuditDetail(page, mappedAssessmentDetailUrl);
+
+		// ID.AM-1 above is unmapped and retains its default score. Also prove a
+		// non-default result actually traversed the declared ISO -> Adobe -> NIST
+		// path: ISO 4.1 -> Adobe RM-02 -> NIST ID.RM-1 uses intersect mappings.
+		const mappedRiskStrategy = await expandedAuditTreeItem(
+			page,
+			complianceAssessmentsPage.itemDetail,
+			'ID.RM-1'
+		);
+		await mappedRiskStrategy.content.click();
+		await page.waitForURL(/\/requirement-assessments\/[^/]+\/edit(?:\?.*)?$/);
+		await expect(page.getByTestId('form-input-result')).toHaveValue('partially_compliant');
 		await reopenAuditDetail(page, mappedAssessmentDetailUrl);
 	});
 

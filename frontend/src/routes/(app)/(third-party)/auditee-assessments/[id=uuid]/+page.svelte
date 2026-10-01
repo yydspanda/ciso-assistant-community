@@ -44,6 +44,10 @@
 	import type { ActionData, PageData } from './$types';
 	import Anchor from '$lib/components/Anchor/Anchor.svelte';
 	import { invalidateAll } from '$app/navigation';
+	import {
+		withAuthorizedParentSections,
+		type AuditeeNavigationItem
+	} from '$lib/utils/auditee-navigation';
 
 	interface Props {
 		data: PageData;
@@ -285,40 +289,19 @@
 	);
 
 	// --- Navigation items: assessable items + splash screen nodes + section headers ---
-	type NavItem =
-		| { type: 'assessment'; data: (typeof requirementAssessments)[0] }
-		| { type: 'splash'; data: Record<string, any> }
-		| { type: 'section'; data: Record<string, any> };
+	type NavItem = AuditeeNavigationItem<(typeof requirementAssessments)[0], Record<string, any>>;
 
-	const assessmentNavItems: NavItem[] = $derived(
+	const assessmentNavItems: Extract<NavItem, { type: 'assessment' }>[] = $derived(
 		requirementAssessments
 			.filter((ra) => ra.assessable)
 			.map((ra) => ({ type: 'assessment' as const, data: ra }))
 	);
 
-	const splashNavItems: NavItem[] = $derived(
+	const splashNavItems: Extract<NavItem, { type: 'splash' }>[] = $derived(
 		data.requirements
 			.filter((r: Record<string, any>) => r.display_mode === 'splash')
 			.map((r: Record<string, any>) => ({ type: 'splash' as const, data: r }))
 	);
-
-	function resolveParentNode(parentReference: unknown): Record<string, any> | undefined {
-		if (!parentReference) return undefined;
-
-		const parentId =
-			typeof parentReference === 'object' && parentReference !== null
-				? (parentReference as Record<string, unknown>).id
-				: parentReference;
-		const parentUrn =
-			typeof parentReference === 'object' && parentReference !== null
-				? (parentReference as Record<string, unknown>).urn
-				: parentReference;
-
-		return data.requirements.find(
-			(r: Record<string, any>) =>
-				(parentId != null && r.id === parentId) || (parentUrn != null && r.urn === parentUrn)
-		);
-	}
 
 	const navItems: NavItem[] = $derived.by(() => {
 		const sorted = [...assessmentNavItems, ...splashNavItems].sort((a, b) => {
@@ -333,26 +316,8 @@
 			return orderA - orderB;
 		});
 
-		// Insert section headers before groups of items sharing the same parent
-		const seenParents = new Set<string>();
-		const items: NavItem[] = [];
-		for (const item of sorted) {
-			const requirementId = item.data.requirement?.id ?? item.data.requirement;
-			const parentReference =
-				item.type === 'assessment'
-					? requirementHashmap[requirementId]?.parent_requirement
-					: item.data.parent_requirement;
-			const parentNode = resolveParentNode(parentReference);
-			const parentKey = parentNode ? String(parentNode.id ?? parentNode.urn ?? '') : '';
-			if (parentKey && !seenParents.has(parentKey)) {
-				seenParents.add(parentKey);
-				if (parentNode && parentNode.display_mode !== 'splash' && !parentNode.assessable) {
-					items.push({ type: 'section', data: parentNode });
-				}
-			}
-			items.push(item);
-		}
-		return items;
+		// Parent sections come only from this caller's authorized projection.
+		return withAuthorizedParentSections(sorted, data.requirements);
 	});
 
 	const assessableItems = $derived(
