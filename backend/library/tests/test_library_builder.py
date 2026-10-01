@@ -1925,7 +1925,11 @@ def test_stored_library_reads_stay_open_for_standard_roles(admin_client):
 
 
 def _store_mapping_fixture():
-    """A mapping set plus the two frameworks it spans, stored as libraries."""
+    """Load a mapping owner and both live framework/node inventories natively.
+
+    Stored JSON alone is not mapping authority. The graph/table APIs also
+    require an imported owner and readable live Framework/RequirementNode rows.
+    """
     root = Folder.get_root_folder()
     common = {"folder": root, "locale": "en", "version": 1, "packager": "tests"}
 
@@ -1938,6 +1942,7 @@ def _store_mapping_fixture():
             content={
                 "framework": {
                     "urn": f"urn:tests:risk:framework:{slug}",
+                    "ref_id": slug,
                     "name": slug,
                     "requirement_nodes": [
                         {
@@ -1952,10 +1957,17 @@ def _store_mapping_fixture():
             **common,
         )
 
-    framework("mapsrc", "S.1")
-    framework("maptgt", "T.1")
+    for stored in (framework("mapsrc", "S.1"), framework("maptgt", "T.1")):
+        error = stored.load()
+        assert error is None, error
+        live_framework = Framework.objects.get(urn=stored.content["framework"]["urn"])
+        assert live_framework.library.urn == stored.urn
+        assert live_framework.folder_id == root.pk
+        assert set(live_framework.requirement_nodes.values_list("urn", flat=True)) == {
+            stored.content["framework"]["requirement_nodes"][0]["urn"]
+        }
 
-    return StoredLibrary.objects.create(
+    mapping_owner = StoredLibrary.objects.create(
         urn="urn:tests:risk:library:mapset",
         name="mapset",
         ref_id="mapset",
@@ -1964,6 +1976,7 @@ def _store_mapping_fixture():
             "requirement_mapping_sets": [
                 {
                     "urn": "urn:tests:risk:req_mapping_set:mapset",
+                    "name": "Synthetic mapping set",
                     "source_framework_urn": "urn:tests:risk:framework:mapsrc",
                     "target_framework_urn": "urn:tests:risk:framework:maptgt",
                     "requirement_mappings": [
@@ -1978,6 +1991,11 @@ def _store_mapping_fixture():
         },
         **common,
     )
+    error = mapping_owner.load()
+    assert error is None, error
+    mapping_owner.refresh_from_db()
+    assert mapping_owner.is_loaded
+    return mapping_owner
 
 
 MAPPING_DATA_ROUTES = (
@@ -1997,17 +2015,34 @@ def test_mapping_data_reads_respect_rbac(builder_only_client):
 
 
 @pytest.mark.django_db
-def test_mapping_data_reads_stay_open_for_standard_roles(admin_client):
-    """Sanity: the RBAC lookup changes nothing for a role that may read libraries."""
+@pytest.mark.parametrize(
+    "role_name",
+    ["BI-RL-ADM", "BI-RL-AUD", "BI-RL-BSL", "BI-RL-APP", "BI-RL-ANA", "BI-RL-DMA"],
+)
+def test_mapping_data_reads_stay_open_for_standard_roles(admin_client, role_name):
+    """Native standard roles read a fully imported and authorised mapping."""
     mapping_set = _store_mapping_fixture()
+    root = Folder.get_root_folder()
+    user = User.objects.create_user("mapping-reader@example.test")
+    assignment = RoleAssignment.objects.create(
+        name="Synthetic standard-role mapping read",
+        user=user,
+        role=Role.objects.get(name=role_name, builtin=True),
+        folder=root,
+        is_recursive=False,
+    )
+    assignment.perimeter_folders.set([root])
+    client = APIClient()
+    client.force_authenticate(user)
 
     for route in MAPPING_DATA_ROUTES:
-        response = admin_client.get(reverse(route, args=[mapping_set.pk]))
+        response = client.get(reverse(route, args=[mapping_set.pk]))
         assert response.status_code == status.HTTP_200_OK, route
 
-    table = admin_client.get(
+    table = client.get(
         reverse("requirement-mapping-sets-table-data", args=[mapping_set.pk])
     )
+    assert table.status_code == status.HTTP_200_OK, table.content
     assert [row["source_ref_id"] for row in table.data["rows"]] == ["S.1"]
     assert [row["target_ref_id"] for row in table.data["rows"]] == ["T.1"]
 
@@ -2035,10 +2070,32 @@ def test_mapping_table_data_indexes_every_row(admin_client):
     response = admin_client.get(
         reverse("requirement-mapping-sets-table-data", args=[mapping_set.pk])
     )
+    assert response.status_code == status.HTTP_200_OK, response.content
     rows = response.data["rows"]
 
     assert len(rows) == 2
     assert [row["index"] for row in rows] == [0, 1]
+
+
+@pytest.mark.django_db
+def test_mapping_data_reads_reject_an_unloaded_owner_even_with_live_nodes(admin_client):
+    mapping_set = _store_mapping_fixture()
+    assert (
+        RequirementNode.objects.filter(
+            urn__in={
+                "urn:tests:risk:req_node:mapsrc:r1",
+                "urn:tests:risk:req_node:maptgt:r1",
+            }
+        ).count()
+        == 2
+    )
+    # Keep the live endpoint inventories present: the loaded owner is a
+    # separate required proof, not a substitute for their object IAM.
+    mapping_set.is_loaded = False
+    mapping_set.save(update_fields=["is_loaded"])
+    for route in MAPPING_DATA_ROUTES:
+        response = admin_client.get(reverse(route, args=[mapping_set.pk]))
+        assert response.status_code == status.HTTP_404_NOT_FOUND, route
 
 
 @pytest.mark.django_db
