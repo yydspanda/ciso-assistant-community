@@ -27,29 +27,34 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
 | Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
 | Production acceptance | Legal, privacy, security, records, audit, operations, and production acceptance have not been performed. |
-| Hosted project governance | PR #4 remains open. Submitted checkpoint `276ffa373` has six functional-browser failures and its complete hosted terminal audit remains open; it is not release approval. Fresh canonical fetch on 2026-10-01 resolves `a88f2c2db`, 51 ahead / zero behind at that checkpoint. Pure merge `cd09e055d` and earlier merge `426d685da` remain intact. A separate seven-file test-contract correction passed isolated validation and independent review; the future candidate's builds, full backend/browser and exact-head hosted acceptance remain open. Ruleset 21569001 remains active with zero bypass actors and strict governance; the weekly read-only monitor remains active. |
+| Hosted project governance | PR #4 remains open; its last fully audited checkpoint is `cbb524c9e`. All 216 checks at that checkpoint are terminal: 213 successful / two mapping failures / one tag-only skipped; backend coverage passed naturally. Fresh canonical fetch on 2026-10-01 resolves `a88f2c2db`, 52 ahead / zero behind at that checkpoint. Pure merges `cd09e055d` and `426d685da` remain intact. The separate four-file test-only scenario/cleanup correction passed isolated verification and independent review; new-head acceptance, publication-owner policy and protected-main merge remain open. Ruleset 21569001 remains active with zero bypass actors and strict governance; the weekly read-only monitor remains active. |
 
 ## Current verification summary
 
-- Exact `276ffa373` CE and isolated native EE builds passed; its complete
-  frontend unit suite passed **52 files / 703 tests**. Frozen authenticated
-  Chromium/Firefox execution ended **eight passed / six failed / four not run**.
+- Exact `cbb524c9e` CE and isolated native EE builds passed; its complete
+  frontend unit suite passed **53 files / 732 tests**. Frozen authenticated
+  Chromium/Firefox execution ended **15 passed / three failed / zero not run**.
   Light/dark 320px register automation found zero axe violations or horizontal
   overflow, with one manual-review item each. These are not future-candidate
   browser or full accessibility acceptance.
-- The six hosted functional failures are CE/EE clone identity, directional
-  mapping's old-page wait and the exact respondent question title. Actual clone
-  creation and earlier scoring/mapping-picker/ACCESS CONTROL assertions pass.
-  The local matrix also has an unresolved Firefox Solutions-tab failure.
-  Its trace rejects a simple not-started-machine explanation; no speculative
-  production fix, IAM/default change or extra retry is included.
-- The separate seven-file test-contract correction passed **71 focused tests**
-  and **53 files / 732 complete units**, strict scoped types, formatting,
-  frozen-source checks and independent review. It requires valid scalar/nested
-  framework UUIDs, artifact-bound CMMC ref/name, and a genuinely new mapped UUID
-  with authenticated target/framework identity checks. Future-head full build,
-  browser and hosted gates remain open. Canonical detail and hashes are in
-  [CFGRC-REC-20261001-04](progress-archive/2026-10.md#cfgrc-rec-20261001-04).
+- Both local mapping failures exhaust the whole-test deadline after valid
+  source/target work. Chromium passes non-default ID.RM-1; Firefox times out
+  earlier and does not reach it. The private serial scenario split preserves
+  all eight steps, 23 business assertions and 96 original business awaits, adds two
+  fresh-page reopens, and collects **22 two-engine cases** without changing
+  timeout/retry defaults. Final four-file follow-up passed **88 focused / 749
+  complete units**, scoped types/format, exact collection and frozen-source
+  independent review; new-head
+  build/browser/hosted verification remains open.
+- Firefox TPRM business steps pass, but `afterAll` fails because the substring
+  first-row helper deletes the prefix-matching `foo` domain twice before
+  refresh, leaving the base domain. A test-only own-Name-column exact locator
+  and deletion-refresh wait are verified in 17 DOM regressions and reused
+  explicitly in mapping cleanup. Both domains require final count zero;
+  production table/IAM stays
+  unchanged. The prior Solutions-tab failure did not recur and is not
+  retroactively claimed fixed. Canonical evidence is in
+  [CFGRC-REC-20261001-05](progress-archive/2026-10.md#cfgrc-rec-20261001-05).
 - Exact-checkpoint full type checking failed with **2061 errors / 857 warnings /
   467 files**; its auditee route retains **11 errors / three warnings**, with no
   new owned-file diagnostic messages/multiplicities. No passing full-type
@@ -57,11 +62,14 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   two-parent tree; frozen PostgreSQL **156 related / 69 native IAM-notification
   tests** passed with zero skips. See
   [CFGRC-REC-20261001-02](progress-archive/2026-10.md#cfgrc-rec-20261001-02).
-- The immutable, unexcluded PostgreSQL run at `d1ee20591` collected **6636
-  tests** and is still running; there is no terminal full-suite result. Its
-  backend content is unchanged by the new frontend-only correction. The
-  reboot-lost previous run is unverified, not a pass; historical terminal
-  failures and test-only corrections remain in
+- The immutable, unexcluded PostgreSQL run at `d1ee20591` ended **6636
+  collected / 6615 passed / 20 skipped / one xfailed / zero failures or errors**.
+  All 1679 actual backend inputs equal the current candidate's unchanged
+  backend content; this is content equivalence, not a later-head rerun.
+  A separate native RiskMatrix fixture supplement passed the unchanged metrics
+  node once, without rewriting the full run's skip count. The restore xfail
+  remains a 500 response, not a pass. The reboot-lost previous run is unverified;
+  historical terminal failures and test-only corrections remain in
   [CFGRC-REC-20261001-01](progress-archive/2026-10.md#cfgrc-rec-20261001-01)
   and the [September archive](progress-archive/2026-09.md).
 - Prior local synthetic regulatory persistence/IAM, migration/rollback,
@@ -95,21 +103,27 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
    complete upstream-table privileges, production topology, monitoring,
    encryption/key custody, PITR/RPO/RTO, and operations approval remain open.
 10. **The upstream acceptance gate remains open.** Explicit fresh fetch resolves
-    canonical `a88f2c2db`; submitted checkpoint `276ffa373` measures **51 ahead /
-    zero behind**, but has six failed browser checks. Separate pure two-parent
+    canonical `a88f2c2db`; submitted checkpoint `cbb524c9e` measures **52 ahead /
+    zero behind**, but has two failed hosted mapping checks and three local
+    browser failures. Separate pure two-parent
     merges `cd09e055d` and `426d685da` preserve canonical ancestry and computed
-    trees; extension fixes are not hidden in them. Final-candidate unit/build,
-    immutable unexcluded backend, authenticated browser, and every triggered
-    exact-head hosted gate remain open. The task stays active until protected
+    trees; extension fixes are not hidden in them. Unexcluded backend-content
+    evidence is verified; the next candidate's unit/build, authenticated browser
+    and every triggered exact-head hosted gate remain open. The task stays active until protected
     `main` merge, and weekly fresh-fetch monitoring remains enabled.
 11. **Inherited workflow activation still needs an owner policy.** Opening PR #1
     registered inherited validation workflows as well as the three fork jobs.
     The write-scoped CLA and OIDC/security-events Plumber workflows were
-    explicitly disabled; no CLA was signed. The unregistered scheduled
-    `mirror-images.yml` has `packages: write` and could not be disabled through
-    the workflow API because GitHub did not register it. It and inherited
-    release workflows require an explicit owner decision before any manual,
-    tag, or scheduled activation.
+    explicitly disabled; no CLA was signed. A fresh read-only inventory now
+    confirms `mirror-images.yml` is registered and active, with `packages: write`.
+    Protected main uses a weekly schedule; this PR changes it to daily. Five
+    past weekly runs have successful metadata, not independently verified
+    package-write contents. Its earlier unregistered API result is historical.
+    The Helm publisher's direct API still returns 404, which does not prove it
+    cannot activate after merge. This PR changes both publishers' main-push
+    path selectors. Explicit owner approval for a fork publication guard or
+    fork package writes is required before protected-main merge; neither
+    publisher has been dispatched or disabled during this audit.
 12. **Historical workflow payloads need a read-only deployment inventory.** New
     regulatory audit entries cannot create generic workflow instances, but no
     target database was inspected for instances created before this boundary.
@@ -157,10 +171,11 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 
 ## Current next action
 
-Verify the new bounded test-contract candidate with fresh CE/isolated EE
-builds, complete frontend units, authenticated Chromium/Firefox and every exact-head
-hosted check; let the immutable unexcluded PostgreSQL run finish naturally and
-verify its unchanged backend content. Merge only the precisely verified candidate
+Verify the exact candidate containing the reviewed scenario/cleanup test-only correction
+with fresh CE/isolated EE builds, complete frontend units, all 22 authenticated
+Chromium/Firefox cases and every exact-head hosted check. Bind the complete
+unexcluded backend evidence to its unchanged actual backend bytes.
+Resolve the outstanding publication-owner decision before merging the precisely verified candidate
 through protected main. Keep the stage/task pointers; named-owner and production
 acceptance remain later work.
 
@@ -184,6 +199,7 @@ the ten most recent records and does not duplicate their evidence.
 
 | Completed | Record | Task IDs | Result |
 | --- | --- | --- | --- |
+| 2026-10-01 | [CFGRC-REC-20261001-05](progress-archive/2026-10.md#cfgrc-rec-20261001-05) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Exact 732 units / CE / EE and backend-content evidence passed; browser failed 15/3/0, hosted 213/2/1; separate test-only correction passed 88/749 and 22-case collection; final gates and publication-owner decision remain open. |
 | 2026-10-01 | [CFGRC-REC-20261001-04](progress-archive/2026-10.md#cfgrc-rec-20261001-04) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Exact checkpoint CE/EE and 703 units passed; browser failed 8/6/4, full types remain failed; separate test-only correction passed 71 focused / 732 complete units, final gates remain open. |
 | 2026-10-01 | [CFGRC-REC-20261001-03](progress-archive/2026-10.md#cfgrc-rec-20261001-03) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Checkpoint CE/EE and 682 units passed; browser diagnosis and 42 final focused correction tests verified; final-candidate full/browser/hosted gates remain open. |
 | 2026-10-01 | [CFGRC-REC-20261001-02](progress-archive/2026-10.md#cfgrc-rec-20261001-02) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Pure canonical successor merge verified; frozen PostgreSQL 156/69 and merged frontend 682 tests passed; build, type, full backend/browser and hosted release gates remain open. |
@@ -193,7 +209,6 @@ the ten most recent records and does not duplicate their evidence.
 | 2026-09-30 | [CFGRC-REC-20260930-09](progress-archive/2026-09.md#cfgrc-rec-20260930-09) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Pure canonical successor merge matches computed tree; fresh behind zero and pre-merge 640 frontend tests passed; final acceptance remains open. |
 | 2026-09-30 | [CFGRC-REC-20260930-08](progress-archive/2026-09.md#cfgrc-rec-20260930-08) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Bounded PostgreSQL compatibility/fixture suites passed; further authority review and full acceptance remain open. |
 | 2026-09-30 | [CFGRC-REC-20260930-07](progress-archive/2026-09.md#cfgrc-rec-20260930-07) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Three artifact/loader/update tests and 94 CA API/immutable-parent tests passed; no complete acceptance claimed. |
-| 2026-09-30 | [CFGRC-REC-20260930-06](progress-archive/2026-09.md#cfgrc-rec-20260930-06) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Local two-parent merge checkpoints and attribution-only correction committed; freshly fetched upstream behind count is zero, not release approval. |
 
 ## Ledger update rules
 

@@ -4,6 +4,7 @@ import { LoginPage } from '../../utils/login-page.js';
 import { PageContent } from '../../utils/page-content.js';
 import { expect, test, TestContent } from '../../utils/test-utils.js';
 import { mappingPrerequisites } from '../../utils/test-data.js';
+import { exactNamedObjectRow } from '../../utils/exact-named-object-row.js';
 import {
 	auditFrameworkUuid,
 	expandedAuditTreeItem,
@@ -16,6 +17,9 @@ const vars = TestContent.generateTestVars();
 const testObjectsData: { [k: string]: any } = TestContent.itemBuilder(vars);
 const FOLDER_WORKAROUND_SUFFIX = ' foo';
 const BACKEND_API_URL = process.env.PUBLIC_BACKEND_API_URL ?? 'http://localhost:8000/api';
+// Each serial scenario gets a new page; retain only verified resource URLs.
+let sourceAssessmentDetailUrl: string | undefined;
+let mappedAssessmentDetailUrl: string | undefined;
 
 test.describe.configure({ mode: 'serial' });
 
@@ -60,34 +64,17 @@ test('user can import required libraries and create required objects', async ({
 	});
 });
 
-test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
+test('user can create and persist a scored iso27001-2022 audit', async ({
 	page,
 	logedPage,
 	complianceAssessmentsPage
 }) => {
-	const IDAM1Score = {
-		ratio: 0.66,
-		progress: '75',
-		value: 1
-	};
-
 	const OrgContextScore = {
 		value: 75 / 5 + 1,
 		progress: '75'
 	};
 
-	const applyMappingButton = page.getByTestId('apply-mapping-button');
 	const scoreProgress = page.getByTestId('score-field').getByTestId('progress-ring-svg');
-	let sourceAssessmentDetailUrl = '';
-	let mappedAssessmentDetailUrl = '';
-
-	//NOTE: The form fields can't be passed to the PageContent constructor because the form is not an usual one
-	const applyMappingForm = new FormContent(page, 'Create audit from baseline', [
-		{ name: 'name', type: FormFieldType.TEXT },
-		{ name: 'description', type: FormFieldType.TEXT },
-		{ name: 'folder', type: FormFieldType.SELECT_AUTOCOMPLETE },
-		{ name: 'framework', type: FormFieldType.SELECT_AUTOCOMPLETE }
-	]);
 
 	await test.step('create and score iso27001-2022 audit', async () => {
 		await complianceAssessmentsPage.goto();
@@ -149,6 +136,33 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 			OrgContextScore.progress
 		);
 	});
+});
+
+test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
+	page,
+	logedPage,
+	complianceAssessmentsPage
+}) => {
+	const sourceDetailUrl = sourceAssessmentDetailUrl;
+	if (!sourceDetailUrl || !isAuditDetailUrl(sourceDetailUrl)) {
+		throw new Error('The preceding serial scenario did not retain an exact source audit URL');
+	}
+	await reopenAuditDetail(page, sourceDetailUrl);
+	const IDAM1Score = {
+		ratio: 0.66,
+		progress: '75',
+		value: 1
+	};
+	const applyMappingButton = page.getByTestId('apply-mapping-button');
+	const scoreProgress = page.getByTestId('score-field').getByTestId('progress-ring-svg');
+
+	//NOTE: The form fields can't be passed to the PageContent constructor because the form is not an usual one
+	const applyMappingForm = new FormContent(page, 'Create audit from baseline', [
+		{ name: 'name', type: FormFieldType.TEXT },
+		{ name: 'description', type: FormFieldType.TEXT },
+		{ name: 'folder', type: FormFieldType.SELECT_AUTOCOMPLETE },
+		{ name: 'framework', type: FormFieldType.SELECT_AUTOCOMPLETE }
+	]);
 
 	await test.step('apply mapping to new csf 1.1 audit', async () => {
 		//NOTE: imitates PageContent.createItem(), since our form is not a "classic"" one
@@ -178,7 +192,7 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 		);
 		// A source detail already satisfies the generic pathname predicate while
 		// the new target's SPA navigation is still pending. Wait for a new UUID.
-		mappedAssessmentDetailUrl = await waitForAuditDetail(page, sourceAssessmentDetailUrl);
+		mappedAssessmentDetailUrl = await waitForAuditDetail(page, sourceDetailUrl);
 		const mappedId = new URL(mappedAssessmentDetailUrl).pathname.split('/').at(-1);
 		expect(mappedId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i);
 		const token = (await page.context().cookies()).find((cookie) => cookie.name === 'token')?.value;
@@ -206,6 +220,10 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 			name: vars.framework.name
 		});
 	});
+	const mappedDetailUrl = mappedAssessmentDetailUrl;
+	if (!mappedDetailUrl || !isAuditDetailUrl(mappedDetailUrl)) {
+		throw new Error('The mapping did not retain an exact target audit URL');
+	}
 	await test.step('verify that mapping worked correctly', async () => {
 		const IDAM1TreeViewItem = await expandedAuditTreeItem(
 			page,
@@ -227,7 +245,7 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 
 		await page.getByTestId('save-no-continue-button').click();
 		await complianceAssessmentsPage.isToastVisible('successfully saved', 'i');
-		await reopenAuditDetail(page, mappedAssessmentDetailUrl);
+		await reopenAuditDetail(page, mappedDetailUrl);
 
 		// ID.AM-1 above is unmapped and retains its default score. Also prove a
 		// non-default result actually traversed the declared ISO -> Adobe -> NIST
@@ -240,8 +258,21 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 		await mappedRiskStrategy.content.click();
 		await page.waitForURL(/\/requirement-assessments\/[^/]+\/edit(?:\?.*)?$/);
 		await expect(page.getByTestId('form-input-result')).toHaveValue('partially_compliant');
-		await reopenAuditDetail(page, mappedAssessmentDetailUrl);
+		await reopenAuditDetail(page, mappedDetailUrl);
 	});
+});
+
+test('user can map from an audit with an idempotent repeat', async ({
+	page,
+	logedPage,
+	complianceAssessmentsPage
+}) => {
+	const mappedDetailUrl = mappedAssessmentDetailUrl;
+	if (!mappedDetailUrl || !isAuditDetailUrl(mappedDetailUrl)) {
+		throw new Error('The preceding serial scenario did not retain an exact mapped audit URL');
+	}
+	await reopenAuditDetail(page, mappedDetailUrl);
+	const applyMappingButton = page.getByTestId('apply-mapping-button');
 
 	// Map-from = inbound direction (pull a source audit's results INTO the
 	// current one). We create a fresh, empty target audit and pull the
@@ -311,10 +342,14 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 });
 
 async function deleteFolder(foldersPage: PageContent, folderName: string) {
-	await foldersPage.deleteItemButton(folderName).click();
+	const exactRow = await exactNamedObjectRow(foldersPage.page, folderName, m.name());
+	await expect(exactRow).toHaveCount(1);
+	await exactRow.getByTestId('tablerow-delete-button').click();
 	await expect(foldersPage.deletePromptConfirmTextField()).toBeVisible();
 	await foldersPage.deletePromptConfirmTextField().fill(m.yes());
 	await foldersPage.deletePromptConfirmButton().click();
+	await expect(exactRow).toHaveCount(0);
+	return exactRow;
 }
 
 test.afterAll('cleanup', async ({ browser }) => {
@@ -326,9 +361,10 @@ test.afterAll('cleanup', async ({ browser }) => {
 	await loginPage.login();
 	await foldersPage.goto();
 
-	await deleteFolder(foldersPage, vars.folderName);
-	await deleteFolder(foldersPage, vars.folderName + FOLDER_WORKAROUND_SUFFIX);
+	const baseRow = await deleteFolder(foldersPage, vars.folderName);
+	const workaroundRow = await deleteFolder(foldersPage, vars.folderName + FOLDER_WORKAROUND_SUFFIX);
 
-	await expect(foldersPage.getRow(vars.folderName)).not.toBeVisible();
+	await expect(baseRow).toHaveCount(0);
+	await expect(workaroundRow).toHaveCount(0);
 	await page.close();
 });

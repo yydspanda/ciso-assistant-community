@@ -5,6 +5,7 @@ import { TestContent, test, expect, getUniqueValue } from '../../utils/test-util
 import { m } from '$paraglide/messages';
 import { SideBar } from '../../utils/sidebar.js';
 import { questionnaire } from '../../utils/test-data.js';
+import { exactNamedObjectRow } from '../../utils/exact-named-object-row.js';
 
 let vars = TestContent.generateTestVars();
 let testObjectsData: { [k: string]: any } = TestContent.itemBuilder(vars);
@@ -449,15 +450,16 @@ test.afterAll('cleanup', async ({ browser }) => {
 	}
 	await foldersPage.goto();
 
-	await foldersPage.deleteItemButton(vars.folderName).click();
-	await expect(foldersPage.deletePromptConfirmTextField()).toBeVisible();
-	await foldersPage.deletePromptConfirmTextField().fill(m.yes());
-	await foldersPage.deletePromptConfirmButton().click();
-
-	await foldersPage.deleteItemButton(vars.folderName + ' foo').click();
-	await expect(foldersPage.deletePromptConfirmTextField()).toBeVisible();
-	await foldersPage.deletePromptConfirmTextField().fill(m.yes());
-	await foldersPage.deletePromptConfirmButton().click();
-
-	await expect(foldersPage.getRow(vars.folderName)).not.toBeVisible();
+	const deletedRows: Locator[] = [];
+	for (const name of [vars.folderName, vars.folderName + ' foo']) {
+		const exactRow = await exactNamedObjectRow(page, name, m.name());
+		await expect(exactRow).toHaveCount(1);
+		await exactRow.getByTestId('tablerow-delete-button').click();
+		await expect(foldersPage.deletePromptConfirmTextField()).toBeVisible();
+		await foldersPage.deletePromptConfirmTextField().fill(m.yes());
+		await foldersPage.deletePromptConfirmButton().click();
+		await expect(exactRow).toHaveCount(0);
+		deletedRows.push(exactRow);
+	}
+	for (const exactRow of deletedRows) await expect(exactRow).toHaveCount(0);
 });
