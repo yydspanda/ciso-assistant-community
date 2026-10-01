@@ -1,15 +1,20 @@
-"""Browser-only role setup never grants user access or changes default IAM."""
+"""Explicit synthetic browser roles/grants never change builtin or default IAM."""
 
 import pytest
 from django.contrib.auth.models import Permission
 
 from app_tests.browser_fixtures import (
+    TPRM_FIXTURE_ADMIN_GRANT,
+    TPRM_FIXTURE_ADMIN_PERMISSIONS,
+    TPRM_FIXTURE_ADMIN_ROLE,
     TPRM_TEMPLATE_READ_PERMISSIONS,
     TPRM_TEMPLATE_READER_ROLE,
     seed_tprm_template_reader,
+    seed_tprm_browser_admin_grant,
 )
 from core.startup import startup
-from iam.models import Folder, Role, RoleAssignment, UserGroup
+from iam.models import Folder, Role, RoleAssignment, User, UserGroup
+from rest_framework.test import APIClient
 
 pytestmark = pytest.mark.django_db
 
@@ -114,3 +119,147 @@ def test_missing_native_permission_does_not_create_partial_role(root):
         seed_tprm_template_reader(synthetic_test_database=True)
     assert Role.objects.count() == before
     assert not Role.objects.filter(name=TPRM_TEMPLATE_READER_ROLE).exists()
+
+
+def _builtin_permissions():
+    return {
+        role.pk: set(role.permissions.values_list("pk", flat=True))
+        for role in Role.objects.filter(builtin=True)
+    }
+
+
+def test_explicit_admin_fixture_uses_native_api_without_changing_builtin_iam(root):
+    admin = User.objects.create_superuser("admin@tests.com")
+    respondent = User.objects.create_user("synthetic-respondent@tests.invalid")
+    role = seed_tprm_template_reader(synthetic_test_database=True)
+    client = APIClient()
+    client.force_authenticate(admin)
+    payload = {
+        "name": "Synthetic respondent template grant",
+        "user": str(respondent.pk),
+        "user_group": None,
+        "role": str(role.pk),
+        "folder": str(root.pk),
+        "is_recursive": False,
+        "perimeter_folders": [str(root.pk)],
+    }
+    denied = client.post("/api/role-assignments/", payload, format="json")
+    assert denied.status_code == 403
+    assert not RoleAssignment.objects.filter(user=respondent).exists()
+    builtin_before = _builtin_permissions()
+    defaults_before = list(Folder.objects.values_list("pk", "default_role_id"))
+    assignment = seed_tprm_browser_admin_grant(
+        synthetic_admin_email=admin.email, synthetic_test_database=True
+    )
+    assert assignment.user_id == admin.pk
+    assert assignment.user_group_id is None
+    assert assignment.folder_id == root.pk
+    assert assignment.is_recursive is False
+    assert assignment.builtin is False
+    assert set(assignment.perimeter_folders.values_list("pk", flat=True)) == {root.pk}
+    assert set(assignment.role.permissions.values_list("codename", flat=True)) == set(
+        TPRM_FIXTURE_ADMIN_PERMISSIONS
+    )
+    assert (
+        seed_tprm_browser_admin_grant(
+            synthetic_admin_email=admin.email, synthetic_test_database=True
+        ).pk
+        == assignment.pk
+    )
+    granted = client.post("/api/role-assignments/", payload, format="json")
+    assert granted.status_code == 201, granted.content
+    created = RoleAssignment.objects.get(pk=granted.json()["id"])
+    assert created.user_id == respondent.pk
+    assert created.role_id == role.pk
+    assert not created.is_recursive
+    assert set(created.perimeter_folders.values_list("pk", flat=True)) == {root.pk}
+    deleted = client.delete(f"/api/role-assignments/{created.pk}/")
+    assert deleted.status_code == 204, deleted.content
+    assert not RoleAssignment.objects.filter(pk=created.pk).exists()
+    assert not RoleAssignment.objects.filter(user=respondent).exists()
+    assert _builtin_permissions() == builtin_before
+    assert list(Folder.objects.values_list("pk", "default_role_id")) == defaults_before
+
+
+@pytest.mark.parametrize(
+    "identity", ["missing", "inactive", "not_superuser", "not_synthetic"]
+)
+def test_admin_fixture_refuses_an_unavailable_named_identity_without_writes(
+    root, identity
+):
+    email = "admin@tests.com"
+    if identity != "missing":
+        if identity == "not_synthetic":
+            email = "not-a-fixture@example.invalid"
+        user = User.objects.create_user(email, is_superuser=identity != "not_superuser")
+        if identity == "inactive":
+            # User.save intentionally prevents normal superuser deactivation.
+            # Simulate a legacy/direct-DB inactive row, not an API transition.
+            User.objects.filter(pk=user.pk).update(is_active=False)
+    before = _unrelated_iam_state(), Role.objects.count()
+    with pytest.raises(ValueError, match="synthetic browser administrator"):
+        seed_tprm_browser_admin_grant(
+            synthetic_admin_email=email, synthetic_test_database=True
+        )
+    assert (_unrelated_iam_state(), Role.objects.count()) == before
+    assert not Role.objects.filter(name=TPRM_FIXTURE_ADMIN_ROLE).exists()
+
+
+def test_admin_fixture_requires_explicit_opt_in(root):
+    before = _unrelated_iam_state(), Role.objects.count()
+    with pytest.raises(ValueError, match="synthetic test database"):
+        seed_tprm_browser_admin_grant(synthetic_admin_email="admin@tests.com")
+    assert (_unrelated_iam_state(), Role.objects.count()) == before
+
+
+def test_missing_admin_native_permission_cannot_create_partial_role_or_grant(root):
+    admin = User.objects.create_superuser("admin@tests.com")
+    Permission.objects.get(
+        content_type__app_label="iam",
+        content_type__model="roleassignment",
+        codename="delete_roleassignment",
+    ).delete()
+    before = _unrelated_iam_state(), Role.objects.count()
+    with pytest.raises(Permission.DoesNotExist):
+        seed_tprm_browser_admin_grant(
+            synthetic_admin_email=admin.email, synthetic_test_database=True
+        )
+    assert (_unrelated_iam_state(), Role.objects.count()) == before
+    assert not Role.objects.filter(name=TPRM_FIXTURE_ADMIN_ROLE).exists()
+    assert not RoleAssignment.objects.filter(name=TPRM_FIXTURE_ADMIN_GRANT).exists()
+
+
+@pytest.mark.parametrize(
+    "corruption", ["role_permissions", "recipient", "recursive", "perimeter", "builtin"]
+)
+def test_admin_fixture_rejects_existing_contract_drift_without_repair(root, corruption):
+    admin = User.objects.create_superuser("admin@tests.com")
+    assignment = seed_tprm_browser_admin_grant(
+        synthetic_admin_email=admin.email, synthetic_test_database=True
+    )
+    if corruption == "role_permissions":
+        assignment.role.permissions.add(
+            Permission.objects.get(
+                content_type__app_label="core", codename="change_framework"
+            )
+        )
+    elif corruption == "recipient":
+        assignment.user = User.objects.create_user("other-fixture@tests.invalid")
+        assignment.save(update_fields=["user"])
+    elif corruption == "recursive":
+        assignment.is_recursive = True
+        assignment.save(update_fields=["is_recursive"])
+    elif corruption == "perimeter":
+        assignment.perimeter_folders.set(
+            [Folder.objects.create(name="Synthetic other scope")]
+        )
+    else:
+        assignment.builtin = True
+        assignment.save(update_fields=["builtin"])
+    before = _unrelated_iam_state()
+    with pytest.raises(ValueError, match="contract mismatch"):
+        seed_tprm_browser_admin_grant(
+            synthetic_admin_email=admin.email, synthetic_test_database=True
+        )
+    assert _unrelated_iam_state() == before
+    assert RoleAssignment.objects.filter(name=TPRM_FIXTURE_ADMIN_GRANT).count() == 1

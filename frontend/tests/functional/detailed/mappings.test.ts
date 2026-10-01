@@ -3,6 +3,12 @@ import { FormContent, FormFieldType } from '../../utils/form-content.js';
 import { LoginPage } from '../../utils/login-page.js';
 import { PageContent } from '../../utils/page-content.js';
 import { expect, test, TestContent } from '../../utils/test-utils.js';
+import {
+	expandedAuditTreeItem,
+	isAuditDetailUrl,
+	reopenAuditDetail,
+	waitForAuditDetail
+} from '../../utils/audit-navigation.js';
 
 const vars = TestContent.generateTestVars();
 const testObjectsData: { [k: string]: any } = TestContent.itemBuilder(vars);
@@ -63,14 +69,6 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 	const scoreProgress = page.getByTestId('score-field').getByTestId('progress-ring-svg');
 	let sourceAssessmentDetailUrl = '';
 	let mappedAssessmentDetailUrl = '';
-	const reopenAuditDetail = async (detailUrl: string) => {
-		expect(detailUrl).toMatch(/\/compliance-assessments\/[0-9a-f-]{36}$/i);
-		const response = await page.goto(detailUrl, { waitUntil: 'domcontentloaded' });
-		expect(response?.ok()).toBe(true);
-		const expandAllButton = page.getByRole('button', { name: /Expand all/ });
-		await expect(expandAllButton).toBeVisible();
-		await expandAllButton.click();
-	};
 
 	//NOTE: The form fields can't be passed to the PageContent constructor because the form is not an usual one
 	const applyMappingForm = new FormContent(page, 'Create audit from baseline', [
@@ -100,12 +98,13 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 		}
 		await page.getByTestId('visibility-score-everyone').click();
 		await page.getByTestId('save-button').click();
-		await page.waitForURL(/\/compliance-assessments\/[0-9a-f-]{36}$/i);
-		sourceAssessmentDetailUrl = page.url();
+		sourceAssessmentDetailUrl = await waitForAuditDetail(page);
 
 		await page.waitForTimeout(5000);
 
-		const OrgContextTree = await complianceAssessmentsPage.itemDetail.treeViewItem(
+		const OrgContextTree = await expandedAuditTreeItem(
+			page,
+			complianceAssessmentsPage.itemDetail,
 			'4.1 - Understanding the organization and its context',
 			['core - Clauses', '4 - Context of the organization']
 		);
@@ -127,8 +126,10 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 
 		await page.getByTestId('save-no-continue-button').click();
 		await complianceAssessmentsPage.isToastVisible('successfully saved', 'i');
-		await reopenAuditDetail(sourceAssessmentDetailUrl);
-		const refreshedOrgContextTree = await complianceAssessmentsPage.itemDetail.treeViewItem(
+		await reopenAuditDetail(page, sourceAssessmentDetailUrl);
+		const refreshedOrgContextTree = await expandedAuditTreeItem(
+			page,
+			complianceAssessmentsPage.itemDetail,
 			'4.1 - Understanding the organization and its context',
 			['core - Clauses', '4 - Context of the organization']
 		);
@@ -164,14 +165,15 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 			'The audit object has been successfully created',
 			'i'
 		);
-		await page.waitForURL(/\/compliance-assessments\/[0-9a-f-]{36}$/i);
-		mappedAssessmentDetailUrl = page.url();
+		mappedAssessmentDetailUrl = await waitForAuditDetail(page);
 	});
 	await test.step('verify that mapping worked correctly', async () => {
-		const IDAM1TreeViewItem = await complianceAssessmentsPage.itemDetail.treeViewItem('ID.AM-1', [
-			'ID - Identify',
-			'ID.AM - Asset Management'
-		]);
+		const IDAM1TreeViewItem = await expandedAuditTreeItem(
+			page,
+			complianceAssessmentsPage.itemDetail,
+			'ID.AM-1',
+			['ID - Identify', 'ID.AM - Asset Management']
+		);
 		await IDAM1TreeViewItem.content.click();
 
 		await page.waitForURL(/\/requirement-assessments\/[^/]+\/edit(?:\?.*)?$/);
@@ -186,7 +188,7 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 
 		await page.getByTestId('save-no-continue-button').click();
 		await complianceAssessmentsPage.isToastVisible('successfully saved', 'i');
-		await reopenAuditDetail(mappedAssessmentDetailUrl);
+		await reopenAuditDetail(page, mappedAssessmentDetailUrl);
 	});
 
 	// Map-from = inbound direction (pull a source audit's results INTO the
@@ -243,7 +245,7 @@ test('user can map iso27001-2022 audit to a new csf-1.1 audit', async ({
 		// The target is empty, so the mapping produces changes and confirm is enabled.
 		await expect(page.getByTestId('confirm-mapping-button')).toBeEnabled();
 		await page.getByTestId('confirm-mapping-button').click();
-		await page.waitForURL(/\/compliance-assessments\/[0-9a-f-]{36}/i);
+		await page.waitForURL(isAuditDetailUrl);
 		await complianceAssessmentsPage.isToastVisible('updated successfully', 'i');
 	});
 

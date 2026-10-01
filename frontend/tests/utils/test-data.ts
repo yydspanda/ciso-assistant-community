@@ -602,15 +602,15 @@ export default {
 		urn: 'urn:intuitem:risk:library:critical_risk_matrix_5x5'
 	},
 	referenceControl: {
-		name: 'POL.PHYSICAL - Physical security policy',
-		// category: 'policy',
+		name: 'DOC.OVERVIEW - Organization overview document',
+		// category: 'process',
 		// csf_function: 'govern',
 		library: {
 			name: 'CISO Assistant Key Reference Controls',
 			ref: 'usual-controls',
 			urn: 'urn:intuitem:risk:library:doc-pol'
 		},
-		urn: 'urn:intuitem:risk:function:POL.PHYSICAL'
+		urn: 'urn:intuitem:risk:function:doc-pol:doc.overview'
 	},
 	referenceControl2: {
 		name: 'DOC.CONTROLS - Controls accountability matrix',
@@ -621,7 +621,7 @@ export default {
 			ref: 'usual-controls',
 			urn: 'urn:intuitem:risk:library:doc-pol'
 		},
-		urn: 'urn:intuitem:risk:function:DOC.CONTROLS'
+		urn: 'urn:intuitem:risk:function:doc-pol:doc.controls'
 	},
 	// ATT&CK now ships as TTPs, so its legacy threats are no longer maintained
 	threat: {

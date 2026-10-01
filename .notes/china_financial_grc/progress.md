@@ -1,7 +1,7 @@
 # China Financial GRC Progress Ledger / 中国金融 GRC 进度台账
 
 > Status: **Authoritative current execution record / 权威当前执行记录**
-> Updated: **2026-09-30**
+> Updated: **2026-10-01**
 > Branch: `agent/cfgrc-upstream-reconciliation-20260827`
 
 This file is the bounded current dashboard: one stage pointer, one active task,
@@ -27,10 +27,19 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
 | Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
 | Production acceptance | Legal, privacy, security, records, audit, operations, and production acceptance have not been performed. |
-| Hosted project governance | PR #4 remains open on submitted head `0c4c66820`: 190 checks passed, 25 failed, and one skipped. The authenticated CLI session is restored. A fresh canonical HTTPS fetch resolved `dcce0c55d`; dedicated pure merge `426d685da` measures 45 ahead / zero behind. Bounded authority regressions passed; immutable full backend/browser and exact-head hosted gates remain open. Ruleset 21569001 was independently verified active with zero bypass actors and strict governance checks; the weekly read-only monitor remains active. |
+| Hosted project governance | PR #4 remains open on submitted head `e3d1ee312`: all 216 checks are terminal, with 203 passed, 12 failed and one skipped. The active CLI session is verified. A fresh canonical HTTPS fetch now resolves `a88f2c2db`; submitted-head divergence is 47 ahead / five behind. The earlier dedicated pure merge `426d685da` remains intact. New successor reconciliation, full backend/browser and exact-head hosted gates remain open. Ruleset 21569001 remains active with zero bypass actors and strict governance; the weekly read-only monitor remains active. |
 
 ## Current verification summary
 
+- Fresh test-only frontend navigation/positive-control fixtures passed **48
+  files / 661 tests**, scoped contracts and strict types; the explicit synthetic
+  browser-administrator fixture passed **22 PostgreSQL tests** without changing
+  builtin/default IAM. Full type checking
+  exhausted its default heap and has no passing result. The machine rebooted;
+  old test processes and temporary evidence are absent, so the previous full
+  backend attempt's final outcome cannot be confirmed. Fresh durable evidence
+  and exact-head terminal failures are recorded in
+  [CFGRC-REC-20261001-01](progress-archive/2026-10.md#cfgrc-rec-20261001-01).
 - Local merge `78e546e5b` joins first parent `491130e9` and canonical upstream
   `e6ba85f8`. The separate artifact-only merge `835a8c772` joins its successor
   `555225678` with a tree identical to Git's pure merge result. Attribution-only
@@ -136,11 +145,13 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 9. **Only local synthetic PostgreSQL evidence exists.** Representative plans,
    complete upstream-table privileges, production topology, monitoring,
    encryption/key custody, PITR/RPO/RTO, and operations approval remain open.
-10. **The upstream acceptance gate remains open.** Explicit fresh fetch of
-    canonical upstream `dcce0c55d` and pure two-parent merge `426d685da`
-    measured 45 ahead / zero behind. The previously reviewed merge through
+10. **The upstream acceptance gate remains open.** Explicit fresh fetch now
+    resolves canonical `a88f2c2db`; submitted head is 47 ahead / five behind.
+    Earlier pure two-parent merge `426d685da` through `dcce0c55d` remains intact.
+    The previously reviewed merge through
     `555225678` and attribution correction remain intact; the new three-commit
     successor was incorporated without hiding extension fixes in the merge.
+    The five new successors require a separate pure merge and regression evidence.
     The local artifact loader/update gate passed. Migration paths and bounded regressions passed;
     full backend, browser, and every hosted check on the exact submitted head
     remain open. The task remains active until that branch
@@ -187,8 +198,8 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
     guided GitHub reauthorization and the active CLI session was independently
     verified; server-side invalidation of the old credential is not independently
     attested here. No secret is stored in the ledger or candidate diff. Local
-    checkpoint `fd27104e7` remains unpushed and its immutable full-backend
-    diagnostic failed; it is not a full pass.
+    checkpoint `fd27104e7` is historical and its immutable full-backend diagnostic
+    failed; it is not a full pass. The currently submitted head is `e3d1ee312`.
 19. **Wider questionnaire/deletion concurrency remains open.** Bounded
     quick-form creation/action IAM, moved-parent read/write consistency, and
     locked-save rechecks passed. QFR submit/status writers still do not share
@@ -198,12 +209,12 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 
 ## Current next action
 
-Run the unexcluded immutable PostgreSQL suite and the proportional frozen-
-candidate browser matrix, preserving native IAM and aggregate ownership. Monitor
-every hosted check triggered for the submitted PR #4 head. Merge through the
-no-bypass protected-main path only after those checks pass. Keep the current
-stage/task pointers until reconciliation completes; target-environment and
-named-owner acceptance remain subsequent work.
+Reproduce and correct the exact-head backend coverage and browser fixture failures
+without relaxing native IAM, then separately pure-merge the five freshly fetched
+canonical successors. Verify that frozen candidate with complete PostgreSQL,
+merged frontend/browser and every triggered hosted check before protected-main
+merge. Keep the stage/task pointers until reconciliation completes; named-owner
+and target-production acceptance remain subsequent work.
 
 ## Active task board
 
@@ -225,6 +236,7 @@ the ten most recent records and does not duplicate their evidence.
 
 | Completed | Record | Task IDs | Result |
 | --- | --- | --- | --- |
+| 2026-10-01 | [CFGRC-REC-20261001-01](progress-archive/2026-10.md#cfgrc-rec-20261001-01) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Fresh frontend 661 tests passed; exact E3 hosted checks ended 203 passed / 12 failed / one skipped; rebooted full-backend outcome unverified, successor and release gates open. |
 | 2026-09-30 | [CFGRC-REC-20260930-11](progress-archive/2026-09.md#cfgrc-rec-20260930-11) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Quick-form authority 37 focused / 93 related regressions passed and bounded independent review accepted; wider races and release gates remain open. |
 | 2026-09-30 | [CFGRC-REC-20260930-10](progress-archive/2026-09.md#cfgrc-rec-20260930-10) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Merged frontend 640 tests and both CI builds passed; 31 deletion/rollback and ten test-only seed regressions passed; final gates remain open. |
 | 2026-09-30 | [CFGRC-REC-20260930-09](progress-archive/2026-09.md#cfgrc-rec-20260930-09) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Pure canonical successor merge matches computed tree; fresh behind zero and pre-merge 640 frontend tests passed; final acceptance remains open. |
@@ -234,7 +246,6 @@ the ten most recent records and does not duplicate their evidence.
 | 2026-09-30 | [CFGRC-REC-20260930-05](progress-archive/2026-09.md#cfgrc-rec-20260930-05) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Forward TaskTemplate projection and Policy contract verified; synthetic real Huey/SMTP delivery passed; full and new-upstream gates remain open. |
 | 2026-09-30 | [CFGRC-REC-20260930-04](progress-archive/2026-09.md#cfgrc-rec-20260930-04) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Answer-parent validator and caller-scoped mutation-response compatibility verified on PostgreSQL; full acceptance remains open. |
 | 2026-09-30 | [CFGRC-REC-20260930-03](progress-archive/2026-09.md#cfgrc-rec-20260930-03) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Merged-working-tree migration, PostgreSQL authority, and frontend checkpoint; full backend/browser/hosted gates still open. |
-| 2026-09-30 | [CFGRC-REC-20260930-02](progress-archive/2026-09.md#cfgrc-rec-20260930-02) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Nested creation bound to route-owned assessment authority; all 370 frontend tests passed before the next upstream merge. |
 
 ## Ledger update rules
 

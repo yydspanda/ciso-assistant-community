@@ -2428,7 +2428,7 @@ class BaseModelViewSet(SparseFieldsMixin, AutocompleteMixin, viewsets.ModelViewS
                 content_type__model=permission_model._meta.model_name,
                 codename=f"view_{permission_model._meta.model_name}",
             )
-        except (Permission.DoesNotExist, Permission.MultipleObjectsReturned):
+        except Permission.DoesNotExist, Permission.MultipleObjectsReturned:
             return False
         return RoleAssignment.is_access_allowed(
             user=self.request.user, perm=perm, folder=folder

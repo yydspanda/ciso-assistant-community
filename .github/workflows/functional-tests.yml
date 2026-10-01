@@ -447,6 +447,8 @@ jobs:
           uv run python manage.py createsuperuser --noinput
           uv run python manage.py shell -c \
             'from app_tests.browser_fixtures import seed_tprm_template_reader; seed_tprm_template_reader(synthetic_test_database=True)'
+          uv run python manage.py shell -c \
+            'from app_tests.browser_fixtures import seed_tprm_browser_admin_grant; import os; seed_tprm_browser_admin_grant(synthetic_test_database=True, synthetic_admin_email=os.environ["DJANGO_SUPERUSER_EMAIL"])'
           BACKEND_LOG="$PWD/functional-backend-runserver.log"
           nohup uv run python manage.py runserver localhost:8173 --noreload >"$BACKEND_LOG" 2>&1 &
           BACKEND_PID=$!
@@ -684,6 +686,8 @@ jobs:
           uv run --project ../enterprise/backend python manage.py createsuperuser --noinput --settings="$SETTINGS_MODULE"
           uv run --project ../enterprise/backend python manage.py shell --settings="$SETTINGS_MODULE" -c \
             'from app_tests.browser_fixtures import seed_tprm_template_reader; seed_tprm_template_reader(synthetic_test_database=True)'
+          uv run --project ../enterprise/backend python manage.py shell --settings="$SETTINGS_MODULE" -c \
+            'from app_tests.browser_fixtures import seed_tprm_browser_admin_grant; import os; seed_tprm_browser_admin_grant(synthetic_test_database=True, synthetic_admin_email=os.environ["DJANGO_SUPERUSER_EMAIL"])'
           BACKEND_LOG="$PWD/functional-backend-runserver.log"
           nohup uv run --project ../enterprise/backend python manage.py runserver localhost:8173 \
             --noreload --settings="$SETTINGS_MODULE" >"$BACKEND_LOG" 2>&1 &
