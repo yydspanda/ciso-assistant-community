@@ -76,14 +76,18 @@ Partial amendment, repeal/transition, binding legal review and publication
 remain absent. New correction of a document bound to an edge is refused until
 a separate rebind contract is reviewed. A local synthetic upgrade passes 168
 PostgreSQL regulatory cases and 12 authenticated Chromium/Firefox cases.
-The separate new-table upgrade/privilege/restore chain and full-file freeze are
-not yet wholly accepted. A fresh frozen actual-old-code upgrade preserves old
-records/audit and passes populated-history rollback protection and five
-new-table SQL/constraint probes. Backup/restore commands succeed, but the
-columns/indexes fingerprint comparison fails; restored append and that run's
-suite are not executed. Source/dependency freeze passes, and the failed trial
-is retained. The prior exact hosted 168-case result does not cover this changed
-CI/ledger head. Full restore, new-head and production acceptance remain open.
+An initial frozen recovery trial fails its columns/indexes comparison and is
+retained. Separate read-only diagnosis supports a new strict logical-schema
+profile, preserving relative column order and permitting only one named MFA
+index's exact typed predicate-cast pair, with raw metadata retained. The prior
+constraint-cast rules remain in effect; raw CHECK text may still differ. A distinct
+new run passes actual-old-code upgrade, old records/all 565 audit entries
+preservation, empty rollback/reapply, populated-history rollback protection,
+five SQL/constraint probes, backup/restore across all 30 captured components,
+restored append and 168 PostgreSQL regressions. Source/dependency/seven-harness
+freeze matches. No native MFA or historical DDL changes. This is synthetic
+logical recovery, not physical-schema identity, WORM, PITR or production approval.
+The changed CI/ledger head still needs its own hosted and protected-main checks.
 See
 [ADR 0005](../../../documentation/china-financial-grc/adr/0005-synthetic-whole-version-supersession.md).
 

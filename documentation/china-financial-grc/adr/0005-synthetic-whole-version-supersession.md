@@ -168,6 +168,20 @@ exit one, restored v3 and the trial's suite remain unrun. The before/after sourc
 dependency, harness and private-input manifests match. This failure is retained,
 not converted to restore acceptance by excluding schema checks. See
 [CFGRC-REC-20261003-01](../../../.notes/china_financial_grc/progress-archive/2026-10.md#cfgrc-rec-20261003-01).
+After separate read-only diagnosis, a new frozen private logical-schema profile
+preserves relative column order and all captured fields, permitting only one
+named MFA index's exact typed predicate-cast pair. The previous constraint-cast
+profile remains unchanged; five existing CHECK casts still differ in raw text.
+Raw physical metadata is retained; no native MFA or historical DDL is changed.
+Its 21 tests / 95 subtests
+include retained adversarial type controls. A distinct full old-code upgrade,
+empty rollback/reapply, populated rollback refusal, five exact SQL probes,
+backup/restore with all 30 logical components, restored runtime v3 and 168/168
+PostgreSQL regressions pass. All source/dependency/seven-harness inputs match
+before/after; prior failures remain failures. This is bounded synthetic logical
+recovery, not physical-schema identity, universal MFA/IAM, WORM or PITR approval.
+See [CFGRC-REC-20261003-03](../../../.notes/china_financial_grc/progress-archive/2026-10.md#cfgrc-rec-20261003-03).
+
 The changed CI/ledger candidate still requires its own hosted checks. Legal
 review, real source rights and named production/operations acceptance remain open.
 
