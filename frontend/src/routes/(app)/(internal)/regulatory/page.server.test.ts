@@ -20,7 +20,8 @@ const summary = {
 };
 
 const userWithDocumentPermission = {
-	domain_permissions: { 'synthetic-folder': ['view_regulatorydocument'] }
+	permission_sets: [['view_regulatorydocument']],
+	domain_permissions: { 'synthetic-folder': 0 }
 };
 
 const callLoad = async ({
@@ -42,7 +43,9 @@ describe('regulatory register server loader', () => {
 	it('does not call the API when the local navigation permission is absent', async () => {
 		const fetchFn = vi.fn() as unknown as typeof fetch;
 
-		await expect(callLoad({ fetchFn, user: { domain_permissions: {} } })).resolves.toMatchObject({
+		await expect(
+			callLoad({ fetchFn, user: { permission_sets: [], domain_permissions: {} } })
+		).resolves.toMatchObject({
 			state: 'restricted',
 			documents: [],
 			count: 0

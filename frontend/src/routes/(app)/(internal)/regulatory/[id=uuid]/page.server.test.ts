@@ -7,8 +7,9 @@ const selectedEntityId = '3dd2af97-4c34-4e51-82b8-ceb92645e784';
 const selectedRecordedAt = '2026-08-26T01:30:00Z';
 const hash = 'a'.repeat(64);
 const userWithSecondaryReadPermissions = {
+	permission_sets: [['view_entity', 'view_regulatoryapplicabilitydecision']],
 	domain_permissions: {
-		'synthetic-folder': ['view_entity', 'view_regulatoryapplicabilitydecision']
+		'synthetic-folder': 0
 	}
 };
 

@@ -259,7 +259,8 @@ describe('buildNavigationCommands', () => {
 		const regulatoryReader = {
 			root_folder_id: ROOT,
 			roles: ['BI-RL-GLA'],
-			domain_permissions: { delegated: ['view_regulatorydocument'] }
+			permission_sets: [['view_regulatorydocument']],
+			domain_permissions: { delegated: 0 }
 		} as unknown as User;
 		expect(buildNavigationCommands(nobody, allFlags).map((command) => command.href)).not.toContain(
 			'/regulatory'
