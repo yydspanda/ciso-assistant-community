@@ -109,9 +109,26 @@ automatically: an administrator must explicitly grant
 `view_entitydocumentregistration` where that role is intended to read or
 record applicability. Do not backfill the broader `tprm.view_entity` permission.
 
-This increment cannot represent source/legal supersession and does not add
+The 0001–0004 increment cannot represent source/legal supersession and does not add
 binding decisions, rejection, approval/publication, source text, real
 institution facts, UI writes, a library projection, or an agent.
+
+The additional bounded `regulatory.0005` increment creates an append-only
+synthetic whole-version replacement event table without changing old migrations
+or backfilling source/institution data. Its internal service appends the new
+chain and binds exact old/new source references and digests without closing the
+old recorded interval. It adds only a separately granted supersession permission;
+generic IAM, workflow and library semantics remain unchanged. Shared selectors
+and read anchors extend the existing read-only APIs and frontend, preserving
+single-chain cardinality and legacy single-version drafts.
+
+Empty 0005 history may be rolled back and reapplied. Populated event history
+must refuse reversal before the table can be dropped; retention or removal
+requires a reviewed forward preservation plan. Real migration-graph and focused
+test results belong in the monthly progress archive. PostgreSQL concurrency,
+new-table privileges, backup/restore, live browser, legal and production
+acceptance are separate gates. See
+[ADR 0005](adr/0005-synthetic-whole-version-supersession.md).
 
 Migration-backed focused tests and an isolated SQLite full-project database
 copy verify 0001 -> 0002 apply, empty-history rollback/reapply, and refusal to

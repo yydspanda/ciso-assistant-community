@@ -1,4 +1,54 @@
+export const mappingPrerequisites = {
+	framework: {
+		file: 'adobe-ccf-v5.yaml',
+		name: 'Adobe CCF v5',
+		urn: 'urn:intuitem:risk:library:adobe-ccf-v5',
+		frameworkUrn: 'urn:intuitem:risk:framework:adobe-ccf-v5'
+	},
+	libraries: [
+		{
+			file: 'mapping-adobe-ccf-v5-and-iso27001-2022.yaml',
+			name: 'adobe-ccf-v5 <-> ISO/IEC 27001:2022',
+			urn: 'urn:intuitem:risk:library:mapping-adobe-ccf-v5-and-iso27001-2022',
+			dependencies: [
+				'urn:intuitem:risk:library:adobe-ccf-v5',
+				'urn:intuitem:risk:library:iso27001-2022'
+			],
+			frameworkUrns: [
+				'urn:intuitem:risk:framework:adobe-ccf-v5',
+				'urn:intuitem:risk:framework:iso27001-2022'
+			]
+		},
+		{
+			file: 'mapping-adobe-ccf-v5-and-nist-csf-1.1.yaml',
+			name: 'adobe-ccf-v5 <-> NIST-CSF-1.1',
+			urn: 'urn:intuitem:risk:library:mapping-adobe-ccf-v5-and-nist-csf-1.1',
+			dependencies: [
+				'urn:intuitem:risk:library:adobe-ccf-v5',
+				'urn:intuitem:risk:library:nist-csf-1.1'
+			],
+			frameworkUrns: [
+				'urn:intuitem:risk:framework:adobe-ccf-v5',
+				'urn:intuitem:risk:framework:nist-csf-1.1'
+			]
+		}
+	]
+} as const;
+
+export const questionnaire = {
+	name: 'CMMC version 2.0',
+	ref: 'CMMC-2.0',
+	urn: 'urn:intuitem:risk:framework:cmmc-2.0',
+	firstRequirement: {
+		urn: 'urn:intuitem:risk:req_node:cmmc-2.0:ac.l1-3.1.1',
+		parentUrn: 'urn:intuitem:risk:req_node:cmmc-2.0:ac',
+		ref: 'AC.L1-3.1.1',
+		name: 'Authorized Access Control'
+	}
+} as const;
+
 export default {
+	mappingPrerequisites,
 	assessmentName: 'Test assessment',
 	assetName: 'Test asset',
 	evidenceName: 'Test evidence',
@@ -17,6 +67,8 @@ export default {
 	threatName: 'Test threat',
 	description: 'Test description',
 	biaName: 'Test BIA',
+	metricDefinitionName: 'Test metric definition',
+	metricInstanceName: 'Test metric instance',
 	file: new URL('../utils/test_image.png', import.meta.url).pathname,
 	file2: new URL('../utils/test_file.txt', import.meta.url).pathname,
 	favicon: new URL('../utils/test_favicon.ico', import.meta.url).pathname,
@@ -141,7 +193,6 @@ export default {
 				'change_operationalscenario',
 				'delete_operationalscenario',
 				'view_qualification',
-				'view_globalsettings',
 				'view_securityexception',
 				'add_securityexception',
 				'change_securityexception',
@@ -277,7 +328,6 @@ export default {
 				'view_attackpath',
 				'view_operationalscenario',
 				'view_qualification',
-				'view_globalsettings',
 				'view_securityexception',
 				'view_finding',
 				'view_findingsassessment',
@@ -421,7 +471,6 @@ export default {
 				'change_operationalscenario',
 				'delete_operationalscenario',
 				'view_qualification',
-				'view_globalsettings',
 				'view_securityexception',
 				'add_securityexception',
 				'change_securityexception',
@@ -557,7 +606,6 @@ export default {
 				'view_attackpath',
 				'view_operationalscenario',
 				'view_qualification',
-				'view_globalsettings',
 				'view_securityexception',
 				'view_finding',
 				'view_findingsassessment',
@@ -593,26 +641,22 @@ export default {
 		ref: 'NIST-CSF-1.1',
 		urn: 'urn:intuitem:risk:library:nist-csf-1.1'
 	},
-	questionnaire: {
-		name: 'CMMC version 2.0',
-		ref: 'CMMC-2.0',
-		urn: 'urn:intuitem:risk:framework:cmmc-2.0'
-	},
+	questionnaire,
 	matrix: {
 		name: 'Critical risk matrix 5x5',
 		displayName: 'critical 5x5',
 		urn: 'urn:intuitem:risk:library:critical_risk_matrix_5x5'
 	},
 	referenceControl: {
-		name: 'POL.PHYSICAL - Physical security policy',
-		// category: 'policy',
+		name: 'DOC.OVERVIEW - Organization overview document',
+		// category: 'process',
 		// csf_function: 'govern',
 		library: {
 			name: 'CISO Assistant Key Reference Controls',
 			ref: 'usual-controls',
 			urn: 'urn:intuitem:risk:library:doc-pol'
 		},
-		urn: 'urn:intuitem:risk:function:POL.PHYSICAL'
+		urn: 'urn:intuitem:risk:function:doc-pol:doc.overview'
 	},
 	referenceControl2: {
 		name: 'DOC.CONTROLS - Controls accountability matrix',
@@ -623,7 +667,7 @@ export default {
 			ref: 'usual-controls',
 			urn: 'urn:intuitem:risk:library:doc-pol'
 		},
-		urn: 'urn:intuitem:risk:function:DOC.CONTROLS'
+		urn: 'urn:intuitem:risk:function:doc-pol:doc.controls'
 	},
 	// ATT&CK now ships as TTPs, so its legacy threats are no longer maintained
 	threat: {

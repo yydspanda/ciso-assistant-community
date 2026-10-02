@@ -4,20 +4,124 @@ from math import ceil
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-from django.db.models import Count
+from django.db.models import Count, Prefetch, Q
 from django.utils.timezone import now
 from docx.shared import Cm
 from docxtpl import InlineImage
 from library.helpers import get_referential_translation
 
+from .utils import is_field_visible_to
+
 from .models import (
     AppliedControl,
+    Actor,
+    Answer,
+    Commitment,
     ComplianceAssessment,
+    Evidence,
+    Policy,
+    Question,
+    QuestionChoice,
     RequirementAssessment,
     RequirementNode,
+    TaskTemplate,
+    Team,
 )
 
 matplotlib.use("Agg")
+
+
+def _viewable_applied_control_ids(user) -> set:
+    """Respect the Policy proxy's independent permission on the shared table."""
+    from iam.models import RoleAssignment
+
+    ordinary_ids = RoleAssignment.get_viewable_object_ids(user, AppliedControl)
+    policy_ids = RoleAssignment.get_viewable_object_ids(user, Policy)
+    return set(
+        AppliedControl.objects.filter(
+            Q(category="policy", id__in=policy_ids)
+            | (~Q(category="policy") & Q(id__in=ordinary_ids))
+        ).values_list("id", flat=True)
+    )
+
+
+def _visible_actor_email_map(actor_ids, *, user) -> dict:
+    """Expand actor emails without crossing an underlying object's IAM boundary."""
+    from iam.models import RoleAssignment, User
+    from tprm.models import Entity, Representative
+
+    visible_actor_ids = set(RoleAssignment.get_viewable_object_ids(user, Actor))
+    actors = list(
+        Actor.objects.filter(id__in=set(actor_ids) & visible_actor_ids)
+        .only("id", "user_id", "team_id", "entity_id")
+        .order_by("id")
+    )
+
+    visible_user_ids = set(RoleAssignment.get_viewable_object_ids(user, User))
+    requested_team_ids = {actor.team_id for actor in actors if actor.team_id}
+    visible_team_ids = set(RoleAssignment.get_viewable_object_ids(user, Team))
+    visible_users = User.objects.filter(id__in=visible_user_ids).order_by("id")
+    teams = list(
+        Team.objects.filter(id__in=requested_team_ids & visible_team_ids)
+        .only("id", "team_email", "leader_id")
+        .prefetch_related(
+            Prefetch("deputies", queryset=visible_users, to_attr="report_deputies"),
+            Prefetch("members", queryset=visible_users, to_attr="report_members"),
+        )
+        .order_by("id")
+    )
+    teams_by_id = {team.id: team for team in teams}
+    requested_user_ids = {actor.user_id for actor in actors if actor.user_id}
+    requested_user_ids.update(team.leader_id for team in teams if team.leader_id)
+    requested_user_ids.update(
+        member.id
+        for team in teams
+        for member in (*team.report_deputies, *team.report_members)
+    )
+    users_by_id = dict(
+        User.objects.filter(id__in=requested_user_ids & visible_user_ids).values_list(
+            "id", "email"
+        )
+    )
+
+    requested_entity_ids = {actor.entity_id for actor in actors if actor.entity_id}
+    visible_entity_ids = set(RoleAssignment.get_viewable_object_ids(user, Entity))
+    entity_ids = requested_entity_ids & visible_entity_ids
+    visible_representative_ids = RoleAssignment.get_viewable_object_ids(
+        user, Representative
+    )
+    representatives_by_entity = {}
+    for entity_id, email in Representative.objects.filter(
+        entity_id__in=entity_ids,
+        id__in=visible_representative_ids,
+    ).values_list("entity_id", "email"):
+        if email:
+            representatives_by_entity.setdefault(entity_id, []).append(email)
+
+    result = {}
+    for actor in actors:
+        emails = []
+        if actor.user_id:
+            email = users_by_id.get(actor.user_id)
+            if email:
+                emails.append(email)
+        elif actor.team_id:
+            team = teams_by_id.get(actor.team_id)
+            if team is not None:
+                if team.team_email:
+                    emails.append(team.team_email)
+                leader_email = users_by_id.get(team.leader_id)
+                if leader_email:
+                    emails.append(leader_email)
+                emails.extend(
+                    member.email
+                    for member in (*team.report_deputies, *team.report_members)
+                    if member.email
+                )
+        elif actor.entity_id:
+            emails.extend(representatives_by_entity.get(actor.entity_id, ()))
+        result[actor.id] = tuple(dict.fromkeys(emails))
+    return result
 
 
 def plot_horizontal_bar(data, colors=None, title=None):
@@ -337,7 +441,483 @@ def calculate_depths(framework):
     return depth_map
 
 
-def gen_audit_context(id, doc, tree, lang):
+def _answer_rows(
+    ra,
+    lang,
+    *,
+    visible_answer_ids,
+    visible_question_ids,
+    visible_choice_ids,
+):
+    """Questions and the respondent's answers, resolved the way the zip index does.
+
+    Mirrors `get_answers` in core_extras so the PDF and `audit_report.html` agree:
+    a `urn:` value is a choice reference and renders as the choice's label.
+    """
+    from core.utils import visible_questions
+
+    answers_qs = (
+        ra.answers.filter(
+            id__in=visible_answer_ids,
+            question_id__in=visible_question_ids,
+        )
+        .select_related("question")
+        .prefetch_related(
+            Prefetch(
+                "selected_choices",
+                queryset=QuestionChoice.objects.filter(id__in=visible_choice_ids),
+            )
+        )
+    )
+    answers = {}
+    for answer in answers_qs:
+        selected_choice_urns = [choice.urn for choice in answer.selected_choices.all()]
+        if answer.question.type == Question.Type.UNIQUE_CHOICE:
+            answers[answer.question.urn] = (
+                selected_choice_urns[0] if selected_choice_urns else None
+            )
+        elif answer.question.type == Question.Type.MULTIPLE_CHOICE:
+            answers[answer.question.urn] = selected_choice_urns
+        else:
+            answers[answer.question.urn] = answer.value
+
+    questions_qs = Question.objects.filter(
+        requirement_node=ra.requirement,
+        id__in=visible_question_ids,
+    ).prefetch_related(
+        Prefetch(
+            "choices",
+            queryset=QuestionChoice.objects.filter(id__in=visible_choice_ids),
+        )
+    )
+    questions_dict = {}
+    for question in questions_qs:
+        translation = (question.translations or {}).get(lang, {})
+        definition = {
+            "text": translation.get("text", question.text or ""),
+            "choices": [
+                {
+                    "urn": choice.urn,
+                    "value": (choice.translations or {})
+                    .get(lang, {})
+                    .get("value", choice.value or ""),
+                }
+                for choice in question.choices.all()
+            ],
+        }
+        if question.depends_on:
+            definition["depends_on"] = question.depends_on
+        questions_dict[question.urn] = definition
+
+    # `visible_questions` drops questions hidden by an unsatisfied `depends_on`,
+    # so a conditional question that does not apply is not listed as unanswered.
+    questions = visible_questions(questions_dict, answers)
+    if not questions:
+        return []
+
+    def resolve(question, value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, list):
+            resolved = [resolve(question, item) for item in value]
+            return ", ".join(item for item in resolved if item) or None
+        if not str(value).startswith("urn:"):
+            return str(value)
+        for choice in question.get("choices", []):
+            if choice["urn"] == value:
+                return choice["value"]
+        return None
+
+    rows = []
+    for urn, question in questions.items():
+        rows.append(
+            {
+                "question": question.get("text", "-"),
+                "answer": resolve(question, answers.get(urn)) or "-",
+            }
+        )
+    return rows
+
+
+# Status ordering and fills for the action plan, keyed on the raw enum so the
+# colour never depends on a localised label (house style, §9b).
+_ACTION_PLAN_STATUS_FILLS = {
+    "to_do": "#fff8f0",
+    "in_progress": "#e8e4f0",
+    "on_hold": "#fdf3d3",
+    "active": "#e3f4f2",
+    "degraded": "#fde8e8",
+    "deprecated": "#ffe8d6",
+    "--": "#f1f5f9",
+}
+
+
+def action_plan_context(assessment, controls, lang="en", linked=None):
+    """Payload for the action plan, grouped by status and sorted by ETA.
+
+    `assessment` is whatever the controls hang off — a compliance assessment or a
+    risk assessment; the template renders whichever subject it is given, so one
+    document serves both. `linked` maps a control id to the requirement or
+    scenario labels shown in the last column.
+
+    Deliberately narrow: an A4 page cannot carry nine columns legibly, so this
+    keeps what an action plan is actually read for — what, who, by when, against
+    which item — and drops CSF function, effort, cost and expiry date.
+    """
+    linked = linked or {}
+    buckets = {key: [] for key in _ACTION_PLAN_STATUS_FILLS}
+
+    for control in controls:
+        buckets.setdefault(control.status or "--", []).append(
+            {
+                "name": control.name or "-",
+                "description": control.description or "-",
+                "category_key": control.category or "",
+                "owner": ", ".join(str(actor) for actor in control.owner.all()) or "-",
+                "eta": _date_str(control.eta),
+                "linked": linked.get(control.id, []),
+            }
+        )
+
+    groups = [
+        {
+            "status_key": key,
+            "fill": _ACTION_PLAN_STATUS_FILLS.get(key, "#f1f5f9"),
+            "controls": rows,
+        }
+        for key, rows in buckets.items()
+        if rows
+    ]
+
+    perimeter = getattr(assessment, "perimeter", None)
+    framework = getattr(assessment, "framework", None)
+    return {
+        "subject": {
+            "domain": str(assessment.folder) if assessment.folder else "-",
+            "perimeter": str(perimeter.name) if perimeter else "-",
+            "name": assessment.name or "-",
+            "version": str(assessment.version or "-"),
+            "framework": str(framework) if framework else "",
+        },
+        "id": str(assessment.id),
+        "date": now().strftime("%d/%m/%Y"),
+        "generated_at": now().strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "groups": groups,
+        "total": sum(len(g["controls"]) for g in groups),
+    }
+
+
+# Severity is an IntegerChoices whose labels are lowercase keys ("critical"),
+# so the locale template maps them; the raw key also drives the badge colour.
+_SEVERITY_ORDER = [4, 3, 2, 1, 0, -1]
+_SEVERITY_KEYS = {
+    4: "critical",
+    3: "high",
+    2: "medium",
+    1: "low",
+    0: "info",
+    -1: "undefined",
+}
+
+_CLOSED_FINDING_STATUSES = (
+    "dismissed",
+    "mitigated",
+    "resolved",
+    "closed",
+    "deprecated",
+)
+
+
+def findings_assessment_context(assessment, findings, lang="en"):
+    """Payload for the findings report.
+
+    Findings are grouped by severity, worst first: a reader triages by severity,
+    and one block per page (what the HTML template did) turns fifty findings into
+    fifty pages.
+    """
+    metrics = assessment.get_findings_metrics()
+    severity_counts = metrics.get("severity_distribution", {})
+
+    rows = []
+    for finding in findings:
+        rows.append(
+            {
+                "ref_id": finding.ref_id or "-",
+                "name": finding.name or "-",
+                "severity_key": _SEVERITY_KEYS.get(finding.severity, "undefined"),
+                "status_key": finding.status or "--",
+                "description": finding.description or "",
+                "observation": getattr(finding, "observation", "") or "",
+                "owners": ", ".join(str(a) for a in finding.owner.all()) or "-",
+                "eta": _date_str(finding.eta),
+                "due_date": _date_str(finding.due_date),
+                "controls": [c.name for c in finding.applied_controls.all()],
+                "evidences": [e.name for e in finding.evidences.all()],
+                "labels": [str(label) for label in finding.filtering_labels.all()],
+            }
+        )
+
+    groups = [
+        {
+            "severity_key": _SEVERITY_KEYS[value],
+            "findings": [
+                row for row in rows if row["severity_key"] == _SEVERITY_KEYS[value]
+            ],
+        }
+        for value in _SEVERITY_ORDER
+    ]
+    groups = [group for group in groups if group["findings"]]
+
+    closed = sum(
+        count
+        for status, count in metrics.get("status_distribution", {}).items()
+        if status in _CLOSED_FINDING_STATUSES
+    )
+    total = metrics.get("total_count", 0)
+
+    return {
+        "assessment": {
+            "name": assessment.name or "-",
+            "ref_id": assessment.ref_id or "-",
+            "description": assessment.description or "",
+            "category_key": assessment.category or "--",
+            "status_key": assessment.status or "",
+            "folder": str(assessment.folder) if assessment.folder else "-",
+            "observation": getattr(assessment, "observation", "") or "",
+            "authors": ", ".join(str(a) for a in assessment.authors.all()) or "-",
+            "reviewers": ", ".join(str(r) for r in assessment.reviewers.all()) or "-",
+        },
+        "id": str(assessment.id),
+        "date": now().strftime("%d/%m/%Y"),
+        "generated_at": now().strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "metrics": {
+            "total": total,
+            "closed": closed,
+            "open": total - closed,
+            "unresolved_important": metrics.get("unresolved_important_count", 0),
+        },
+        "severity_rows": [
+            {
+                "key": _SEVERITY_KEYS[value],
+                "count": severity_counts.get(_SEVERITY_KEYS[value], 0),
+            }
+            for value in _SEVERITY_ORDER
+        ],
+        "groups": groups,
+    }
+
+
+def _timestamp_str(value):
+    return value.strftime("%Y-%m-%d %H:%M:%S") if value else "-"
+
+
+def incident_context(incident, timeline_entries, lang="en"):
+    """Payload for the incident report.
+
+    The timeline is the substance: entries in chronological order, each keyed by
+    its raw `entry_type` so the locale template supplies the label and the accent
+    colour without depending on a translated string.
+    """
+    entries = []
+    for entry in timeline_entries:
+        entries.append(
+            {
+                "entry": entry.entry or "-",
+                "type_key": entry.entry_type or "observation",
+                "timestamp": _timestamp_str(entry.timestamp),
+                "author": str(entry.author) if entry.author else "",
+                "observation": entry.observation or "",
+                "evidences": [e.name for e in entry.evidences.all()],
+            }
+        )
+
+    counts = {}
+    for entry in entries:
+        counts[entry["type_key"]] = counts.get(entry["type_key"], 0) + 1
+
+    return {
+        "incident": {
+            "ref_id": incident.ref_id or "",
+            "name": incident.name or "-",
+            "severity_key": str(incident.severity or ""),
+            "status_key": incident.status or "",
+            "detection_key": incident.detection or "",
+            "folder": str(incident.folder) if incident.folder else "-",
+            "description": incident.description or "",
+            "resolution": getattr(incident, "resolution", "") or "",
+            "is_bcp_activated": bool(incident.is_bcp_activated),
+            "owners": ", ".join(str(o) for o in incident.owners.all()) or "-",
+            "qualifications": [q.name for q in incident.qualifications.all()],
+            "entities": [e.name for e in incident.entities.all()],
+            "assets": [a.name for a in incident.assets.all()],
+            "threats": [t.name for t in incident.threats.all()],
+            "reported_at": _timestamp_str(incident.reported_at),
+            "occurred_at": _timestamp_str(incident.occurred_at),
+            "resolved_at": _timestamp_str(incident.resolved_at),
+        },
+        "id": str(incident.id),
+        "date": now().strftime("%d/%m/%Y"),
+        "generated_at": now().strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "counts": {
+            "total": len(entries),
+            "detection": counts.get("detection", 0),
+            "mitigation": counts.get("mitigation", 0),
+        },
+        "timeline": entries,
+    }
+
+
+def risk_assessment_context(
+    assessment,
+    scenarios,
+    clusters,
+    swap_axes=False,
+    flip_vertical=False,
+    lang="en",
+    label_standard="ISO",
+    use_risk_category_label=False,
+):
+    """Payload for the risk assessment report.
+
+    The matrix is emitted once, already oriented: the four HTML variants existed
+    only to encode `swap_axes` x `flip_vertical`, which is a transform on the grid
+    rather than four layouts.
+    """
+    matrix = assessment.risk_matrix
+    definition = matrix.parse_json_translated()
+    grid = matrix.render_grid_as_colors()
+
+    rows = [
+        [
+            {
+                "name": str(cell.get("name", "")),
+                "hexcolor": cell.get("hexcolor", "#ffffff"),
+            }
+            for cell in row
+        ]
+        for row in grid
+    ]
+    y_axis = [
+        {"name": str(p.get("name", "")), "description": str(p.get("description", ""))}
+        for p in definition.get("probability", [])
+    ]
+    x_axis = [
+        {"name": str(i.get("name", "")), "description": str(i.get("description", ""))}
+        for i in definition.get("impact", [])
+    ]
+
+    y_type, x_type = "probability", "impact"
+    if swap_axes:
+        y_type, x_type = x_type, y_type
+
+    def orient(cells, y_labels, x_labels):
+        if swap_axes:
+            cells = [list(column) for column in zip(*cells)]
+            y_labels, x_labels = x_labels, y_labels
+        if not flip_vertical:
+            # Rows arrive lowest-first; a matrix reads with the worst row on top.
+            cells = list(reversed(cells))
+            y_labels = list(reversed(y_labels))
+        return cells, y_labels, x_labels
+
+    # The inherent-risk flag reaches here as the presence of its cluster: gate the
+    # matrix views and the per-scenario level on the same signal.
+    include_inherent = "inherent" in clusters
+
+    views = []
+    for key in ("inherent", "current", "residual"):
+        cluster = clusters.get(key)
+        if cluster is None:
+            continue
+        cells = [
+            [{**rows[r][c], "refs": sorted(cluster[r][c])} for c in range(len(rows[r]))]
+            for r in range(len(rows))
+        ]
+        oriented, y_labels, x_labels = orient(cells, y_axis, x_axis)
+        views.append(
+            {
+                "key": key,
+                "cells": oriented,
+                "y_axis": y_labels,
+                "x_axis": x_labels,
+                "y_type": y_type,
+                "x_type": x_type,
+            }
+        )
+
+    scenario_rows = []
+    for scenario in scenarios:
+        row = {
+            "ref_id": scenario.ref_id or "-",
+            "name": scenario.name or "-",
+            "description": getattr(scenario, "description", "") or "",
+            "qualifications": [
+                str(q) for q in getattr(scenario, "qualifications", _EMPTY).all()
+            ],
+            "assets": [a.name for a in scenario.assets.all()],
+            "threats": [t.get_name_translated for t in scenario.threats.all()],
+            "existing_controls": [
+                c.name for c in scenario.existing_applied_controls.all()
+            ],
+            "controls": [c.name for c in scenario.applied_controls.all()],
+            "treatment_key": scenario.treatment or "",
+            "justification": scenario.justification or "",
+            "strength_of_knowledge": str(scenario.strength_of_knowledge or "-"),
+            "current": _risk_level(scenario.get_current_risk()),
+            "residual": _risk_level(scenario.get_residual_risk()),
+        }
+        if include_inherent:
+            row["inherent"] = _risk_level(scenario.get_inherent_risk())
+        scenario_rows.append(row)
+
+    return {
+        "assessment": {
+            "name": assessment.name or "-",
+            "version": str(assessment.version or "-"),
+            "perimeter": str(assessment.perimeter) if assessment.perimeter else "-",
+            "folder": str(assessment.folder) if assessment.folder else "-",
+            "matrix": str(matrix),
+            "status_key": assessment.status or "",
+            "description": assessment.description or "",
+            "authors": ", ".join(str(a) for a in assessment.authors.all()) or "-",
+            "reviewers": ", ".join(str(r) for r in assessment.reviewers.all()) or "-",
+            "eta": _date_str(assessment.eta),
+            "due_date": _date_str(assessment.due_date),
+        },
+        "id": str(assessment.id),
+        "date": now().strftime("%d/%m/%Y"),
+        "generated_at": now().strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "include_inherent": include_inherent,
+        # `risk_matrix_labels`: ISO says "Impact", EBIOS says "Severity".
+        "label_standard": label_standard
+        if label_standard in ("ISO", "EBIOS")
+        else "ISO",
+        # `use_risk_category_label` renames qualifications to risk categories.
+        "use_risk_category_label": bool(use_risk_category_label),
+        "scenarios": scenario_rows,
+        "matrix_views": views,
+    }
+
+
+class _EmptyRelation:
+    @staticmethod
+    def all():
+        return []
+
+
+_EMPTY = _EmptyRelation()
+
+
+def _risk_level(level):
+    if not level:
+        return {"name": "-", "hexcolor": "#f1f5f9"}
+    return {
+        "name": str(level.get("name", "-")),
+        "hexcolor": level.get("hexcolor", "#f1f5f9"),
+    }
+
+
+def gen_audit_context(id, tree, lang, assessments=None, charts=True, *, user):
     def count_category_results(data):
         def recursive_result_count(node_data):
             # Initialize result counts for this node
@@ -453,15 +1033,77 @@ def gen_audit_context(id, doc, tree, lang):
             ],
         }
 
+    from iam.models import RoleAssignment
+
     audit = ComplianceAssessment.objects.get(id=id)
+    field_visible = {
+        field: is_field_visible_to(audit, field, "auditor")
+        for field in (
+            "answers",
+            "evidences",
+            "task_templates",
+            "status",
+            "result",
+            "extended_result",
+            "score",
+            "is_scored",
+            "observation",
+            "applied_controls",
+        )
+    }
+    visible_ra_ids = set(
+        RoleAssignment.get_viewable_object_ids(user, RequirementAssessment)
+    )
+    visible_control_ids = (
+        _viewable_applied_control_ids(user)
+        if field_visible["applied_controls"]
+        else set()
+    )
+    visible_answer_ids = (
+        set(RoleAssignment.get_viewable_object_ids(user, Answer))
+        if field_visible["answers"]
+        else set()
+    )
+    visible_question_ids = (
+        set(RoleAssignment.get_viewable_object_ids(user, Question))
+        if field_visible["answers"]
+        else set()
+    )
+    visible_choice_ids = (
+        set(RoleAssignment.get_viewable_object_ids(user, QuestionChoice))
+        if field_visible["answers"]
+        else set()
+    )
+    visible_evidence_ids = (
+        set(RoleAssignment.get_viewable_object_ids(user, Evidence))
+        if field_visible["evidences"]
+        else set()
+    )
+    visible_task_template_ids = (
+        set(RoleAssignment.get_viewable_object_ids(user, TaskTemplate))
+        if field_visible["task_templates"]
+        else set()
+    )
 
     context = dict()
 
+    author_ids = list(audit.authors.order_by("id").values_list("id", flat=True))
+    reviewer_ids = list(audit.reviewers.order_by("id").values_list("id", flat=True))
+    actor_emails = _visible_actor_email_map(
+        {*author_ids, *reviewer_ids},
+        user=user,
+    )
     authors = ", ".join(
-        dict.fromkeys(email for a in audit.authors.all() for email in a.get_emails())
+        dict.fromkeys(
+            email for actor_id in author_ids for email in actor_emails.get(actor_id, ())
+        )
     )
     reviewers = ", ".join(
-        dict.fromkeys(email for r in audit.reviewers.all() for email in r.get_emails())
+        dict.fromkeys(
+            email
+            for actor_id in reviewer_ids
+            for email in actor_emails.get(actor_id, ())
+        )
     )
 
     spider_data = list()
@@ -477,8 +1119,6 @@ def gen_audit_context(id, doc, tree, lang):
         if node.get("max_score") is not None:
             max_score = node["max_score"]
             break
-    print(category_scores)
-
     for key, content in tree.items():
         total = sum(result_counts[content["urn"]].values())
         ok_items = result_counts[content["urn"]].get("compliant", 0) + result_counts[
@@ -504,9 +1144,6 @@ def gen_audit_context(id, doc, tree, lang):
                 aggregated[status] += count
 
     total = sum([v for v in aggregated.values()])
-    if total == 0:
-        print("Error:: No requirments found, something is wrong. aborting ..")
-        # NOTICE: We aren't aborting here, lead to a division by zero in the plot_donut function
     aggregated["total"] = total
 
     # temporary hack since the gettext_lazy wasn't consistent
@@ -614,19 +1251,28 @@ def gen_audit_context(id, doc, tree, lang):
     ]
 
     custom_colors = ["#2196F3"]
-    spider_chart_buffer = plot_spider_chart(
-        spider_data,
-        colors=custom_colors,
+    # Charts are ~99% of this function's cost (matplotlib at dpi=300); a caller
+    # that drops them — the countersigned export does — should not pay for them.
+    spider_chart_buffer = (
+        plot_spider_chart(spider_data, colors=custom_colors) if charts else None
     )
-
-    category_radar_buffer = plot_category_radar(
-        category_scores, max_score=max_score, colors=custom_colors
+    category_radar_buffer = (
+        plot_category_radar(category_scores, max_score=max_score, colors=custom_colors)
+        if charts
+        else None
     )
-    chart_category_radar = InlineImage(doc, category_radar_buffer, width=Cm(15))
-
-    requirement_assessments_objects = audit.get_requirement_assessments(
-        include_non_assessable=True
+    # `assessments` lets a caller pass a row-level-scoped set (see
+    # `scoped_requirement_assessments`). Always intersect that caller-provided
+    # scope with object IAM; neither source is sufficient on its own.
+    candidate_assessments = (
+        audit.get_requirement_assessments(include_non_assessable=True)
+        if assessments is None
+        else assessments
     )
+    requirement_assessments_objects = [
+        ra for ra in candidate_assessments if ra.id in visible_ra_ids
+    ]
+    projected_ra_ids = {ra.id for ra in requirement_assessments_objects}
 
     # Build flat list of requirement assessments for Word template
     requirement_assessments_list = []
@@ -642,21 +1288,64 @@ def gen_audit_context(id, doc, tree, lang):
                     ra.requirement, "description", lang
                 )
                 or "-",
-                "status": safe_translate(lang, ra.status),
-                "result": safe_translate(lang, ra.result),
-                "extended_result": safe_translate(lang, ra.extended_result),
-                "score": ra.score,
-                "max_score": audit.framework.max_score if ra.is_scored else None,
-                "observation": ra.observation or "-",
-                "applied_controls": ", ".join(
-                    ac.name for ac in ra.applied_controls.all()
+                "status": safe_translate(lang, ra.status)
+                if field_visible["status"]
+                else "-",
+                "result": safe_translate(lang, ra.result)
+                if field_visible["result"]
+                else "-",
+                # The label is localised; the colour must key off the raw value.
+                "result_key": ra.result or "" if field_visible["result"] else "",
+                "extended_result": safe_translate(lang, ra.extended_result)
+                if field_visible["extended_result"]
+                else "-",
+                "score": ra.score
+                if field_visible["score"] and field_visible["is_scored"]
+                else None,
+                "max_score": ra.get_resolved_scoring()["max_score"]
+                if ra.is_scored
+                and field_visible["score"]
+                and field_visible["is_scored"]
+                else None,
+                "observation": ra.observation or "-"
+                if field_visible["observation"]
+                else "-",
+                "answers": _answer_rows(
+                    ra,
+                    lang,
+                    visible_answer_ids=visible_answer_ids,
+                    visible_question_ids=visible_question_ids,
+                    visible_choice_ids=visible_choice_ids,
                 )
-                or "-",
+                if field_visible["answers"]
+                else [],
+                "evidences": [
+                    evidence.name
+                    for evidence in ra.evidences.filter(id__in=visible_evidence_ids)
+                ]
+                if field_visible["evidences"]
+                else [],
+                "task_templates": [
+                    task.name
+                    for task in ra.task_templates.filter(
+                        id__in=visible_task_template_ids
+                    )
+                ]
+                if field_visible["task_templates"]
+                else [],
+                "applied_controls": ", ".join(
+                    ac.name
+                    for ac in ra.applied_controls.filter(id__in=visible_control_ids)
+                )
+                or "-"
+                if field_visible["applied_controls"]
+                else "-",
             }
         )
 
     applied_controls = AppliedControl.objects.filter(
-        requirement_assessments__in=requirement_assessments_objects
+        requirement_assessments__in=requirement_assessments_objects,
+        id__in=visible_control_ids,
     ).distinct()
     ac_total = applied_controls.count()
     status_cnt = applied_controls.values("status").annotate(count=Count("id"))
@@ -671,11 +1360,10 @@ def gen_audit_context(id, doc, tree, lang):
     full_controls = list()
     for ac in applied_controls.filter(priority=1):
         requirements_count = (
-            RequirementAssessment.objects.filter(compliance_assessment=audit)
+            RequirementAssessment.objects.filter(id__in=projected_ra_ids)
             .filter(applied_controls=ac.id)
             .count()
         )
-        print(f"[{ac.name}] {ac.category}: {type(ac.category)}")
         p1_controls.append(
             {
                 "name": ac.name,
@@ -688,7 +1376,7 @@ def gen_audit_context(id, doc, tree, lang):
 
     for ac in applied_controls.all():
         requirements_count = (
-            RequirementAssessment.objects.filter(compliance_assessment=audit)
+            RequirementAssessment.objects.filter(id__in=projected_ra_ids)
             .filter(applied_controls=ac.id)
             .count()
         )
@@ -712,34 +1400,418 @@ def gen_audit_context(id, doc, tree, lang):
         "#F4D06F",
         "#BFDBFE",
     ]
-    hbar_buffer = plot_horizontal_bar(ac_chart_data, colors=custom_colors)
-
-    completion_bar_buffer = plot_completion_bar(spider_data, colors=custom_colors)
-
-    chart_completion = InlineImage(doc, completion_bar_buffer, width=Cm(15))
-
-    res_donut = InlineImage(doc, plot_donut(donut_data), width=Cm(15))
-    chart_spider = InlineImage(doc, spider_chart_buffer, width=Cm(15))
-    ac_chart = InlineImage(doc, hbar_buffer, width=Cm(15))
+    hbar_buffer = (
+        plot_horizontal_bar(ac_chart_data, colors=custom_colors) if charts else None
+    )
+    completion_bar_buffer = (
+        plot_completion_bar(spider_data, colors=custom_colors) if charts else None
+    )
+    donut_buffer = plot_donut(donut_data) if charts else None
     IGs = ", ".join([str(x) for x in audit.get_selected_implementation_groups()])
     context = {
         "audit": _build_safe_audit_context(audit),
         "date": now().strftime("%d/%m/%Y"),
+        # Traceability on the cover: which render, of which audit.
+        "generated_at": now().strftime("%Y-%m-%d %H:%M:%S %Z"),
         "contributors": f"{authors}\n{reviewers}",
         "req": aggregated,
-        "compliance_donut": res_donut,
-        "completion_bar": chart_completion,
-        "compliance_radar": chart_spider,
+        "compliance_donut": donut_buffer,
+        "completion_bar": completion_bar_buffer,
+        "compliance_radar": spider_chart_buffer,
         "drifts_per_domain": agg_drifts,
-        "chart_controls": ac_chart,
+        "chart_controls": hbar_buffer,
         "p1_controls": p1_controls,
         "full_controls": full_controls,
         "ac_count": ac_total,
         "igs": IGs,
         "category_scores": category_scores,
-        "category_radar": chart_category_radar,
+        "category_radar": category_radar_buffer,
         "requirement_assessments": requirement_assessments_list,
         "ra_count": len(requirement_assessments_list),
     }
 
     return context
+
+
+AUDIT_CHART_KEYS = (
+    "compliance_donut",
+    "completion_bar",
+    "compliance_radar",
+    "chart_controls",
+    "category_radar",
+)
+
+
+def inline_charts_for_docx(context, doc, width=Cm(15)):
+    """Wrap the chart buffers of `gen_audit_context` for docxtpl.
+
+    The context stays engine-agnostic so other renderers consume the same
+    buffers; the rewind lets one assembly feed several renders.
+    """
+    wrapped = dict(context)
+    for key in AUDIT_CHART_KEYS:
+        buffer = wrapped.get(key)
+        if buffer is None:
+            continue
+        buffer.seek(0)
+        wrapped[key] = InlineImage(doc, buffer, width=width)
+    return wrapped
+
+
+# Requirement-assessment fields governed by the audit's `field_visibility`;
+# `max_score` is not itself governed but is meaningless once `score` is dropped.
+_REDACTABLE_RA_FIELDS = (
+    "answers",
+    "evidences",
+    "task_templates",
+    "status",
+    "result",
+    "extended_result",
+    "score",
+    "observation",
+    "applied_controls",
+)
+
+# Data derived from a governed field. Redacting the field does not redact an
+# aggregate or an image computed from it, so they have to be dropped together —
+# otherwise the PDF discloses as a total or a picture what the rows withheld.
+_FIELD_DERIVED_CHARTS = {
+    "score": ("category_radar",),
+    "result": ("compliance_donut", "compliance_radar", "completion_bar"),
+}
+_FIELD_DERIVED_KEYS = {
+    "score": ("category_scores",),
+    "result": ("req", "drifts_per_domain"),
+    "applied_controls": ("p1_controls", "full_controls", "ac_count"),
+}
+
+# Report profiles. `sections` drives layout; `drops` drives the payload. Both are
+# needed: a template flag alone would leave excluded values in the JSON, and the
+# template is overridable, so anything a reader must not see is removed here.
+REPORT_PROFILES = {
+    "full": {
+        # Each profile has its own self-contained template per locale, so
+        # customising one cannot affect the others.
+        "template": "audit_report",
+        # The reader's own role still applies on top; this is the ceiling.
+        "role": "auditor",
+        "discloses": (),
+        "sections": (
+            "summary",
+            "charts",
+            "scope",
+            "drifts",
+            "categories",
+            "controls",
+            "requirements",
+            "answers",
+            "commitments",
+            "tasks",
+        ),
+    },
+    "attestation": {
+        "template": "attestation",
+        "role": "respondent",
+        # The questionnaire deliberately withholds the auditor's verdict while the
+        # respondent is answering (THIRD_PARTY_VISIBILITY marks `result` auditor-only).
+        # The attestation exists to state that verdict for agreement, so it is
+        # disclosed back when an auditor produces it — explicitly and in one place,
+        # rather than by a parallel redaction list that could drift from the audit's
+        # own configuration. A respondent selecting this profile cannot disclose it.
+        "discloses": ("result",),
+        # A record of what was recorded, not an analysis: no aggregate counts,
+        # percentages, drift tallies or charts — the same content selection as the
+        # zip's `audit_report.html`, which walks the requirements and prints what
+        # is on them.
+        "sections": (
+            "scope",
+            "requirements",
+            "answers",
+            "commitments",
+            "tasks",
+            "signatures",
+        ),
+    },
+}
+
+# Template chrome, keyed the way `frontend/messages/*.json` keys it so this can be
+# swapped for the shared catalog without touching the template. English literals
+# stand in until then — see docs/backend_i18n_catalog_shaping.md.
+
+
+# Commitment states are row data, so they are localised here rather than in the
+# per-locale template. Same category as `i18n_dict` above, retired by the same
+# catalog work; a new locale template needs an entry here too.
+_STATE_LABELS = {
+    "en": {
+        Commitment.State.UNDEFINED: "Undefined",
+        Commitment.State.IN_NEGOTIATION: "In negotiation",
+        Commitment.State.COMMITTED: "Committed",
+        Commitment.State.DECLINED: "Declined",
+        Commitment.State.FULFILLED: "Fulfilled",
+    },
+    "fr": {
+        Commitment.State.UNDEFINED: "Non défini",
+        Commitment.State.IN_NEGOTIATION: "En négociation",
+        Commitment.State.COMMITTED: "Engagé",
+        Commitment.State.DECLINED: "Refusé",
+        Commitment.State.FULFILLED: "Réalisé",
+    },
+}
+
+
+def _date_str(value):
+    return value.isoformat() if value else "-"
+
+
+def _current_visible_commitment(obj):
+    return next(
+        (
+            commitment
+            for commitment in getattr(obj, "report_commitments", ())
+            if commitment.is_current
+        ),
+        None,
+    )
+
+
+def _commitment_row(obj, lang, kind):
+    current = _current_visible_commitment(obj)
+    state = current.state if current else Commitment.State.UNDEFINED
+    states = _STATE_LABELS.get(lang, _STATE_LABELS["en"])
+    committed_eta = current.committed_eta if current else None
+    current_date = getattr(obj, obj.COMMITMENT_DATE_FIELD, None)
+    return {
+        "kind": kind,
+        "name": obj.name or "-",
+        "state": states.get(state, state),
+        "committed_eta": _date_str(committed_eta),
+        "current_date": _date_str(current_date),
+        "has_slipped": bool(
+            committed_eta and current_date and current_date > committed_eta
+        ),
+        "notes": (current.notes or "") if current else "",
+    }
+
+
+def audit_undertakings(audit, lang="en", assessments=None, hidden=(), *, user):
+    """Applied controls and tasks attached to the audit, with commitment state.
+
+    Returns ``(commitments, tasks)``: the first is everything carrying a live
+    commitment — the promises a counterparty would countersign — the second is the
+    task list regardless of commitment.
+
+    `assessments` must be the row-level-scoped set, or a respondent sees
+    undertakings hanging off requirements they were never assigned. Object IAM
+    is intersected even when the caller supplies that scope. `hidden` drops
+    whole categories the reader may not see.
+    """
+    from iam.models import RoleAssignment
+
+    candidate_ras = (
+        audit.get_requirement_assessments(include_non_assessable=False)
+        if assessments is None
+        else [ra for ra in assessments if ra.requirement.assessable]
+    )
+    visible_ra_ids = set(
+        RoleAssignment.get_viewable_object_ids(user, RequirementAssessment)
+    )
+    ras = [ra for ra in candidate_ras if ra.id in visible_ra_ids]
+    visible_control_ids = _viewable_applied_control_ids(user)
+    visible_task_ids = RoleAssignment.get_viewable_object_ids(user, TaskTemplate)
+    visible_commitment_ids = RoleAssignment.get_viewable_object_ids(user, Commitment)
+    visible_commitments = Commitment.objects.filter(id__in=visible_commitment_ids)
+    controls = (
+        AppliedControl.objects.filter(
+            requirement_assessments__in=ras,
+            id__in=visible_control_ids,
+        )
+        .distinct()
+        .prefetch_related(
+            Prefetch(
+                "commitments",
+                queryset=visible_commitments,
+                to_attr="report_commitments",
+            )
+        )
+        .order_by("eta")
+    )
+    task_templates = (
+        TaskTemplate.objects.filter(
+            requirement_assessments__in=ras,
+            id__in=visible_task_ids,
+        )
+        .distinct()
+        .prefetch_related(
+            Prefetch(
+                "commitments",
+                queryset=visible_commitments,
+                to_attr="report_commitments",
+            )
+        )
+        .order_by("name")
+    )
+
+    if "applied_controls" in hidden:
+        controls = []
+    if "task_templates" in hidden:
+        task_templates = []
+
+    tasks = [_commitment_row(t, lang, "task") for t in task_templates]
+    commitments = [
+        _commitment_row(obj, lang, kind)
+        for obj, kind in (
+            [(c, "control") for c in controls] + [(t, "task") for t in task_templates]
+        )
+        if (current := _current_visible_commitment(obj)) is not None
+        and current.state != Commitment.State.UNDEFINED
+    ]
+    return commitments, tasks
+
+
+def counterparty_context(audit, *, user):
+    """The assessed entity behind this audit, when it is a third-party questionnaire.
+
+    An audit reached through an entity assessment identifies a counterparty; a plain
+    internal audit does not, and the cover simply omits the block.
+    """
+    from iam.models import RoleAssignment
+    from tprm.models import Entity, EntityAssessment
+
+    visible_assessment_ids = RoleAssignment.get_viewable_object_ids(
+        user, EntityAssessment
+    )
+    visible_entity_ids = RoleAssignment.get_viewable_object_ids(user, Entity)
+    entity_assessment = (
+        audit.entityassessment_set.filter(
+            id__in=visible_assessment_ids,
+            entity_id__in=visible_entity_ids,
+        )
+        .select_related("entity")
+        .first()
+    )
+    if entity_assessment is None or entity_assessment.entity is None:
+        return None
+    entity = entity_assessment.entity
+    identifiers = entity.legal_identifiers or {}
+    return {
+        "entity": entity.name,
+        "ref_id": entity.ref_id or "",
+        "address": entity.address or "",
+        "legal_identifiers": [
+            {"label": key, "value": value}
+            for key, value in identifiers.items()
+            if value
+        ],
+        "expiry_date": _date_str(entity_assessment.expiry_date),
+        "assessment": entity_assessment.name,
+    }
+
+
+def audit_context_for_typst(
+    context,
+    audit,
+    role="auditor",
+    lang="en",
+    profile="full",
+    assessments=None,
+    *,
+    user,
+):
+    """Split `gen_audit_context` output into a JSON payload and chart images.
+
+    Fields hidden from `role` are dropped here rather than in the template:
+    templates are overridable, so a guard living in one could be removed by an
+    override and leak auditor-only values to a respondent.
+    """
+    payload = {
+        key: value for key, value in context.items() if key not in AUDIT_CHART_KEYS
+    }
+
+    spec = REPORT_PROFILES.get(profile, REPORT_PROFILES["full"])
+    # Least privilege of the two: an auditor exporting the external document gets
+    # the respondent's field set, and a respondent never escalates by asking for
+    # the internal one.
+    effective_role = "respondent" if "respondent" in (role, spec["role"]) else "auditor"
+    hidden = {
+        field
+        for field in _REDACTABLE_RA_FIELDS
+        if not is_field_visible_to(audit, field, effective_role)
+    }
+    # Disclose only what the auditor themselves can see: a field the *framework*
+    # hides from everyone (a maturity questionnaire that does not use `result`, say)
+    # is a stronger statement than the third-party base's auditor-only default, and
+    # the external copy must never show more than the internal one.
+    if role == "auditor":
+        hidden -= {
+            field
+            for field in spec["discloses"]
+            if is_field_visible_to(audit, field, "auditor")
+        }
+    score_visible = is_field_visible_to(
+        audit, "score", effective_role
+    ) and is_field_visible_to(audit, "is_scored", effective_role)
+    if not score_visible:
+        hidden.add("score")
+    if "score" in hidden:
+        audit_payload = payload.get("audit")
+        framework_payload = (
+            audit_payload.get("framework") if isinstance(audit_payload, dict) else None
+        )
+        if isinstance(framework_payload, dict):
+            payload["audit"] = {
+                **audit_payload,
+                "framework": {
+                    key: value
+                    for key, value in framework_payload.items()
+                    if key not in {"min_score", "max_score"}
+                },
+            }
+    if hidden:
+        payload["requirement_assessments"] = [
+            {
+                key: value
+                for key, value in ra.items()
+                if key not in hidden
+                and not (key == "max_score" and "score" in hidden)
+                and not (key == "result_key" and "result" in hidden)
+            }
+            for ra in payload.get("requirement_assessments", [])
+        ]
+    payload["hidden_fields"] = sorted(hidden)
+
+    images = {}
+    for key in AUDIT_CHART_KEYS:
+        buffer = context.get(key)
+        if buffer is None:
+            continue
+        buffer.seek(0)
+        images[f"{key}.png"] = buffer.read()
+    if "categories" not in spec["sections"]:
+        payload.pop("category_scores", None)
+
+    for field in hidden:
+        for key in _FIELD_DERIVED_KEYS.get(field, ()):
+            payload.pop(key, None)
+        for name in _FIELD_DERIVED_CHARTS.get(field, ()):
+            images.pop(f"{name}.png", None)
+
+    if {"commitments", "tasks"} & set(spec["sections"]):
+        commitments, tasks = audit_undertakings(
+            audit,
+            lang,
+            assessments,
+            hidden,
+            user=user,
+        )
+        payload["commitments"] = commitments
+        payload["tasks"] = tasks
+
+    if "charts" not in spec["sections"]:
+        images = {}
+
+    payload["counterparty"] = counterparty_context(audit, user=user)
+    payload["profile"] = profile
+    payload["sections"] = list(spec["sections"])
+    payload["charts"] = sorted(images)
+    return payload, images

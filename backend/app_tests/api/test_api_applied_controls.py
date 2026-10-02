@@ -166,6 +166,13 @@ class TestAppliedControlsAuthenticated:
             },
             user_group=test.user_group,
             scope=str(test.folder),
+            # Mutations deliberately return the caller-scoped read projection,
+            # not an unfiltered echo of write-serializer values.
+            mutation_response_params={
+                "folder": {"id": str(test.folder.id), "str": test.folder.name},
+                "category": APPLIED_CONTROL_CATEGORY[1],
+                "effort": APPLIED_CONTROL_EFFORT[1],
+            },
         )
 
     def test_update_applied_controls(self, test):
@@ -208,6 +215,11 @@ class TestAppliedControlsAuthenticated:
                 "status": APPLIED_CONTROL_STATUS._value_,
                 "effort": APPLIED_CONTROL_EFFORT[1],
                 "is_assigned": False,
+            },
+            test_params={
+                "folder": {"id": str(folder.id), "str": folder.name},
+                "category": APPLIED_CONTROL_CATEGORY2[1],
+                "effort": APPLIED_CONTROL_EFFORT2[1],
             },
             user_group=test.user_group,
         )
@@ -287,9 +299,7 @@ def _make_scoped_reader(folder):
     """User with READER role recursive on `folder` and nothing else.
     Built directly via RoleAssignment so the perimeter is exactly that
     one folder — what the masking assertions rely on."""
-    user = User.objects.create_user(
-        f"reader-{uuid.uuid4().hex[:6]}@perf.test", is_published=True
-    )
+    user = User.objects.create_user(f"reader-{uuid.uuid4().hex[:6]}@perf.test")
     role = Role.objects.get(name=RoleCodename.READER.value)
     ra = RoleAssignment.objects.create(
         user=user,

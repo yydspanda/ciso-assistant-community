@@ -12,6 +12,7 @@ from regulatory.models import (
     EntityDocumentRegistration,
     RegulatoryDocument,
     RegulatoryDocumentVersion,
+    RegulatoryFolderModel,
     RegulatoryObligation,
     RegulatoryProvision,
 )
@@ -25,6 +26,13 @@ from .factories import (
     make_synthetic_entity,
     make_user_with_permissions,
 )
+
+
+def test_regulatory_base_owns_nonpublication_field():
+    field = RegulatoryFolderModel._meta.get_field("is_published")
+
+    assert field.model is RegulatoryFolderModel
+    assert field.default is False
 
 
 @pytest.mark.django_db

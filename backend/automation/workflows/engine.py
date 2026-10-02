@@ -8,19 +8,28 @@ as `waiting`; everything else executes and advances in the same call.
 
 import contextvars
 import re
+from collections.abc import Callable
 from datetime import date, timedelta
 
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
 from .actions import (
+    MISSING,
     ActionError,
+    DeferredTask,
+    FatalActionError,
     _read_scope_folder_ids,
     _render_context,
     dig,
     execute_action,
+    read_page,
+    read_page_limit,
+    read_snapshot_ids,
     render,
 )
+from .context import RESERVED_VARIABLE_KEYS, temporal_seeds
 from .models import (
     WorkflowInstance,
     WorkflowInstanceLog,
@@ -245,6 +254,7 @@ def create_instance(
     trigger_depth=0,
     entry_node=None,
     initial_variables=None,
+    trigger_cid="",
 ):
     if entry_node is None:
         entry_node = default_entry_node(version)
@@ -259,6 +269,8 @@ def create_instance(
     # caller (manual-run endpoint) validates keys and types beforehand.
     if initial_variables:
         variables.update(initial_variables)
+    # Engine-owned last; these keys are reserved, so nothing authored is lost.
+    variables.update(temporal_seeds(trigger_registration))
     if payload:
         variables["payload"] = payload
 
@@ -277,6 +289,7 @@ def create_instance(
             parent_token=parent_token,
             trigger_registration=trigger_registration,
             trigger_depth=trigger_depth,
+            trigger_cid=trigger_cid,
         )
         _log(
             instance,
@@ -309,6 +322,84 @@ def resume_token(token):
         token.save(update_fields=["status", "updated_at"])
         _advance(token)
         _run(instance)
+
+
+def claim_deferred_action(token_id: str, dispatch_id: str) -> WorkflowToken | None:
+    """Exclusive claim on a parked token's dispatch, returning None when
+    another delivery already took it. Same CAS pattern as retry_token_task:
+    huey may deliver a task twice, and a read-then-act window would let both
+    deliveries run the side effect. The token stays WAITING while in flight,
+    so _run never picks it up mid-delivery."""
+    claimed = WorkflowToken.objects.filter(
+        id=token_id,
+        status=WorkflowToken.Status.WAITING,
+        dispatch_id=dispatch_id,
+    ).update(dispatch_id=None)
+    if not claimed:
+        return None
+    return WorkflowToken.objects.select_related("instance").get(id=token_id)
+
+
+def _resume_deferred(
+    token: WorkflowToken, on_resume: Callable[[WorkflowInstance], None]
+) -> None:
+    """Shared scaffolding for a deferred action's task handing its token
+    back: run `on_resume` then the instance under the tree lock and the
+    instance's trigger depth. The WAITING re-check makes duplicate task
+    deliveries and operator interference no-ops."""
+    depth_token = current_trigger_depth.set(token.instance.trigger_depth)
+    try:
+        with transaction.atomic():
+            instance = _lock_instance_tree(token.instance_id)
+            token.refresh_from_db()
+            if token.status != WorkflowToken.Status.WAITING:
+                return
+            token.instance = instance
+            on_resume(instance)
+            _run(instance)
+    finally:
+        current_trigger_depth.reset(depth_token)
+
+
+def complete_deferred_action(token: WorkflowToken, output: dict) -> None:
+    """A deferred action's task reports success: persist the output, log the
+    execution and advance."""
+
+    def on_resume(instance):
+        node = token.current_node
+        try:
+            _persist_node_output(node, output, instance)
+        except FatalActionError as e:
+            # The dispatch claim is already committed: escaping would roll the
+            # resume back and leave the token WAITING for a task that is never
+            # delivered again (as _refresh_status does for a subprocess).
+            token.status = WorkflowToken.Status.ACTIVE
+            token.save(update_fields=["status", "updated_at"])
+            _handle_failure(token, str(e), retryable=False)
+            return
+        _log(
+            instance,
+            WorkflowInstanceLog.EventType.ACTION_EXECUTED,
+            node=node,
+            message=(node.action_config or {}).get("type", ""),
+            data=_truncate_log_data(output),
+        )
+        _advance(token)
+
+    _resume_deferred(token, on_resume)
+
+
+def fail_deferred_action(token: WorkflowToken, message: str) -> None:
+    """A deferred action's task reports failure: route through the node's
+    retry policy exactly like a synchronous ActionError (mirrors the failed
+    async-subprocess path in _refresh_status)."""
+
+    def on_resume(instance):
+        token.status = WorkflowToken.Status.ACTIVE
+        token.save(update_fields=["status", "updated_at"])
+        _handle_failure(token, message)
+
+    _resume_deferred(token, on_resume)
 
 
 def _reopen(instance):
@@ -492,6 +583,7 @@ def _process(token):
     _set_iteration_overlay(token)
 
     failure = None
+    failure_retryable = True
     try:
         # Savepoint: a DB error here would otherwise poison run_instance's
         # atomic block and take _handle_failure's error token down with it.
@@ -530,6 +622,9 @@ def _process(token):
                 if node.type == WorkflowNode.Type.ACTION:
                     config = node.action_config or {}
                     output = execute_action(node, instance) or {}
+                    if isinstance(output, DeferredTask):
+                        output.dispatch(token)
+                        return
                     _persist_node_output(node, output, instance)
                     _log(
                         instance,
@@ -549,19 +644,24 @@ def _process(token):
                     return
 
                 _advance(token)
+            except FatalActionError as e:
+                failure = str(e)
+                failure_retryable = False
             except (ActionError, EngineError) as e:
                 failure = str(e)
     except Exception as e:  # noqa: BLE001 — a buggy action must not 500 the request
         failure = f"{type(e).__name__}: {e}"
     if failure is not None:
-        _handle_failure(token, failure)
+        _handle_failure(token, failure, retryable=failure_retryable)
 
 
-def _handle_failure(token, message):
-    """Retry policy: schedule a delayed Huey re-execution while
-    attempts remain on action/subprocess nodes, else park the token in error."""
+def _handle_failure(token, message, retryable=True):
+    """Retry policy: schedule a delayed Huey re-execution while attempts
+    remain on action/subprocess nodes, else park the token in error.
+    retryable=False (permanent config/validation failures) skips the retry
+    schedule and fails immediately — no retry can change the outcome."""
     node = token.current_node
-    retryable = node.type in (
+    retryable = retryable and node.type in (
         WorkflowNode.Type.ACTION,
         WorkflowNode.Type.SUBPROCESS,
     )
@@ -621,7 +721,18 @@ def _handle_failure(token, message):
     )
 
 
-LOOP_MAX_ITEMS = 100
+def loop_max_items():
+    """Items one loop will iterate from a list. Same trade-off as the read cap:
+    every item is a token and an action execution. Read at call time so a
+    deployment (or a test) can change it."""
+    return int(getattr(settings, "WORKFLOW_LOOP_MAX_ITEMS", 500))
+
+
+def loop_max_pages():
+    """Pages a reading loop pulls before it stops on its own."""
+    return int(getattr(settings, "WORKFLOW_LOOP_MAX_PAGES", 20))
+
+
 LOOP_TEMPLATE_RE = re.compile(r"^\{\{\s*([\w.]+)\s*\}\}$")
 
 
@@ -651,21 +762,40 @@ def _process_loop(token):
 
     # Fresh arrival: this token becomes the controller.
     config = node.loop_config or {}
-    expression = config.get("collection") or ""
-    match = LOOP_TEMPLATE_RE.match(expression) if isinstance(expression, str) else None
-    if match is None:
-        raise ActionError("loop: collection must be a single {{path}} expression")
+    read_config = config.get("read")
+    paged = isinstance(read_config, dict) and bool(read_config)
     _set_iteration_overlay(token)
-    items = dig(_render_context(instance), match.group(1))
-    if items is None:
-        items = []
-    if not isinstance(items, list):
-        raise ActionError(
-            f"loop: '{expression}' did not resolve to a list "
-            f"(got {type(items).__name__})"
+    if paged:
+        # The loop pulls its own pages, so a sweep stays three nodes whatever
+        # the size of the set. The ids are frozen up front: paging the live
+        # queryset by offset would skip rows as the body mutates them out of
+        # the filter match (the canonical sweep filters on the very field it
+        # updates). The snapshot is bounded by the item ceiling.
+        snapshot = read_snapshot_ids(node, instance, read_config, loop_max_items() + 1)
+        items, next_offset = _read_snapshot_page(
+            node, instance, read_config, snapshot, 0
         )
-    if len(items) > LOOP_MAX_ITEMS:
-        raise ActionError(f"loop: {len(items)} items exceeds the {LOOP_MAX_ITEMS} cap")
+    else:
+        snapshot = None
+        expression = config.get("collection") or ""
+        match = (
+            LOOP_TEMPLATE_RE.match(expression) if isinstance(expression, str) else None
+        )
+        if match is None:
+            raise ActionError("loop: collection must be a single {{path}} expression")
+        items = dig(_render_context(instance), match.group(1))
+        if items is None:
+            items = []
+        if not isinstance(items, list):
+            raise ActionError(
+                f"loop: '{expression}' did not resolve to a list "
+                f"(got {type(items).__name__})"
+            )
+        if len(items) > loop_max_items():
+            raise ActionError(
+                f"loop: {len(items)} items exceeds the {loop_max_items()} cap"
+            )
+        next_offset = 0
 
     token.status = WorkflowToken.Status.WAITING
     token.loop_state = {
@@ -674,9 +804,33 @@ def _process_loop(token):
         "outstanding": 0,
         "results": [],
         "errors": [],
+        "processed": 0,
+        "read": read_config if paged else None,
+        "snapshot": snapshot,
+        "next_offset": next_offset,
+        "pages": 1 if paged else 0,
     }
     token.save(update_fields=["status", "loop_state", "updated_at"])
     _loop_next_iteration(token)
+
+
+def _loop_stop_reason(state):
+    """Why a loop stops before its items do. Checked between iterations, so it
+    stops before the next item's side effects rather than after all of them."""
+    collected = len(state.get("results") or [])
+    if state.get("processed", 0) >= loop_max_items():
+        return f"stopped after {loop_max_items()} items"
+    if collected >= MAX_COLLECTION_ITEMS:
+        return f"stopped after collecting {MAX_COLLECTION_ITEMS} items"
+    # Predictive, against the widest item seen: noticing once over means having
+    # collected what cannot be kept, and dropping it loses work the run did.
+    room = node_output_budget() - state.get("collected_chars", 0)
+    if collected and room <= state.get("widest_item", 0):
+        return (
+            f"stopped after collecting {collected} items: another would not fit "
+            f"in one node output (WORKFLOW_NODE_OUTPUT_BUDGET)"
+        )
+    return None
 
 
 def _loop_next_iteration(controller):
@@ -685,6 +839,16 @@ def _loop_next_iteration(controller):
     state = controller.loop_state
     state["index"] += 1
 
+    stop = _loop_stop_reason(state)
+    if stop:
+        state["stopped"] = stop
+        _loop_finish(controller)
+        return
+
+    if state["index"] >= len(state["items"]) and _loop_load_next_page(
+        controller, state
+    ):
+        pass
     if state["index"] >= len(state["items"]):
         _loop_finish(controller)
         return
@@ -693,6 +857,7 @@ def _loop_next_iteration(controller):
     if not each_edges:
         raise ActionError("loop: no edge leaves the 'each' port")
     item = state["items"][state["index"]]
+    state["processed"] = state.get("processed", 0) + 1
     state["outstanding"] = len(each_edges)
     controller.loop_state = state
     controller.save(update_fields=["loop_state", "updated_at"])
@@ -735,9 +900,63 @@ def _loop_body_returned(controller, failed):
         value = dig(ctx, match.group(1)) if match else render(collect, ctx)
         controller.instance._iteration_context = None
         state["results"].append(value)
+        # Rough on purpose: it only has to notice the ceiling coming.
+        size = len(str(value))
+        state["collected_chars"] = state.get("collected_chars", 0) + size
+        state["widest_item"] = max(state.get("widest_item", 0), size)
         controller.loop_state = state
         controller.save(update_fields=["loop_state", "updated_at"])
     _loop_next_iteration(controller)
+
+
+def _read_snapshot_page(node, instance, read_config, snapshot, start):
+    """Rows for the next non-empty slice of the loop's frozen id snapshot.
+    A slice can come back short or empty (rows deleted, or no longer visible,
+    since the snapshot); keep sliding until rows turn up or the snapshot is
+    exhausted. Returns (items, next_start), next_start 0 when exhausted."""
+    limit = read_page_limit(read_config)
+    items = []
+    while not items and start < len(snapshot):
+        ids = snapshot[start : start + limit]
+        start += limit
+        items = read_page(node, instance, read_config, ids)
+    return items, (start if start < len(snapshot) else 0)
+
+
+def _loop_load_next_page(controller, state):
+    """Pull the next page into the controller, if the loop reads its own and
+    there is one. Returns True when fresh items are available."""
+    if not state.get("read") or not state.get("next_offset"):
+        return False
+    if state.get("pages", 0) >= loop_max_pages():
+        # A ceiling, not an item that failed — same as the others.
+        state["stopped"] = f"stopped after {loop_max_pages()} pages"
+        return False
+    try:
+        items, next_offset = _read_snapshot_page(
+            controller.current_node,
+            controller.instance,
+            state["read"],
+            state.get("snapshot") or [],
+            state["next_offset"],
+        )
+    except (ActionError, FatalActionError) as e:
+        # A failed page read must not unwind through the body token that
+        # triggered it: that token is already COMPLETED, so _handle_failure
+        # would collect it a second time (outstanding below zero, the second
+        # raise escaping run_instance's transaction). Record the failure on
+        # the loop and finish with the items already processed.
+        state["errors"].append(
+            {"index": state["index"], "message": f"page read failed: {e}"}
+        )
+        return False
+    if not items:
+        return False
+    state["items"] = items
+    state["index"] = 0
+    state["next_offset"] = next_offset
+    state["pages"] = state.get("pages", 0) + 1
+    return True
 
 
 def _loop_finish(controller):
@@ -745,15 +964,31 @@ def _loop_finish(controller):
     instance = controller.instance
     state = controller.loop_state
     output = {
-        "count": len(state["items"]),
+        "count": state.get("processed", len(state["items"])),
         "results": state["results"],
         "errors": state["errors"],
+        "pages": state.get("pages", 0),
+        # Why it ended early. Not in `errors`: no item went wrong, and a step
+        # branching on failures must not see one here.
+        "stopped": state.get("stopped"),
     }
-    _persist_node_output(node, output, instance)
+    try:
+        _persist_node_output(node, output, instance)
+    except FatalActionError as e:
+        # Runs under the body token that closed the last iteration: escaping
+        # here would route the loop's failure through _handle_failure, which
+        # collects that iteration again and arrives back with a second raise,
+        # this one outside the run transaction. Fail the loop itself.
+        controller.loop_state = {}
+        controller.save(update_fields=["loop_state", "updated_at"])
+        _fail_token(controller, str(e))
+        return
     failed = len(state["errors"])
     message = f"processed {output['count']} items"
     if failed:
         message += f" · {failed} failed"
+    if output["stopped"]:
+        message += f" · {output['stopped']}"
     _log(
         instance,
         WorkflowInstanceLog.EventType.LOOP_COMPLETED,
@@ -824,33 +1059,71 @@ def _start_subprocess(token):
         raise EngineError(f"Subprocess failed ({child})")
 
 
+def _foreign_output(node):
+    """Whether this node's output is a remote's payload rather than the step's
+    own product. Declared by the action, not guessed from its name."""
+    from .actions import ACTION_REGISTRY
+
+    action = ACTION_REGISTRY.get((node.action_config or {}).get("type"))
+    return bool(getattr(action, "foreign_output", False))
+
+
 def _store_node_output(node, output, instance):
     """Record the node's output (in memory) for {{nodes.<ref>.<path>}} references
-    and the builder's reference-run data browser. Structure-preserving: nested
-    JSON stays navigable and referenceable; only oversized leaves and collections
-    shrink. The display log truncates flat and harder. Persisting is the caller's
-    job — see _persist_node_output."""
+    and the builder's data browser. Persisting is the caller's job — see
+    _persist_node_output.
+
+    Dropping records fails the node: they are the next node's input, so a silent
+    cut means a write-up short of what the run processed. Shortening one string
+    keeps the value, so that stays quiet — as does a payload the action declared
+    foreign, where the trim markers say what was cut.
+    """
     key = node.ref or str(node.id)
-    instance.node_outputs[key] = _cap_structure(output)
+    lost = []
+    instance.node_outputs[key] = _cap_structure(output, lost=lost)
+    if lost and not _foreign_output(node):
+        # Only the character budget is a setting; naming it for the item and
+        # depth caps, which are constants, would misdirect.
+        raisable = {remedy for _what, remedy in lost if remedy}
+        hint = f" Or raise {', '.join(sorted(raisable))}." if raisable else ""
+        raise FatalActionError(
+            f"This step produced more than one node output can hold, so "
+            f"{'; '.join(what for what, _remedy in lost)}. Narrow what the step "
+            f"reads.{hint}"
+        )
 
 
 MAX_LEAF_CHARS = 1000
-MAX_COLLECTION_ITEMS = 100
+MAX_COLLECTION_ITEMS = 2000
 MAX_STRUCTURE_DEPTH = 10
 
 
-def _cap_structure(value, budget=None, depth=0):
-    """Bound node_outputs without flattening: dicts and lists keep their shape
-    (so paths into them keep working), long strings truncate, huge collections
-    tail-omit, and a global character budget backstops pathological payloads."""
+def node_output_budget():
+    """Characters one node output may hold. `node_outputs` keeps every node's
+    output in one JSONField, rewritten on each node completion."""
+    return int(getattr(settings, "WORKFLOW_NODE_OUTPUT_BUDGET", 500_000))
+
+
+def _cap_structure(value, budget=None, depth=0, lost=None):
+    """Bound node_outputs without flattening: dicts and lists keep their shape so
+    paths into them keep working. `lost` collects what the caller no longer
+    has."""
     if budget is None:
-        budget = [32000]
+        budget = [node_output_budget()]
+
+    def drop(what, remedy=None):
+        if lost is not None:
+            lost.append((what, remedy))
+
     if budget[0] <= 0:
+        drop("the output budget ran out", "WORKFLOW_NODE_OUTPUT_BUDGET")
         return "<truncated: output budget exceeded>"
     if depth > MAX_STRUCTURE_DEPTH:
+        drop(f"nesting past {MAX_STRUCTURE_DEPTH} levels was dropped")
         return "<truncated: max depth>"
 
     if isinstance(value, str):
+        # Quiet: the value is still there and says how much was cut.
         if len(value) > MAX_LEAF_CHARS:
             budget[0] -= MAX_LEAF_CHARS
             return f"{value[:MAX_LEAF_CHARS]}… <{len(value)} chars truncated>"
@@ -861,19 +1134,31 @@ def _cap_structure(value, budget=None, depth=0):
         capped = {}
         for index, (key, item) in enumerate(value.items()):
             if index >= MAX_COLLECTION_ITEMS or budget[0] <= 0:
+                drop(
+                    f"{len(value) - index} of {len(value)} keys were dropped",
+                    None
+                    if index >= MAX_COLLECTION_ITEMS
+                    else "WORKFLOW_NODE_OUTPUT_BUDGET",
+                )
                 capped["<omitted>"] = f"{len(value) - index} more keys"
                 break
             budget[0] -= len(str(key))
-            capped[key] = _cap_structure(item, budget, depth + 1)
+            capped[key] = _cap_structure(item, budget, depth + 1, lost)
         return capped
 
     if isinstance(value, list):
         capped_items = []
         for index, item in enumerate(value):
             if index >= MAX_COLLECTION_ITEMS or budget[0] <= 0:
+                drop(
+                    f"{len(value) - index} of {len(value)} items were dropped",
+                    None
+                    if index >= MAX_COLLECTION_ITEMS
+                    else "WORKFLOW_NODE_OUTPUT_BUDGET",
+                )
                 capped_items.append(f"<{len(value) - index} more items>")
                 break
-            capped_items.append(_cap_structure(item, budget, depth + 1))
+            capped_items.append(_cap_structure(item, budget, depth + 1, lost))
         return capped_items
 
     budget[0] -= 8
@@ -888,8 +1173,26 @@ def _apply_output_mapping(node, output, instance):
         return
     updates = {}
     for variable_key, path in mapping.items():
-        value = dig(output, path)
-        if value is not None:
+        if variable_key in RESERVED_VARIABLE_KEYS:
+            # Refused at publish too; this covers graphs published before that
+            # check existed. Seeds stay engine-owned.
+            continue
+        value = dig(output, path, MISSING)
+        if value is MISSING:
+            # A silent skip is what makes a mis-authored mapping look like an
+            # engine bug; leave a trace in the run log instead. A present null
+            # is a legitimate value the step chose not to set, so it stays quiet.
+            _log(
+                instance,
+                WorkflowInstanceLog.EventType.ERROR,
+                node=node,
+                message=(
+                    f"Output mapping skipped: '{variable_key}' ← '{path}' "
+                    "is not present in this step's output"
+                ),
+                data={"variable": variable_key, "path": str(path)},
+            )
+        elif value is not None:
             updates[variable_key] = value
     if updates:
         instance.variables.update(updates)
@@ -1155,9 +1458,19 @@ def _refresh_status(instance):
             if parent_token.status != WorkflowToken.Status.WAITING:
                 return
             parent_token.instance = parent_instance
-            _persist_node_output(
-                parent_token.current_node, instance.variables, parent_instance
-            )
+            try:
+                _persist_node_output(
+                    parent_token.current_node, instance.variables, parent_instance
+                )
+            except FatalActionError as e:
+                # A child whose variables outgrow the output cap fails the
+                # parent's node; letting it escape would roll this block back
+                # and leave the parent token waiting for a child that is done.
+                parent_token.status = WorkflowToken.Status.ACTIVE
+                parent_token.save(update_fields=["status", "updated_at"])
+                _handle_failure(parent_token, str(e), retryable=False)
+                _run(parent_instance)
+                return
             # resume_token re-acquires the same row lock in this transaction
             # (a no-op) and re-checks WAITING before advancing.
             resume_token(parent_token)

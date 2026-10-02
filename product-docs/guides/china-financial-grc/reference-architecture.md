@@ -13,8 +13,10 @@ description: Proposed trust boundaries and information flow for the China financ
 > append-only applicability-decision aggregate and its independent named-human
 > review-disposition stream. Its public API is read-only. Applicability and its
 > review remain draft, non-binding, unpublished, and limited to a fixed rule and
-> synthetic observations. Legal supersession, approval/publication, source text,
-> real-institution facts, projections, and agents remain proposed.
+> synthetic observations. A synthetic whole-version replacement edge now adds
+> dual-time selection without legal approval. Real-law lifecycle,
+> approval/publication, source text, real-institution facts, projections, and
+> agents remain proposed.
 
 ```mermaid
 flowchart LR
@@ -55,6 +57,39 @@ These behaviours are tested on the project's SQLite path. PostgreSQL migration,
 two-connection concurrency, and representative query-plan evidence remain
 production acceptance gates. The durable contract and rollback boundary are in
 [ADR 0002](../../../documentation/china-financial-grc/adr/0002-recorded-time-correction.md).
+
+## Synthetic whole-version replacement and selection
+
+An independent internal service can append a synthetic metadata-only version
+and a non-binding replacement edge under dedicated folder-scoped human
+authority. It never rewrites the old source intervals or transfers decisions
+and reviews to the new obligations. A known edge supplies a derived, exclusive
+valid-time end; its server-owned recorded time determines when it can be used.
+
+The detail, applicability and review GETs accept the same `valid_on`, portable
+`version_id` and `recorded_as_of` selectors and return one shared `selection`
+anchor. Unknown or contradictory selections fail closed. Version-only reads
+are previews, not statements of applicability. The frontend pins its panels
+to the detail's exact resolved version, valid date and recorded instant.
+
+Partial amendment, repeal/transition, binding legal review and publication
+remain absent. New correction of a document bound to an edge is refused until
+a separate rebind contract is reviewed. A local synthetic upgrade passes 168
+PostgreSQL regulatory cases and 12 authenticated Chromium/Firefox cases.
+An initial frozen recovery trial fails its columns/indexes comparison and is
+retained. Separate read-only diagnosis supports a new strict logical-schema
+profile, preserving relative column order and permitting only one named MFA
+index's exact typed predicate-cast pair, with raw metadata retained. The prior
+constraint-cast rules remain in effect; raw CHECK text may still differ. A distinct
+new run passes actual-old-code upgrade, old records/all 565 audit entries
+preservation, empty rollback/reapply, populated-history rollback protection,
+five SQL/constraint probes, backup/restore across all 30 captured components,
+restored append and 168 PostgreSQL regressions. Source/dependency/seven-harness
+freeze matches. No native MFA or historical DDL changes. This is synthetic
+logical recovery, not physical-schema identity, WORM, PITR or production approval.
+The changed CI/ledger head still needs its own hosted and protected-main checks.
+See
+[ADR 0005](../../../documentation/china-financial-grc/adr/0005-synthetic-whole-version-supersession.md).
 
 ## Implemented synthetic applicability contract
 
@@ -148,7 +183,7 @@ metadata-only projection, while the server validates response shape and binds
 document, entity, obligation revision, recorded time, and decision digest before
 combining panels. The generic entity list only assists discovery; API-side IAM
 and registration checks remain authoritative. Current panel reads share the
-applicability response's microsecond-precise selection anchor. The projection
+detail response's exact version/date/microsecond selection anchor. The projection
 accepts only HTTPS official-source links and strips provision text and free-text
 version notes; decision valid time is shown separately from recorded time. The
 interface contains no state-changing review or approval control.

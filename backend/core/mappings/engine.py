@@ -1,22 +1,157 @@
 from django.db.models import Q
 from core.models import (
+    AppliedControl,
     Framework,
     StoredLibrary,
     ComplianceAssessment,
+    Evidence,
+    RequirementAssessment,
+    SecurityException,
+    RequirementNode,
+    rescale_score,
 )
 from django.db.models.query import QuerySet
 from collections import defaultdict, deque
+from dataclasses import dataclass
+from hashlib import sha256
 from typing import Optional
 import json
 import zlib
 
 
+MappingEdgeIdentity = tuple[str, str, str, str, str, str]
+
+
+@dataclass(frozen=True)
+class MappingAuthorization:
+    """Immutable caller-scoped authorization for the mapping graph.
+
+    Runtime mapping edges are owned by a ``StoredLibrary`` JSON artifact. A
+    live ``RequirementMappingSet`` row is a different identity and its UUID
+    must never authorize one of these cached edges. The edge identity binds
+    the stored owner, mapping-set URN, endpoints, and exact content digest.
+    """
+
+    framework_urns: frozenset[str]
+    requirement_node_urns: frozenset[str]
+    edge_identities: frozenset[MappingEdgeIdentity]
+
+    def allows_framework(self, urn: str) -> bool:
+        return isinstance(urn, str) and urn.lower() in self.framework_urns
+
+    def allows_requirement_node(self, urn: str) -> bool:
+        return isinstance(urn, str) and urn.lower() in self.requirement_node_urns
+
+    def allows_edge(self, mapping_set: dict) -> bool:
+        identity = canonical_mapping_edge_identity(mapping_set)
+        if identity is None or identity not in self.edge_identities:
+            return False
+        mappings = mapping_set.get("requirement_mappings")
+        if not isinstance(mappings, list) or not mappings:
+            return False
+        return all(
+            isinstance(mapping, dict)
+            and self.allows_requirement_node(mapping.get("source_requirement_urn"))
+            and self.allows_requirement_node(mapping.get("target_requirement_urn"))
+            for mapping in mappings
+        )
+
+
+_EDGE_RUNTIME_KEYS = {
+    "id",
+    "library_urn",
+    "owner_stored_library_id",
+    "owner_stored_library_urn",
+}
+
+
+def mapping_set_with_owner(mapping_set: dict, stored_library) -> dict:
+    """Return an unambiguous cached edge without mutating stored JSON."""
+
+    result = dict(mapping_set)
+    owner_id = str(stored_library.id)
+    owner_urn = str(stored_library.urn).lower()
+    # Retain these two established keys for the existing API wire shape.
+    result["id"] = owner_id
+    result["library_urn"] = owner_urn
+    result["owner_stored_library_id"] = owner_id
+    result["owner_stored_library_urn"] = owner_urn
+    return result
+
+
+def canonical_mapping_edge_identity(
+    mapping_set: dict,
+) -> Optional[MappingEdgeIdentity]:
+    """Bind one runtime edge to its exact StoredLibrary-backed identity."""
+
+    if not isinstance(mapping_set, dict):
+        return None
+    try:
+        from uuid import UUID
+
+        owner_id = str(
+            UUID(
+                str(mapping_set.get("owner_stored_library_id") or mapping_set.get("id"))
+            )
+        )
+    except TypeError, ValueError:
+        return None
+
+    fields = []
+    for name in (
+        "owner_stored_library_urn",
+        "urn",
+        "source_framework_urn",
+        "target_framework_urn",
+    ):
+        value = mapping_set.get(name)
+        if name == "owner_stored_library_urn" and not value:
+            value = mapping_set.get("library_urn")
+        if not isinstance(value, str) or not value.strip():
+            return None
+        fields.append(value.lower())
+
+    canonical_content = {
+        key: value
+        for key, value in mapping_set.items()
+        if key not in _EDGE_RUNTIME_KEYS
+    }
+    try:
+        digest = sha256(
+            json.dumps(
+                canonical_content,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+    except TypeError, ValueError:
+        return None
+    owner_urn, mapping_urn, source_urn, target_urn = fields
+    return owner_id, owner_urn, mapping_urn, source_urn, target_urn, digest
+
+
 class MappingEngine:
     def __init__(self):
-        self._all_rms = None
-        self._framework_mappings = None
-        self._frameworks = None
-        self._direct_mappings = None
+        """Reads the mapping graph from the database.
+
+        Nothing is kept between instances on purpose. A module-level one is a
+        cache per gunicorn worker, refreshed only in the worker that handled
+        the write, so the others answer from a graph that predates a library
+        loaded elsewhere (#4791). Callers build one per request instead.
+        """
+        self._frameworks = self.load_frameworks()
+        (
+            self._all_rms,
+            self._framework_mappings,
+            self._direct_mappings,
+        ) = self.load_rms_data()
+        self.own_scales = {
+            urn: (min_score, max_score)
+            for urn, min_score, max_score in RequirementNode.objects.exclude(
+                min_score__isnull=True, max_score__isnull=True
+            ).values_list("urn", "min_score", "max_score")
+        }
 
         self.fields_to_map: list[str] = [
             "result",
@@ -33,13 +168,8 @@ class MappingEngine:
             "evidences",
         ]
 
-    def _ensure_loaded(self):
-        if self._frameworks is None:
-            self.reload_cache()
-
     @property
     def all_rms(self):
-        self._ensure_loaded()
         return self._all_rms
 
     @all_rms.setter
@@ -48,7 +178,6 @@ class MappingEngine:
 
     @property
     def framework_mappings(self):
-        self._ensure_loaded()
         return self._framework_mappings
 
     @framework_mappings.setter
@@ -57,7 +186,6 @@ class MappingEngine:
 
     @property
     def frameworks(self):
-        self._ensure_loaded()
         return self._frameworks
 
     @frameworks.setter
@@ -66,7 +194,6 @@ class MappingEngine:
 
     @property
     def direct_mappings(self):
-        self._ensure_loaded()
         return self._direct_mappings
 
     @direct_mappings.setter
@@ -85,33 +212,6 @@ class MappingEngine:
         if data is None:
             return None
         return self._decompress_rms(data)
-
-    def reload_cache(self) -> None:
-        """Reloads all engine cache data: frameworks and RMS data.
-
-        Builds new local containers from the database first, and only swaps
-        them into the instance attributes after both reads succeed. If the
-        tables are not yet available (e.g. during migrations), the existing
-        instance cache is preserved so ``_ensure_loaded`` can retry later.
-        """
-        from django.db.utils import ProgrammingError, OperationalError
-
-        try:
-            local_frameworks = self.load_frameworks()
-            (
-                local_all_rms,
-                local_framework_mappings,
-                local_direct_mappings,
-            ) = self.load_rms_data()
-        except ProgrammingError, OperationalError:
-            # Tables might not exist during migrations. Preserve whatever
-            # cache state already exists and let the next access retry.
-            return
-
-        self._frameworks = local_frameworks
-        self._all_rms = local_all_rms
-        self._framework_mappings = local_framework_mappings
-        self._direct_mappings = local_direct_mappings
 
     def load_rms_data(
         self,
@@ -132,26 +232,23 @@ class MappingEngine:
             | Q(content__requirement_mapping_sets__isnull=False),
             is_loaded=True,
         ):
-            library_urn = lib.urn
-            lib_id = lib.id
             content = lib.content
 
             if isinstance(content, dict):
                 if "requirement_mapping_set" in content:
-                    obj = content["requirement_mapping_set"]
+                    obj = mapping_set_with_owner(
+                        content["requirement_mapping_set"], lib
+                    )
                     index = (obj["source_framework_urn"], obj["target_framework_urn"])
-                    obj["library_urn"] = library_urn
-                    obj["id"] = str(lib_id)
                     all_rms[index] = self._compress_rms(obj)
 
                 if "requirement_mapping_sets" in content:
-                    for obj in content["requirement_mapping_sets"]:
+                    for raw_obj in content["requirement_mapping_sets"]:
+                        obj = mapping_set_with_owner(raw_obj, lib)
                         index = (
                             obj["source_framework_urn"],
                             obj["target_framework_urn"],
                         )
-                        obj["library_urn"] = library_urn
-                        obj["id"] = str(lib_id)
                         all_rms[index] = self._compress_rms(obj)
 
         for src, tgt in all_rms:
@@ -181,11 +278,47 @@ class MappingEngine:
             ]
         )
 
+    def _edge_is_allowed(
+        self,
+        source_urn: str,
+        target_urn: str,
+        authorization: MappingAuthorization | None,
+    ) -> bool:
+        if authorization is None:
+            return self.get_rms((source_urn, target_urn)) is not None
+        if not authorization.allows_framework(
+            source_urn
+        ) or not authorization.allows_framework(target_urn):
+            return False
+        mapping_set = self.get_rms((source_urn, target_urn))
+        return bool(mapping_set and authorization.allows_edge(mapping_set))
+
+    def _authorized_neighbors(
+        self, source_urn: str, authorization: MappingAuthorization | None
+    ) -> list[str]:
+        return [
+            target_urn
+            for target_urn in self.framework_mappings.get(source_urn, [])
+            if self._edge_is_allowed(source_urn, target_urn, authorization)
+        ]
+
     def all_paths_between(
-        self, source_urn: str, dest_urn: str, max_depth: Optional[int] = None
+        self,
+        source_urn: str,
+        dest_urn: str,
+        max_depth: Optional[int] = None,
+        *,
+        authorization: MappingAuthorization | None,
     ) -> list[list[str]]:
+        if authorization is not None and (
+            not authorization.allows_framework(source_urn)
+            or not authorization.allows_framework(dest_urn)
+        ):
+            return []
         # ✅ 1. Return only direct path if it exists
-        if (source_urn, dest_urn) in self.direct_mappings:
+        if (source_urn, dest_urn) in self.direct_mappings and self._edge_is_allowed(
+            source_urn, dest_urn, authorization
+        ):
             return [[source_urn, dest_urn]]
 
         # 🔄 2. BFS for shortest paths
@@ -208,27 +341,41 @@ class MappingEngine:
             if max_depth and len(path) >= max_depth:
                 continue
 
-            for neighbor in self.framework_mappings.get(current, []):
+            for neighbor in self._authorized_neighbors(current, authorization):
                 if neighbor in visited:
                     continue
                 queue.append((path + [neighbor], visited | {neighbor}))
 
         return shortest_paths
 
-    def get_framework_neighbors(self, source_urn: str) -> list[str]:
+    def get_framework_neighbors(
+        self,
+        source_urn: str,
+        *,
+        authorization: MappingAuthorization | None,
+    ) -> list[str]:
         # retruns the second element of the tuple in the direct mapping set if the first one is equal to source_urn
         neighbors = []
         for couple in self.direct_mappings:
-            if couple[0] == source_urn:
+            if couple[0] == source_urn and self._edge_is_allowed(
+                couple[0], couple[1], authorization
+            ):
                 neighbors.append(couple[1])
         return neighbors
 
-    def paths_and_coverages(self, source_urn: str) -> dict[str, (int, int)]:
+    def paths_and_coverages(
+        self,
+        source_urn: str,
+        *,
+        authorization: MappingAuthorization | None,
+    ) -> dict[str, tuple[int, int]]:
         # Base algo is the same as all_paths_from except than we also add the count of covered / partially-covered requirements
         # the coverage variable is a dict with key = destination and value = (number of partial coverage, number of total coverage)
         # as we are in direct mapping only for the moment, the "current" variable is always the destination
         coverage = {}
-        for neighbor in self.get_framework_neighbors(source_urn):
+        for neighbor in self.get_framework_neighbors(
+            source_urn, authorization=authorization
+        ):
             index = (source_urn, neighbor)
             rms = self.get_rms(index)
             if not rms:
@@ -247,17 +394,24 @@ class MappingEngine:
         return coverage
 
     def get_source_framework_urns(
-        self, target_urn: str, max_depth: int = 3
+        self,
+        target_urn: str,
+        max_depth: int = 3,
+        *,
+        authorization: MappingAuthorization | None,
     ) -> set[str]:
         """Return all framework URNs that can reach *target_urn* via mapping
         paths (reverse BFS on the framework_mappings graph).
 
         The target framework itself is always included (same-framework mapping).
         """
+        if authorization is not None and not authorization.allows_framework(target_urn):
+            return set()
         reverse_graph: defaultdict[str, list[str]] = defaultdict(list)
         for src, targets in self.framework_mappings.items():
             for tgt in targets:
-                reverse_graph[tgt].append(src)
+                if self._edge_is_allowed(src, tgt, authorization):
+                    reverse_graph[tgt].append(src)
 
         reachable: set[str] = {target_urn}
         queue: deque[tuple[str, int]] = deque([(target_urn, 0)])
@@ -273,11 +427,19 @@ class MappingEngine:
 
         return reachable
 
-    def all_paths_from(self, source_urn, max_depth=None):
+    def all_paths_from(
+        self,
+        source_urn,
+        max_depth=None,
+        *,
+        authorization: MappingAuthorization | None,
+    ):
         """
         Breadth-first search returning shortest paths from a source to all reachable targets.
         Yields only minimal-length paths to each destination.
         """
+        if authorization is not None and not authorization.allows_framework(source_urn):
+            return
         queue = deque()
         queue.append(([source_urn], {source_urn}))
         shortest_lengths = defaultdict(set)
@@ -295,7 +457,7 @@ class MappingEngine:
             if max_depth and len(path) >= max_depth:
                 continue
 
-            for neighbor in self.framework_mappings.get(current, []):
+            for neighbor in self._authorized_neighbors(current, authorization):
                 if neighbor in visited:
                     continue
 
@@ -312,7 +474,12 @@ class MappingEngine:
         for path_list in paths.values():
             yield from path_list
 
-    def get_mapping_graph(self, max_depth: int = 3) -> list[list[str]]:
+    def get_mapping_graph(
+        self,
+        max_depth: int = 3,
+        *,
+        authorization: MappingAuthorization | None,
+    ) -> list[list[str]]:
         """
         Generates a graph of all connected frameworks by finding all
         simple paths (no cycles) up to a given max_depth.
@@ -338,6 +505,10 @@ class MappingEngine:
 
         # start a search from every framework as a potential source
         for start_node in self.frameworks.keys():
+            if authorization is not None and not authorization.allows_framework(
+                start_node
+            ):
+                continue
             # The queue will store the path explored so far
             queue: deque[list[str]] = deque()
             queue.append([start_node])
@@ -356,7 +527,9 @@ class MappingEngine:
 
                 # If we are not yet at max_depth, explore neighbors
                 if len(current_path) < max_depth:
-                    for neighbor in self.framework_mappings.get(current_node, []):
+                    for neighbor in self._authorized_neighbors(
+                        current_node, authorization
+                    ):
                         # Avoid cycles within the *current* path
                         if neighbor not in current_path:
                             # Create and enqueue the new path
@@ -371,6 +544,7 @@ class MappingEngine:
         requirement_mapping_set: dict,
         hop_index: int,
         path: list[str],
+        target_range: Optional[tuple[int, int]] = None,
     ) -> dict[str, str | dict[str, str]]:
         # Hop_index allows us to know if the source_audit is the 'real' source, or a transition audit.
         # The first hop in 1.
@@ -386,12 +560,27 @@ class MappingEngine:
         target_framework_urn = requirement_mapping_set.get("target_framework_urn", "")
         target_framework = self.frameworks.get(target_framework_urn)
 
-        # Check if score ranges match between source and target frameworks
-        scores_compatible = (
-            target_framework
-            and target_framework.get("min_score") == source_audit.get("min_score")
-            and target_framework.get("max_score") == source_audit.get("max_score")
-        )
+        source_range = (source_audit.get("min_score"), source_audit.get("max_score"))
+        if target_range is not None:
+            target_range = tuple(target_range)
+            scores_compatible = None not in (*source_range, *target_range)
+        else:
+            scores_compatible = (
+                target_framework
+                and target_framework.get("min_score") == source_range[0]
+                and target_framework.get("max_score") == source_range[1]
+            )
+
+        def scaled(field, value, own_scale):
+            if (
+                own_scale is None
+                and field in ("score", "documentation_score")
+                and value is not None
+                and target_range is not None
+                and source_range != target_range
+            ):
+                return rescale_score(value, source_range, target_range)
+            return value
 
         for mapping in requirement_mapping_set["requirement_mappings"]:
             src = mapping["source_requirement_urn"]
@@ -403,15 +592,20 @@ class MappingEngine:
             src_assessment = source_audit["requirement_assessments"].get(src)
             if src_assessment is None:
                 continue
+            own_scale = self.own_scales.get(src)
+            copy_scores = own_scale == self.own_scales.get(dst) and (
+                own_scale is not None or scores_compatible
+            )
 
             # Track whether this mapping entry actually wrote data.
             mapped = False
 
             if rel in ("equal", "superset"):
-                # If we have matching score ranges on the target framework, copy
-                # the whole assessment (including score fields). Otherwise only
-                # copy non-score fields to avoid misrepresenting scores.
-                if scores_compatible:
+                # Scores are copied when both sides are comparable: converted
+                # into the target audit's range, or kept as-is on a requirement
+                # scale shared by source and target. Otherwise only non-score
+                # fields are copied, to avoid misrepresenting scores.
+                if copy_scores:
                     # Fix 2: Use .get() for collision detection instead of
                     # defaultdict auto-creation.  An empty dict {} (from a
                     # previous defaultdict miss) is falsy, so this is safe.
@@ -431,9 +625,10 @@ class MappingEngine:
                                 existing_result, new_result
                             )
                     else:
-                        target_audit["requirement_assessments"][dst] = (
-                            src_assessment.copy()
-                        )
+                        target_audit["requirement_assessments"][dst] = {
+                            k: scaled(k, v, own_scale)
+                            for k, v in src_assessment.items()
+                        }
                     mapped = True
                 else:
                     target_assessment = target_audit["requirement_assessments"][dst]
@@ -500,16 +695,18 @@ class MappingEngine:
                         else:
                             target_assessment[m2m_field] = src_values
 
-                # Copy score fields if scores are compatible
-                if scores_compatible:
+                # Copy score fields (converted if needed) when comparable
+                if copy_scores:
                     for score_field in [
                         "score",
                         "is_scored",
                         "documentation_score",
                     ]:
                         if score_field in src_assessment:
-                            target_assessment[score_field] = src_assessment.get(
-                                score_field
+                            target_assessment[score_field] = scaled(
+                                score_field,
+                                src_assessment.get(score_field),
+                                own_scale,
                             )
 
                 # Handle result: keep the most restrictive
@@ -682,8 +879,16 @@ class MappingEngine:
         source_urn: str,
         dest_urn: str,
         max_depth: Optional[int] = None,
+        target_range: Optional[tuple[int, int]] = None,
+        *,
+        authorization: MappingAuthorization | None,
     ) -> tuple[dict, list[str]]:
-        paths = self.all_paths_between(source_urn, dest_urn, max_depth)
+        paths = self.all_paths_between(
+            source_urn,
+            dest_urn,
+            max_depth,
+            authorization=authorization,
+        )
         inferences = {}
         best_path = []
 
@@ -693,13 +898,14 @@ class MappingEngine:
             hop_index = 1
             for urn in path[1:]:
                 rms = self.get_rms((tmp_urn, urn))
-                if not rms:
+                if not rms or not self._edge_is_allowed(tmp_urn, urn, authorization):
                     break
                 tmp_inferences = self.map_audit_results(
                     tmp_inferences,
                     rms,
                     hop_index=hop_index,
                     path=path,
+                    target_range=target_range if urn == path[-1] else None,
                 )
                 hop_index += 1
                 tmp_urn = urn
@@ -712,6 +918,9 @@ class MappingEngine:
     def load_audit_fields(
         self,
         audit: ComplianceAssessment,
+        *,
+        user=None,
+        viewer_role: str = "auditor",
     ) -> dict[str, str | dict[str, str]]:
         """
         Extracts requirement assessments from a compliance audit.
@@ -723,14 +932,40 @@ class MappingEngine:
         """
         fields = self.fields_to_map
         all_ra = audit.get_requirement_assessments(include_non_assessable=False)
+        visible_ra_ids = None
+        visible_related_ids = {}
+        from core.utils import is_field_visible_to
+
+        if user is not None:
+            from iam.models import RoleAssignment
+
+            visible_ra_ids = set(
+                RoleAssignment.get_viewable_object_ids(user, RequirementAssessment)
+            )
+            visible_related_ids = {
+                "applied_controls": RoleAssignment.get_viewable_object_ids(
+                    user, AppliedControl
+                ),
+                "security_exceptions": RoleAssignment.get_viewable_object_ids(
+                    user, SecurityException
+                ),
+                "evidences": RoleAssignment.get_viewable_object_ids(user, Evidence),
+            }
+        score_visible = is_field_visible_to(
+            audit, "score", viewer_role
+        ) and is_field_visible_to(audit, "is_scored", viewer_role)
         audit_results = {
-            "min_score": audit.min_score,
-            "max_score": audit.max_score,
+            "min_score": audit.min_score if score_visible else None,
+            "max_score": audit.max_score if score_visible else None,
             "requirement_assessments": defaultdict(dict),
         }
         for ra in all_ra:
+            if visible_ra_ids is not None and ra.id not in visible_ra_ids:
+                continue
             audit_results["requirement_assessments"][ra.requirement.urn] = {
-                field: getattr(ra, field) for field in fields
+                field: getattr(ra, field)
+                for field in fields
+                if is_field_visible_to(audit, field, viewer_role)
             }
             audit_results["requirement_assessments"][ra.requirement.urn]["name"] = str(
                 ra
@@ -747,7 +982,14 @@ class MappingEngine:
             for m2m_field in self.m2m_fields:
                 attr = getattr(ra, m2m_field)
                 if isinstance(attr, QuerySet) or hasattr(attr, "all"):
-                    related_items = list(attr.all())
+                    if not is_field_visible_to(audit, m2m_field, viewer_role):
+                        related_items = []
+                    elif user is not None:
+                        related_items = list(
+                            attr.filter(id__in=visible_related_ids[m2m_field])
+                        )
+                    else:
+                        related_items = list(attr.all())
                     audit_results["requirement_assessments"][ra.requirement.urn][
                         m2m_field
                     ] = [item.id for item in related_items]
@@ -788,6 +1030,3 @@ class MappingEngine:
             res[result] += 1
 
         return dict(res)
-
-
-engine = MappingEngine()

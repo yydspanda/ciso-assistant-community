@@ -56,7 +56,8 @@
 		taskTemplates: Option[];
 		subprocessCandidates: Option[];
 		creatableModels?: any[];
-		readableModels?: { key: string; fields: string[] }[];
+		updatableModels?: any[];
+		readableModels?: { key: string; fields: string[]; includable?: string[] }[];
 		fkOptions?: Record<string, Option[]>;
 		workflowId: string;
 		registrationsByRef?: Record<string, any>;
@@ -87,6 +88,7 @@
 		taskTemplates,
 		subprocessCandidates,
 		creatableModels = [],
+		updatableModels = [],
 		readableModels = [],
 		fkOptions = {},
 		workflowId,
@@ -155,17 +157,30 @@
 	// buffering); the engine still executes it for graphs that carry it.
 	const ACTION_TYPES = [
 		'create_object',
+		'update_object',
+		'attach_evidence',
+		'record_measurement',
+		'post_results',
 		'read_objects',
 		'http_request',
 		'send_email',
+		'ai_extract',
+		'ai_generate',
 		'provision_folder',
 		'provision_user',
 		'manage_group_membership',
 		'set_variables',
+		'date_offset',
 		'log'
 	];
 
 	const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
+
+	// Written as prose or markdown, so a one-line input is the wrong box.
+	const LONG_TEXT_FIELDS = ['description', 'content', 'observation'];
+
+	// 'choice' emits an enum, which is what a branch step can route on.
+	const AI_FIELD_TYPES = ['choice', 'string', 'number', 'boolean'];
 
 	const BUILTIN_GROUPS = [
 		{ code: 'BI-UG-AUD', label: 'reader' },
@@ -182,16 +197,61 @@
 	const ACTION_CONFIG_DEFAULTS: Record<string, object> = {
 		log: { message: '' },
 		set_variables: { variables: {} },
+		date_offset: { base: '', days: 30, weeks: 0, output: '' },
 		create_object: { model: 'applied_control', fields: { name: '' }, upsert: false },
+		update_object: { model: 'applied_control', id: '', fields: {}, m2m: {} },
+		attach_evidence: {
+			evidence: '',
+			source: 'text',
+			filename: '',
+			text: '',
+			url: '',
+			allow_error_status: false,
+			allow_connection_error: false,
+			find_occurrence: false,
+			new_revision: false,
+			task_node: ''
+		},
+		record_measurement: {
+			metric_instance: '',
+			value: '',
+			timestamp: '',
+			observation: '',
+			evidence_revision: ''
+		},
+		post_results: {
+			posture_assessment: '',
+			asset: '',
+			results: '',
+			run_id: '',
+			tool: ''
+		},
 		read_objects: {
 			model: 'applied_control',
 			mode: 'list',
 			filters: {},
 			order_by: '-created_at',
-			limit: 25
+			limit: 25,
+			offset: '',
+			include: []
 		},
-		http_request: { method: 'GET', url: '', headers: {}, body: '', timeout: 15 },
+		http_request: {
+			method: 'GET',
+			url: '',
+			headers: {},
+			body: '',
+			timeout: 15,
+			allow_error_status: false,
+			allow_connection_error: false
+		},
 		send_email: { recipients: '', subject: '', body: '' },
+		ai_extract: {
+			prompt: '',
+			input: '',
+			schema: { type: 'object', properties: {}, required: [] },
+			max_attempts: 2
+		},
+		ai_generate: { prompt: '', input: '', max_words: 200 },
 		provision_folder: { name: '', parent: '', create_default_groups: true },
 		provision_user: {
 			email: '',
@@ -213,6 +273,44 @@
 		creatableModels.find((entry) => entry.key === actionConfig?.model)
 	);
 	const readableEntry = $derived(readableModels.find((entry) => entry.key === actionConfig?.model));
+	const updatableEntry = $derived(
+		updatableModels.find((entry) => entry.key === actionConfig?.model)
+	);
+
+	function resetUpdateFields() {
+		// Field and relation names are per-model.
+		actionConfig.fields = {};
+		actionConfig.m2m = {};
+		onChange();
+	}
+
+	// Added explicitly, never pre-seeded: a row with no ids fails publish.
+	const unusedRelations = $derived(
+		Object.keys(updatableEntry?.m2m_fields ?? {}).filter(
+			(name) => !(name in (actionConfig?.m2m ?? {}))
+		)
+	);
+
+	function addRelationRow() {
+		const name = unusedRelations[0];
+		if (!name) return;
+		actionConfig.m2m = { ...actionConfig.m2m, [name]: { op: 'add', values: '' } };
+		onChange();
+	}
+
+	function removeRelationRow(name: string) {
+		const { [name]: _dropped, ...rest } = actionConfig.m2m ?? {};
+		actionConfig.m2m = rest;
+		onChange();
+	}
+
+	function renameRelationRow(previous: string, next: string) {
+		if (previous === next) return;
+		const spec = actionConfig.m2m?.[previous] ?? { op: 'add', values: '' };
+		const { [previous]: _dropped, ...rest } = actionConfig.m2m ?? {};
+		actionConfig.m2m = { ...rest, [next]: spec };
+		onChange();
+	}
 
 	function resetCreateFields() {
 		actionConfig.fields = { name: actionConfig.fields?.name ?? '' };
@@ -230,13 +328,16 @@
 		onChange();
 	}
 
-	// Older nodes may carry a bare {type} config; make sure the shape the
-	// bindings expect exists before the template reads it.
+	// Older nodes may carry a bare {type} config — so do the ones the palette
+	// drops pre-typed; make sure the shape the bindings expect exists before
+	// the template reads it.
 	$effect(() => {
 		if (nodeDomain?.type === 'action' && actionConfig?.type) {
 			const defaults: any = ACTION_CONFIG_DEFAULTS[actionConfig.type] ?? {};
 			for (const [key, value] of Object.entries(defaults)) {
-				if (actionConfig[key] === undefined) actionConfig[key] = value;
+				// Clone: the nested literals are shared, so two nodes of one
+				// type would otherwise edit the same object.
+				if (actionConfig[key] === undefined) actionConfig[key] = structuredClone(value);
 			}
 		}
 		if (nodeDomain?.type === 'trigger') {
@@ -245,6 +346,7 @@
 		}
 		if (nodeDomain?.type === 'loop') {
 			nodeDomain.loop_config ??= { collection: '', on_item_error: 'continue' };
+			nodeDomain.loop_config.read ??= null;
 			nodeDomain.loop_config.collect ??= '';
 		}
 		if (['action', 'subprocess', 'loop'].includes(nodeDomain?.type) && !nodeDomain.output_mapping) {
@@ -256,11 +358,20 @@
 	const OUTPUT_EXAMPLES: Record<string, string> = {
 		http_request: 'body.summary',
 		create_object: 'created_object_id',
+		update_object: 'object_id',
+		create_audit: 'created_object_id',
+		attach_evidence: 'filename',
+		record_measurement: 'object_id',
+		post_results: 'created',
+		create_entity_assessment: 'created_object_id',
 		read_objects: 'results.0.name',
 		provision_folder: 'folder_id',
 		provision_user: 'user_id',
 		manage_group_membership: 'group_id',
 		send_email: 'subject',
+		ai_extract: 'category',
+		ai_generate: 'text',
+		date_offset: 'result',
 		log: 'message'
 	};
 	const outputExample = $derived(
@@ -468,11 +579,27 @@
 
 	function resetReadModel() {
 		// Field whitelists differ per model: stale filters/ordering would fail
-		// publish validation.
+		// publish validation. Includes are per-model too — the backend rejects
+		// a name the new model does not offer.
 		actionConfig.filters = {};
 		actionConfig.order_by = '-created_at';
+		actionConfig.include = [];
 		readFilterGroups = [];
 		readFilterRawMode = false;
+		onChange();
+	}
+
+	// The backend accepts a bare string as well as a list, so a config authored
+	// through the API or imported from a library can carry either. Spreading a
+	// string would store its characters one by one, and filtering one throws.
+	function readIncludeList(value: unknown): string[] {
+		if (Array.isArray(value)) return value as string[];
+		return typeof value === 'string' && value ? [value] : [];
+	}
+
+	function toggleReadInclude(name: string, checked: boolean) {
+		const current = readIncludeList(actionConfig.include);
+		actionConfig.include = checked ? [...current, name] : current.filter((entry) => entry !== name);
 		onChange();
 	}
 
@@ -701,6 +828,77 @@
 	function removeHeaderRow(index: number) {
 		headerEntries = headerEntries.filter((_, i) => i !== index);
 		syncHeaders();
+	}
+
+	// ---------- ai_extract output fields ----------
+	// Authors name fields and pick types; we build the JSON Schema from that.
+	// Same round-trip shape as headerEntries above.
+	type AiField = { name: string; type: string; choices: string };
+	let aiFields = $state<AiField[]>([]);
+	let aiFieldsNodeId: string | null = null;
+	$effect(() => {
+		const nodeId =
+			nodeDomain?.type === 'action' && actionConfig?.type === 'ai_extract' ? selectedNode.id : null;
+		if (nodeId !== aiFieldsNodeId) {
+			aiFieldsNodeId = nodeId;
+			aiFields = nodeId ? schemaToFields(actionConfig.schema) : [];
+		}
+	});
+
+	function schemaToFields(schema: any): AiField[] {
+		return Object.entries(schema?.properties ?? {}).map(([name, spec]: [string, any]) => ({
+			name,
+			type: Array.isArray(spec?.enum) ? 'choice' : (spec?.type ?? 'string'),
+			choices: Array.isArray(spec?.enum) ? spec.enum.join(', ') : ''
+		}));
+	}
+
+	function syncAiFields() {
+		const properties: Record<string, any> = {};
+		for (const field of aiFields) {
+			const name = field.name.trim();
+			if (!name) continue;
+			if (field.type === 'choice') {
+				const choices = field.choices
+					.split(',')
+					.map((choice) => choice.trim())
+					.filter(Boolean);
+				// An empty enum would validate nothing.
+				properties[name] = choices.length ? { type: 'string', enum: choices } : { type: 'string' };
+			} else {
+				properties[name] = { type: field.type };
+			}
+		}
+		// All required: an absent key makes {{nodes.<ref>.<field>}} unresolvable.
+		actionConfig.schema = {
+			type: 'object',
+			properties,
+			required: Object.keys(properties)
+		};
+		onChange();
+	}
+
+	function aiTypeLabel(fieldType: string): string {
+		// Not m[`...`]: a dynamic index defeats Paraglide tree-shaking.
+		switch (fieldType) {
+			case 'choice':
+				return m.aiTypeChoice();
+			case 'number':
+				return m.aiTypeNumber();
+			case 'boolean':
+				return m.aiTypeBoolean();
+			default:
+				return m.aiTypeString();
+		}
+	}
+
+	function addAiField() {
+		aiFields = [...aiFields, { name: '', type: 'choice', choices: '' }];
+	}
+
+	function removeAiField(index: number) {
+		aiFields = aiFields.filter((_, i) => i !== index);
+		syncAiFields();
 	}
 
 	function optionLabel(option: Option): string {
@@ -1080,62 +1278,125 @@
 			{/if}
 
 			{#if nodeDomain.type === 'loop' && loopConfig}
-				<div>
-					{@render fieldLabel(m.forEachItemIn())}
-					{#if collectionChoices.length}
+				<label>
+					{@render fieldLabel(m.loopSource())}
+					<select
+						class="select w-full text-sm"
+						value={loopConfig.read ? 'read' : 'collection'}
+						onchange={(e) => {
+							if (e.currentTarget.value === 'read') {
+								loopConfig.collection = '';
+								loopConfig.read = { model: 'applied_control', order_by: '-created_at', limit: 25 };
+							} else {
+								loopConfig.read = null;
+							}
+							onChange();
+						}}
+						data-testid="loop-source"
+					>
+						<option value="collection">{m.loopOverResults()}</option>
+						<option value="read">{m.loopOverPages()}</option>
+					</select>
+				</label>
+				{#if loopConfig.read}
+					<label>
+						{@render fieldLabel(m.objectToRead())}
 						<select
 							class="select w-full text-sm"
-							value={collectionIsCustom ? '__custom__' : (loopConfig.collection ?? '')}
+							value={loopConfig.read.model}
 							onchange={(e) => {
-								const chosen = e.currentTarget.value;
-								if (chosen === '__custom__') {
-									collectionIsCustom = true;
-								} else {
-									collectionIsCustom = false;
-									loopConfig.collection = chosen;
-									onChange();
-								}
+								loopConfig.read.model = e.currentTarget.value;
+								// order_by is validated against the model's own fields.
+								loopConfig.read.order_by = '-created_at';
+								onChange();
 							}}
-							data-testid="loop-collection"
 						>
-							{#if !loopConfig.collection && !collectionIsCustom}
-								<option value="">—</option>
-							{/if}
-							{#each collectionChoices as choice (choice.expr)}
-								<option value={choice.expr}>
-									{choice.label}{choice.count === null ? '' : ` (${choice.count})`}
-								</option>
+							{#each readableModels as entry (entry.key)}
+								<option value={entry.key}>{safeTranslate(entry.key)}</option>
 							{/each}
-							<option value="__custom__">{m.customExpression()}</option>
 						</select>
-					{:else}
-						<select class="select w-full text-sm" disabled>
-							<option>{m.forEachNoCollections()}</option>
-						</select>
-					{/if}
-					{#if collectionIsCustom || (!collectionChoices.length && loopConfig.collection)}
-						<input
-							type="text"
-							class="input w-full text-sm font-mono mt-1"
-							placeholder={'{{nodes.list_items.results}}'}
-							bind:value={loopConfig.collection}
-							oninput={onChange}
-						/>
-					{/if}
-					{#if collectionPreview?.invalid}
-						<p class="text-[10px] text-warning-600 mt-1">
-							<i class="fa-solid fa-triangle-exclamation mr-1"></i>{m.forEachNotAList()}
-						</p>
-					{:else if collectionPreview}
-						<p class="text-[10px] text-success-600 mt-1">
-							<i class="fa-solid fa-rotate mr-1"></i>{m.forEachPreview({
-								count: collectionPreview.count
-							})}
-						</p>
-					{/if}
-				</div>
-
-				{#if loopConfig.collection}
+					</label>
+					<div class="flex gap-2">
+						<label class="flex-1">
+							{@render fieldLabel(m.orderBy())}
+							<input
+								type="text"
+								class="input w-full text-sm"
+								bind:value={loopConfig.read.order_by}
+								oninput={onChange}
+							/>
+						</label>
+						<label class="w-24 shrink-0">
+							{@render fieldLabel(m.pageSize())}
+							<input
+								type="number"
+								min="1"
+								class="input w-full text-sm"
+								bind:value={loopConfig.read.limit}
+								oninput={onChange}
+							/>
+						</label>
+					</div>
+					<p class="text-[10px] text-surface-500 leading-relaxed">
+						<i class="fa-solid fa-layer-group mr-1"></i>{m.loopOverPagesHint()}
+					</p>
+				{:else}
+					<div>
+						{@render fieldLabel(m.forEachItemIn())}
+						{#if collectionChoices.length}
+							<select
+								class="select w-full text-sm"
+								value={collectionIsCustom ? '__custom__' : (loopConfig.collection ?? '')}
+								onchange={(e) => {
+									const chosen = e.currentTarget.value;
+									if (chosen === '__custom__') {
+										collectionIsCustom = true;
+									} else {
+										collectionIsCustom = false;
+										loopConfig.collection = chosen;
+										onChange();
+									}
+								}}
+								data-testid="loop-collection"
+							>
+								{#if !loopConfig.collection && !collectionIsCustom}
+									<option value="">—</option>
+								{/if}
+								{#each collectionChoices as choice (choice.expr)}
+									<option value={choice.expr}>
+										{choice.label}{choice.count === null ? '' : ` (${choice.count})`}
+									</option>
+								{/each}
+								<option value="__custom__">{m.customExpression()}</option>
+							</select>
+						{:else}
+							<select class="select w-full text-sm" disabled>
+								<option>{m.forEachNoCollections()}</option>
+							</select>
+						{/if}
+						{#if collectionIsCustom || (!collectionChoices.length && loopConfig.collection)}
+							<input
+								type="text"
+								class="input w-full text-sm font-mono mt-1"
+								placeholder={'{{nodes.list_items.results}}'}
+								bind:value={loopConfig.collection}
+								oninput={onChange}
+							/>
+						{/if}
+						{#if collectionPreview?.invalid}
+							<p class="text-[10px] text-warning-600 mt-1">
+								<i class="fa-solid fa-triangle-exclamation mr-1"></i>{m.forEachNotAList()}
+							</p>
+						{:else if collectionPreview}
+							<p class="text-[10px] text-success-600 mt-1">
+								<i class="fa-solid fa-rotate mr-1"></i>{m.forEachPreview({
+									count: collectionPreview.count
+								})}
+							</p>
+						{/if}
+					</div>
+				{/if}
+				{#if loopConfig.collection || loopConfig.read}
 					{#if itemChips.length}
 						<div>
 							<span class="text-[10px] font-semibold uppercase tracking-wide text-surface-500">
@@ -1235,7 +1496,10 @@
 							{/each}
 						</select>
 					</label>
-					<label class="flex items-center gap-1.5 text-xs text-surface-700-300 cursor-pointer">
+					<label
+						class="flex items-center gap-1.5 text-xs text-surface-700-300 cursor-pointer"
+						class:hidden={creatableEntry?.upsert === false}
+					>
 						<input
 							type="checkbox"
 							class="checkbox scale-75"
@@ -1248,15 +1512,30 @@
 						{/if}
 					</label>
 					{#each creatableEntry?.fields ?? [] as field (field)}
+						{@const narrowed = creatableEntry?.allowed_values?.[field]}
 						<label>
-							{@render fieldLabel(safeTranslate(field))}
-							{#if field === 'description'}
+							{@render fieldLabel(
+								safeTranslate(field) +
+									(creatableEntry?.required_fields?.includes(field) ? ' *' : '')
+							)}
+							{#if LONG_TEXT_FIELDS.includes(field)}
 								<textarea
 									class="input w-full text-sm"
-									rows="2"
+									rows={field === 'content' ? 6 : 2}
 									bind:value={actionConfig.fields[field]}
 									oninput={onChange}
 								></textarea>
+							{:else if narrowed?.length}
+								<select
+									class="select w-full text-sm"
+									bind:value={actionConfig.fields[field]}
+									onchange={onChange}
+								>
+									<option value={''}>—</option>
+									{#each narrowed as choice (choice)}
+										<option value={choice}>{safeTranslate(choice)}</option>
+									{/each}
+								</select>
 							{:else}
 								<input
 									type="text"
@@ -1265,6 +1544,58 @@
 									bind:value={actionConfig.fields[field]}
 									oninput={onChange}
 								/>
+							{/if}
+						</label>
+					{/each}
+					{#each Object.entries(creatableEntry?.params ?? {}) as [paramName, endpoint] (paramName)}
+						<label>
+							{@render fieldLabel(safeTranslate(paramName))}
+							{#if endpoint}
+								<select
+									class="select w-full text-sm"
+									bind:value={actionConfig.fields[paramName]}
+									onchange={onChange}
+								>
+									<option value={''}>—</option>
+									{#if fkOptions[endpoint as string]?.length}
+										<optgroup label={safeTranslate(endpoint as string)}>
+											{#each fkOptions[endpoint as string] as option (option.id)}
+												<option value={(option as any).urn ?? option.id}>
+													{optionLabel(option)}
+												</option>
+											{/each}
+										</optgroup>
+									{/if}
+									{#if variables.length}
+										<optgroup label={m.workflowVariables()}>
+											{#each variables as variable (variable.id)}
+												<option value={'{{' + variable.key + '}}'}>
+													{'{{' + variable.key + '}}'}
+												</option>
+											{/each}
+										</optgroup>
+									{/if}
+								</select>
+								{#if paramName === 'framework'}
+									<span class="text-[10px] text-surface-500">{m.frameworkUrnOrId()}</span>
+								{/if}
+							{:else if LONG_TEXT_FIELDS.includes(paramName)}
+								<textarea
+									class="input w-full text-sm"
+									rows="6"
+									bind:value={actionConfig.fields[paramName]}
+									oninput={onChange}
+								></textarea>
+							{:else}
+								<input
+									type="text"
+									class="input w-full text-sm"
+									bind:value={actionConfig.fields[paramName]}
+									oninput={onChange}
+								/>
+								{#if paramName === 'implementation_groups'}
+									<span class="text-[10px] text-surface-500">{m.implementationGroupsHint()}</span>
+								{/if}
 							{/if}
 						</label>
 					{/each}
@@ -1296,6 +1627,348 @@
 							</select>
 						</label>
 					{/each}
+				{:else if actionConfig.type === 'update_object'}
+					<label>
+						{@render fieldLabel(m.objectToUpdate())}
+						<select
+							class="select w-full text-sm"
+							bind:value={actionConfig.model}
+							onchange={resetUpdateFields}
+						>
+							{#each updatableModels as entry (entry.key)}
+								<option value={entry.key}>{safeTranslate(entry.key)}</option>
+							{/each}
+						</select>
+					</label>
+					<label>
+						{@render fieldLabel(m.targetObjectId())}
+						<input
+							type="text"
+							class="input w-full text-sm"
+							placeholder={'{{payload.object_id}}'}
+							bind:value={actionConfig.id}
+							oninput={onChange}
+						/>
+					</label>
+					{#each updatableEntry?.fields ?? [] as field (field)}
+						{@const allowed = updatableEntry?.allowed_values?.[field]}
+						<label>
+							{@render fieldLabel(safeTranslate(field))}
+							{#if allowed?.length}
+								<select
+									class="select w-full text-sm"
+									bind:value={actionConfig.fields[field]}
+									onchange={onChange}
+								>
+									<option value={''}>—</option>
+									{#each allowed as value (value)}
+										<option {value}>{safeTranslate(value)}</option>
+									{/each}
+								</select>
+								<span class="text-[10px] text-surface-500">{m.guardedFieldHint()}</span>
+							{:else if LONG_TEXT_FIELDS.includes(field)}
+								<textarea
+									class="input w-full text-sm"
+									rows={field === 'content' ? 6 : 2}
+									bind:value={actionConfig.fields[field]}
+									oninput={onChange}
+								></textarea>
+							{:else}
+								<input
+									type="text"
+									class="input w-full text-sm"
+									bind:value={actionConfig.fields[field]}
+									oninput={onChange}
+								/>
+							{/if}
+						</label>
+					{/each}
+					{#if Object.keys(updatableEntry?.m2m_fields ?? {}).length}
+						<div>
+							<div class="flex items-center justify-between mb-1">
+								{@render fieldLabel(m.relations())}
+								<button
+									type="button"
+									class="text-[10px] text-primary-500 hover:text-primary-600 cursor-pointer font-semibold disabled:opacity-50"
+									onclick={addRelationRow}
+									disabled={!unusedRelations.length}
+								>
+									<i class="fa-solid fa-plus mr-0.5"></i>{m.addRelation()}
+								</button>
+							</div>
+							{#each Object.keys(actionConfig.m2m ?? {}) as name (name)}
+								{@const endpoint = updatableEntry?.m2m_fields?.[name]}
+								<div class="flex items-center gap-1 mb-1">
+									<select
+										class="select text-xs w-28 shrink-0 px-1 py-0.5"
+										value={name}
+										onchange={(e) => renameRelationRow(name, e.currentTarget.value)}
+									>
+										{#each [name, ...unusedRelations] as option (option)}
+											<option value={option}>{safeTranslate(option)}</option>
+										{/each}
+									</select>
+									<select
+										class="select text-xs w-20 shrink-0 px-1 py-0.5"
+										bind:value={actionConfig.m2m[name].op}
+										onchange={onChange}
+									>
+										{#each updatableEntry?.operations ?? ['add', 'remove', 'set'] as operation (operation)}
+											<option value={operation}>{safeTranslate(operation)}</option>
+										{/each}
+									</select>
+									<input
+										type="text"
+										class="input text-xs flex-1 min-w-0 font-mono"
+										placeholder={m.relationValues()}
+										bind:value={actionConfig.m2m[name].values}
+										oninput={onChange}
+									/>
+									{#if fkOptions[endpoint as string]?.length}
+										<select
+											class="select text-xs w-16 shrink-0 px-1 py-0.5"
+											value={''}
+											onchange={(e) => {
+												const picked = e.currentTarget.value;
+												if (!picked) return;
+												const current = actionConfig.m2m[name].values;
+												actionConfig.m2m[name].values = current ? `${current},${picked}` : picked;
+												e.currentTarget.value = '';
+												onChange();
+											}}
+										>
+											<option value={''}>+</option>
+											{#each fkOptions[endpoint as string] as option (option.id)}
+												<option value={option.id}>{optionLabel(option)}</option>
+											{/each}
+										</select>
+									{/if}
+									<button
+										type="button"
+										aria-label="Remove link"
+										class="text-error-500 hover:text-error-600 cursor-pointer text-xs shrink-0"
+										onclick={() => removeRelationRow(name)}
+									>
+										<i class="fa-solid fa-xmark"></i>
+									</button>
+								</div>
+							{/each}
+						</div>
+					{/if}
+				{:else if actionConfig.type === 'attach_evidence'}
+					<label>
+						{@render fieldLabel(m.evidence())}
+						<input
+							type="text"
+							class="input w-full text-sm"
+							placeholder={'{{nodes.make_evidence.created_object_id}}'}
+							bind:value={actionConfig.evidence}
+							oninput={onChange}
+						/>
+					</label>
+					<label>
+						{@render fieldLabel(m.fileName())}
+						<input
+							type="text"
+							class="input w-full text-sm"
+							placeholder={'digest-{{today}}.csv'}
+							bind:value={actionConfig.filename}
+							oninput={onChange}
+						/>
+					</label>
+					<label>
+						{@render fieldLabel(m.source())}
+						<select
+							class="select w-full text-sm"
+							bind:value={actionConfig.source}
+							onchange={onChange}
+						>
+							<option value="text">{m.text()}</option>
+							<option value="url">{m.url()}</option>
+						</select>
+						<span class="text-[10px] text-surface-500">{m.attachSourceHint()}</span>
+					</label>
+					{#if actionConfig.source === 'url'}
+						<label>
+							{@render fieldLabel(m.url())}
+							<input
+								type="text"
+								class="input w-full text-sm"
+								bind:value={actionConfig.url}
+								oninput={onChange}
+							/>
+						</label>
+						<label class="flex items-center gap-1.5 text-xs text-surface-700-300 cursor-pointer">
+							<input
+								type="checkbox"
+								class="checkbox scale-75"
+								bind:checked={actionConfig.allow_error_status}
+								onchange={onChange}
+							/>
+							{m.httpAllowErrorStatus()}
+						</label>
+						<label class="flex items-center gap-1.5 text-xs text-surface-700-300 cursor-pointer">
+							<input
+								type="checkbox"
+								class="checkbox scale-75"
+								bind:checked={actionConfig.allow_connection_error}
+								onchange={onChange}
+							/>
+							{m.httpAllowConnectionError()}
+						</label>
+						<span class="text-[10px] text-surface-500">{m.attachSourceMissHint()}</span>
+					{:else}
+						<label>
+							{@render fieldLabel(m.content())}
+							<textarea
+								class="input w-full text-sm"
+								rows="3"
+								bind:value={actionConfig.text}
+								oninput={onChange}
+							></textarea>
+						</label>
+					{/if}
+					<label class="flex items-center gap-1.5 text-xs text-surface-700-300 cursor-pointer">
+						<input
+							type="checkbox"
+							class="checkbox scale-75"
+							checked={actionConfig.find_occurrence}
+							onchange={(e) => {
+								// Hiding the field is not clearing it, and a named
+								// occurrence wins.
+								actionConfig.find_occurrence = e.currentTarget.checked;
+								if (actionConfig.find_occurrence) actionConfig.task_node = '';
+								onChange();
+							}}
+						/>
+						{m.findOccurrence()}
+					</label>
+					<span class="text-[10px] text-surface-500">{m.findOccurrenceHint()}</span>
+					{#if !actionConfig.find_occurrence}
+						<label>
+							{@render fieldLabel(m.taskNode())}
+							<input
+								type="text"
+								class="input w-full text-sm"
+								placeholder={'{{nodes.find_the_occurrence.object.id}}'}
+								bind:value={actionConfig.task_node}
+								oninput={onChange}
+							/>
+							<span class="text-[10px] text-surface-500">{m.taskNodeAttachHint()}</span>
+						</label>
+					{/if}
+					<label class="flex items-center gap-1.5 text-xs text-surface-700-300 cursor-pointer">
+						<input
+							type="checkbox"
+							class="checkbox scale-75"
+							bind:checked={actionConfig.new_revision}
+							onchange={onChange}
+						/>
+						{m.fileAsNewRevision()}
+					</label>
+					<span class="text-[10px] text-surface-500">{m.newRevisionHint()}</span>
+				{:else if actionConfig.type === 'record_measurement'}
+					<label>
+						{@render fieldLabel(m.metricInstance())}
+						<input
+							type="text"
+							class="input w-full text-sm"
+							placeholder={'{{metric_id}}'}
+							bind:value={actionConfig.metric_instance}
+							oninput={onChange}
+						/>
+					</label>
+					<label>
+						{@render fieldLabel(m.value())}
+						<input
+							type="text"
+							class="input w-full text-sm"
+							placeholder={'{{nodes.fetch.body.coverage}}'}
+							bind:value={actionConfig.value}
+							oninput={onChange}
+						/>
+						<span class="text-[10px] text-surface-500">{m.measurementValueHint()}</span>
+					</label>
+					<label>
+						{@render fieldLabel(m.timestamp())}
+						<input
+							type="text"
+							class="input w-full text-sm"
+							placeholder={'{{now}}'}
+							bind:value={actionConfig.timestamp}
+							oninput={onChange}
+						/>
+					</label>
+					<label>
+						{@render fieldLabel(m.observation())}
+						<textarea
+							class="input w-full text-sm"
+							rows="2"
+							bind:value={actionConfig.observation}
+							oninput={onChange}
+						></textarea>
+					</label>
+					<label>
+						{@render fieldLabel(m.evidenceRevision())}
+						<input
+							type="text"
+							class="input w-full text-sm"
+							placeholder={'{{nodes.attach.revision_id}}'}
+							bind:value={actionConfig.evidence_revision}
+							oninput={onChange}
+						/>
+					</label>
+				{:else if actionConfig.type === 'post_results'}
+					<label>
+						{@render fieldLabel(m.postureAssessment())}
+						<input
+							type="text"
+							class="input w-full text-sm"
+							placeholder={'{{assessment_id}}'}
+							bind:value={actionConfig.posture_assessment}
+							oninput={onChange}
+						/>
+					</label>
+					<label>
+						{@render fieldLabel(m.asset())}
+						<input
+							type="text"
+							class="input w-full text-sm"
+							placeholder={'{{item.asset_id}}'}
+							bind:value={actionConfig.asset}
+							oninput={onChange}
+						/>
+					</label>
+					<label>
+						{@render fieldLabel(m.results())}
+						<input
+							type="text"
+							class="input w-full text-sm"
+							placeholder={'{{nodes.fetch.body.checks}}'}
+							bind:value={actionConfig.results}
+							oninput={onChange}
+						/>
+						<span class="text-[10px] text-surface-500">{m.postResultsHint()}</span>
+					</label>
+					<label>
+						{@render fieldLabel(m.tool())}
+						<input
+							type="text"
+							class="input w-full text-sm"
+							bind:value={actionConfig.tool}
+							oninput={onChange}
+						/>
+					</label>
+					<label>
+						{@render fieldLabel(m.runId())}
+						<input
+							type="text"
+							class="input w-full text-sm"
+							bind:value={actionConfig.run_id}
+							oninput={onChange}
+						/>
+						<span class="text-[10px] text-surface-500">{m.postResultsRunIdHint()}</span>
+					</label>
 				{:else if actionConfig.type === 'read_objects'}
 					<label>
 						{@render fieldLabel(m.objectToRead())}
@@ -1320,6 +1993,24 @@
 							<option value="first">{m.readModeFirst()}</option>
 						</select>
 					</label>
+
+					{#if readableEntry?.includable?.length}
+						{@render fieldLabel(m.readInclude())}
+						<p class="text-[10px] text-surface-500">{m.readIncludeHelpText()}</p>
+						<div class="flex flex-col gap-1">
+							{#each readableEntry.includable as name (name)}
+								<label class="flex items-center gap-2 text-sm">
+									<input
+										type="checkbox"
+										class="checkbox"
+										checked={readIncludeList(actionConfig.include).includes(name)}
+										onchange={(e) => toggleReadInclude(name, e.currentTarget.checked)}
+									/>
+									<span>{safeTranslate(name)}</span>
+								</label>
+							{/each}
+						</div>
+					{/if}
 
 					{@render fieldLabel(m.readFilters())}
 					{#if readFilterRawMode}
@@ -1457,9 +2148,18 @@
 								<input
 									type="number"
 									min="1"
-									max="100"
 									class="input w-full text-sm"
 									bind:value={actionConfig.limit}
+									oninput={onChange}
+								/>
+							</label>
+							<label class="w-24 shrink-0">
+								{@render fieldLabel(m.startAt())}
+								<input
+									type="text"
+									class="input w-full text-sm"
+									placeholder="0"
+									bind:value={actionConfig.offset}
 									oninput={onChange}
 								/>
 							</label>
@@ -1554,8 +2254,132 @@
 							oninput={onChange}
 						/>
 					</label>
+					<label class="flex items-center gap-1.5 text-xs text-surface-700-300 cursor-pointer">
+						<input
+							type="checkbox"
+							class="checkbox scale-75"
+							bind:checked={actionConfig.allow_error_status}
+							onchange={onChange}
+						/>
+						{m.httpAllowErrorStatus()}
+					</label>
+					<label class="flex items-center gap-1.5 text-xs text-surface-700-300 cursor-pointer">
+						<input
+							type="checkbox"
+							class="checkbox scale-75"
+							bind:checked={actionConfig.allow_connection_error}
+							onchange={onChange}
+						/>
+						{m.httpAllowConnectionError()}
+					</label>
+					<span class="text-[10px] text-surface-500">{m.httpErrorHandlingHint()}</span>
 					<p class="text-[10px] text-surface-500 leading-relaxed">
 						<i class="fa-solid fa-key mr-1"></i>{m.secretsHint({ syntax: '{{secrets.name}}' })}
+					</p>
+				{:else if actionConfig.type === 'ai_extract' || actionConfig.type === 'ai_generate'}
+					<label>
+						{@render fieldLabel(m.aiInstruction())}
+						<textarea
+							class="input w-full text-sm"
+							rows="3"
+							placeholder={m.aiInstructionPlaceholder()}
+							bind:value={actionConfig.prompt}
+							oninput={onChange}
+						></textarea>
+					</label>
+					<label>
+						{@render fieldLabel(m.aiInput())}
+						<textarea
+							class="input w-full text-sm font-mono"
+							rows="2"
+							placeholder={'{{nodes.read_findings.results.0.description}}'}
+							bind:value={actionConfig.input}
+							oninput={onChange}
+						></textarea>
+					</label>
+					{#if actionConfig.type === 'ai_extract'}
+						<div>
+							<div class="flex items-center justify-between mb-1">
+								{@render fieldLabel(m.aiOutputFields())}
+								<button
+									type="button"
+									class="text-[10px] text-primary-500 hover:text-primary-600 cursor-pointer font-semibold"
+									onclick={addAiField}
+								>
+									<i class="fa-solid fa-plus mr-0.5"></i>{m.aiAddField()}
+								</button>
+							</div>
+							{#each aiFields as field, index (index)}
+								<div class="flex items-center gap-1 mb-1">
+									<input
+										type="text"
+										class="input text-xs w-24 min-w-0 font-mono shrink-0"
+										placeholder={m.aiFieldName()}
+										bind:value={field.name}
+										oninput={syncAiFields}
+									/>
+									<select
+										class="select text-xs w-20 min-w-0 shrink-0"
+										bind:value={field.type}
+										onchange={syncAiFields}
+									>
+										{#each AI_FIELD_TYPES as fieldType}
+											<option value={fieldType}>{aiTypeLabel(fieldType)}</option>
+										{/each}
+									</select>
+									{#if field.type === 'choice'}
+										<input
+											type="text"
+											class="input text-xs flex-1 min-w-0 font-mono"
+											placeholder={m.aiChoicesPlaceholder()}
+											bind:value={field.choices}
+											oninput={syncAiFields}
+										/>
+									{:else}
+										<span class="flex-1"></span>
+									{/if}
+									<button
+										type="button"
+										aria-label={m.aiRemoveField()}
+										class="text-error-500 hover:text-error-600 cursor-pointer text-xs shrink-0"
+										onclick={() => removeAiField(index)}
+									>
+										<i class="fa-solid fa-xmark"></i>
+									</button>
+								</div>
+							{/each}
+							{#if aiFields.length === 0}
+								<p class="text-[10px] text-surface-500 leading-relaxed">
+									{m.aiNoFieldsHint()}
+								</p>
+							{/if}
+						</div>
+						<label>
+							{@render fieldLabel(m.aiMaxAttempts())}
+							<input
+								type="number"
+								class="input w-full text-sm"
+								min="1"
+								max="5"
+								bind:value={actionConfig.max_attempts}
+								oninput={onChange}
+							/>
+						</label>
+					{:else}
+						<label>
+							{@render fieldLabel(m.aiMaxWords())}
+							<input
+								type="number"
+								class="input w-full text-sm"
+								min="1"
+								max="2000"
+								bind:value={actionConfig.max_words}
+								oninput={onChange}
+							/>
+						</label>
+					{/if}
+					<p class="text-[10px] text-surface-500 leading-relaxed">
+						<i class="fa-solid fa-circle-info mr-1"></i>{m.aiFencingHint()}
 					</p>
 				{:else if actionConfig.type === 'send_email'}
 					<label>
@@ -1794,6 +2618,53 @@
 							</div>
 						{/each}
 					</div>
+				{:else if actionConfig.type === 'date_offset'}
+					<label>
+						{@render fieldLabel(m.dateOffsetBase())}
+						<input
+							type="text"
+							class="input w-full text-sm"
+							placeholder={'{{today}}'}
+							bind:value={actionConfig.base}
+							oninput={onChange}
+						/>
+					</label>
+					<div class="flex gap-2">
+						<label class="flex-1">
+							{@render fieldLabel(m.days())}
+							<input
+								type="number"
+								class="input w-full text-sm"
+								bind:value={actionConfig.days}
+								oninput={onChange}
+							/>
+						</label>
+						<label class="flex-1">
+							{@render fieldLabel(m.weeks())}
+							<input
+								type="number"
+								class="input w-full text-sm"
+								bind:value={actionConfig.weeks}
+								oninput={onChange}
+							/>
+						</label>
+					</div>
+					<label>
+						{@render fieldLabel(m.dateOffsetStoreIn())}
+						<select
+							class="select w-full text-sm"
+							bind:value={actionConfig.output}
+							onchange={onChange}
+						>
+							<option value={''}>—</option>
+							{#each variables as variable (variable.id)}
+								<option value={variable.key}>{variable.key}</option>
+							{/each}
+						</select>
+					</label>
+					<p class="text-[10px] text-surface-500 leading-relaxed">
+						<i class="fa-solid fa-calendar-day mr-1"></i>{m.dateOffsetHint()}
+					</p>
 				{/if}
 				<p class="text-[10px] text-surface-500 leading-relaxed">
 					<i class="fa-solid fa-wand-magic-sparkles mr-1"></i>{m.templatingHint({
@@ -1802,7 +2673,11 @@
 				</p>
 			{/if}
 
-			{#if ['action', 'subprocess', 'loop'].includes(nodeDomain.type)}
+			<!-- set_variables already writes variables: offering "save results to
+			     variables" on it invites putting the value in the wrong place. Rows an
+			     older draft or an import already carries stay visible so they can be
+			     removed (publish rejects them). -->
+			{#if ['action', 'subprocess', 'loop'].includes(nodeDomain.type) && (actionConfig?.type !== 'set_variables' || Object.keys(nodeDomain.output_mapping ?? {}).length > 0)}
 				<div>
 					<div class="flex items-center justify-between mb-1">
 						{@render fieldLabel(m.outputMapping())}
@@ -1810,7 +2685,7 @@
 							type="button"
 							class="text-[10px] text-primary-500 hover:text-primary-600 cursor-pointer font-semibold disabled:opacity-50"
 							onclick={addOutputMapping}
-							disabled={!variables.length}
+							disabled={!variables.length || actionConfig?.type === 'set_variables'}
 						>
 							<i class="fa-solid fa-plus mr-0.5"></i>{m.addMapping()}
 						</button>

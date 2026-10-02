@@ -1,3 +1,6 @@
+from datetime import date
+import re
+
 from django.core.exceptions import (
     MultipleObjectsReturned,
     ObjectDoesNotExist,
@@ -28,8 +31,10 @@ from .services import (
 from .services.records import (
     RegulatoryRecordedStateUnavailable,
     regulatory_document_recorded_floor,
+    regulatory_selection_payload,
     select_regulatory_chain_at,
 )
+from .validators import validate_regulatory_identifier
 
 
 def _parse_aware_recorded_time(value: str):
@@ -105,6 +110,7 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
         return selection
 
     def get_queryset(self):
+        self._version_selection()
         if getattr(self, "action", None) not in {
             "retrieve",
             "applicability",
@@ -112,6 +118,46 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
         } and self.request.query_params.getlist("recorded_as_of"):
             self._selection_time()
         return super().get_queryset()
+
+    def _version_selection(self):
+        """Parse the same explicit selectors for every read, never ignore them."""
+
+        values = {}
+        for name in ("version_id", "valid_on"):
+            items = self.request.query_params.getlist(name)
+            if items:
+                if getattr(self, "action", None) not in {
+                    "retrieve",
+                    "applicability",
+                    "applicability_review",
+                }:
+                    raise ValidationError(
+                        {name: "Version selection is available only on detail."}
+                    )
+                if len(items) != 1 or not items[0] or items[0] != items[0].strip():
+                    raise ValidationError(
+                        {name: "Provide exactly one non-empty value."}
+                    )
+                values[name] = items[0]
+        version_id = values.get("version_id")
+        if version_id is not None:
+            try:
+                validate_regulatory_identifier(version_id)
+            except DjangoValidationError as exc:
+                raise ValidationError(
+                    {"version_id": "A regulatory record ID is required."}
+                ) from exc
+        valid_on = values.get("valid_on")
+        if valid_on is not None:
+            try:
+                if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", valid_on) is None:
+                    raise ValueError
+                valid_on = date.fromisoformat(valid_on)
+            except ValueError as exc:
+                raise ValidationError(
+                    {"valid_on": "Use a real YYYY-MM-DD calendar date."}
+                ) from exc
+        return version_id, valid_on
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
@@ -128,11 +174,14 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
             folder=folder,
         )
         selection_time, _ = self._selection_time(recorded_floor)
+        version_id, valid_on = self._version_selection()
         try:
             chain = select_regulatory_chain_at(
                 document=document,
                 folder=folder,
                 recorded_as_of=selection_time,
+                version_record_id=version_id,
+                valid_on=valid_on,
             )
             document.selected_versions = [chain.document_version]
         except DjangoValidationError as exc:
@@ -141,6 +190,7 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
             ) from exc
         serializer = self.get_serializer(document)
         data = serializer.data
+        data["selection"] = regulatory_selection_payload(chain)
         field_models = self._get_fieldsrelated_map(serializer)
         if field_models:
             allowed_ids = self._get_accessible_ids_map(set(field_models.values()))
@@ -168,14 +218,17 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
                     {"recorded_as_of": "Provide one non-empty timestamp."}
                 )
             requested_recorded_as_of = _parse_aware_recorded_time(recorded_values[0])
-        return entity, requested_recorded_as_of
+        version_id, valid_on = self._version_selection()
+        return entity, requested_recorded_as_of, version_id, valid_on
 
     @action(detail=True, methods=["get"], url_path="applicability")
     def applicability(self, request, *args, **kwargs):
         """Read one explicitly entity-scoped, non-binding applicability result."""
 
         document = self.get_object()
-        entity, requested_recorded_as_of = self._applicability_scope_and_time(request)
+        entity, requested_recorded_as_of, version_id, valid_on = (
+            self._applicability_scope_and_time(request)
+        )
 
         try:
             selection = get_regulatory_applicability(
@@ -183,6 +236,8 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
                 entity=entity,
                 document_id=document.id,
                 recorded_as_of=requested_recorded_as_of,
+                version_record_id=version_id,
+                valid_on=valid_on,
             )
         except RegulatoryRecordedStateUnavailable as exc:
             raise NotFound(
@@ -223,6 +278,7 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
                     else None
                 ),
                 "selected_recorded_at": selection.recorded_as_of.isoformat(),
+                "selection": regulatory_selection_payload(selection.chain),
                 "evaluation_status": (
                     "evaluated" if selection.decision is not None else "not_evaluated"
                 ),
@@ -245,13 +301,17 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
         """Read the human disposition of one exact non-binding decision revision."""
 
         document = self.get_object()
-        entity, requested_recorded_as_of = self._applicability_scope_and_time(request)
+        entity, requested_recorded_as_of, version_id, valid_on = (
+            self._applicability_scope_and_time(request)
+        )
         try:
             selection = get_regulatory_applicability_review(
                 actor=request.user,
                 entity=entity,
                 document_id=document.id,
                 recorded_as_of=requested_recorded_as_of,
+                version_record_id=version_id,
+                valid_on=valid_on,
             )
         except RegulatoryRecordedStateUnavailable as exc:
             raise NotFound(
@@ -304,6 +364,7 @@ class RegulatoryDocumentViewSet(AbstractBaseModelViewSet):
                     else None
                 ),
                 "selected_recorded_at": applicability.recorded_as_of.isoformat(),
+                "selection": regulatory_selection_payload(applicability.chain),
                 "evaluation_status": (
                     "evaluated"
                     if applicability.decision is not None

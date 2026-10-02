@@ -385,6 +385,9 @@ def test_applicability_review_api_masks_and_safely_unmasks_reviewer(
     regulatory_root,
 ):
     scope = _make_scope("REVIEWER-IAM", record_decision=True)
+    scope["reviewer"].__class__.objects.filter(pk=scope["reviewer"].pk).update(
+        folder=scope["folder"]
+    )
     _record_disposition(scope, "REVIEWER-IAM")
     client = APIClient()
 

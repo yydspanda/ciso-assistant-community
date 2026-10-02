@@ -1,10 +1,11 @@
 import { BASE_API_URL } from '$lib/utils/constants';
+import { contentDispositionHeader } from '$lib/utils/contentDisposition';
 import { getModelInfo, urlParamModelVerboseName } from '$lib/utils/crud';
 
 import { m } from '$paraglide/messages';
 
 import { safeTranslate } from '$lib/utils/i18n';
-import { modelSchema } from '$lib/utils/schemas';
+import { modelSchema, type FormDataShape } from '$lib/utils/schemas';
 import { fail, redirect, type RequestEvent } from '@sveltejs/kit';
 import { setFlash } from 'sveltekit-flash-message/server';
 import { message, setError, superValidate, type SuperValidated } from 'sveltekit-superforms';
@@ -13,6 +14,16 @@ import { z } from 'zod';
 import { getSecureRedirect } from './helpers';
 
 type FormAction = 'create' | 'edit';
+
+type BoundRelationshipWrite =
+	| {
+			field: 'requirement_assessments';
+			value: string[];
+	  }
+	| {
+			field: 'requirement_assessment';
+			value: string;
+	  };
 
 function getHTTPMethod({
 	action,
@@ -67,7 +78,7 @@ export async function handleErrorResponse({
 }: {
 	event: RequestEvent;
 	response: Response;
-	form: SuperValidated;
+	form: SuperValidated<FormDataShape>;
 }) {
 	const res: Record<string, string> = await response.json();
 	console.error(res);
@@ -87,11 +98,14 @@ export async function handleErrorResponse({
 	Object.entries(res).forEach(([key, value]) => {
 		if (Array.isArray(value)) {
 			value.forEach((item: string) => setError(form, key, safeTranslate(item)));
-		} else {
+		} else if (typeof value === 'string') {
 			setError(form, key, safeTranslate(value));
 		}
 	});
-	return message(form, { status: response.status });
+	// setError only runs for string values; nested errors must still refuse the save.
+	form.valid = false;
+	// Structured values (e.g. a 409's impact summary) reach the form through the message.
+	return message(form, { status: response.status, data: res });
 }
 
 export async function defaultWriteFormAction({
@@ -99,14 +113,22 @@ export async function defaultWriteFormAction({
 	urlModel,
 	action,
 	doRedirect = true,
-	redirectToWrittenObject = false
+	redirectToWrittenObject = false,
+	boundRelationship,
+	expectedUrlModel
 }: {
 	event: RequestEvent;
 	urlModel: string;
 	action: FormAction;
 	doRedirect?: boolean;
 	redirectToWrittenObject?: boolean;
+	boundRelationship?: BoundRelationshipWrite;
+	expectedUrlModel?: string;
 }) {
+	if (boundRelationship && action !== 'create') {
+		throw new TypeError('Bound relationship writes are only supported for create actions');
+	}
+
 	const formData = await event.request.formData();
 	if (!formData) {
 		return fail(400, { form: null });
@@ -114,10 +136,47 @@ export async function defaultWriteFormAction({
 
 	const schema = modelSchema(urlModel!);
 	const form = await superValidate(formData, zod(schema));
+	if (expectedUrlModel && formData.get('urlmodel') !== expectedUrlModel) {
+		return writeFailure({
+			event,
+			form,
+			field: 'urlmodel',
+			error: new TypeError('Submitted model does not match the server-bound model')
+		});
+	}
 
 	if (!form.valid) {
 		console.error(form.errors);
 		return message(form, { status: 400 });
+	}
+	let normalizedBoundRelationship = boundRelationship;
+	if (boundRelationship) {
+		const relationshipSchema =
+			boundRelationship.field === 'requirement_assessments'
+				? z.array(z.string().uuid()).length(1)
+				: z.string().uuid();
+		const parsedRelationshipValue = relationshipSchema.safeParse(boundRelationship.value);
+		if (!parsedRelationshipValue.success) {
+			return writeFailure({
+				event,
+				form,
+				field: boundRelationship.field,
+				error: parsedRelationshipValue.error
+			});
+		}
+		if (boundRelationship.field === 'requirement_assessments') {
+			normalizedBoundRelationship = {
+				field: boundRelationship.field,
+				value: parsedRelationshipValue.data as string[]
+			};
+			form.data[boundRelationship.field] = parsedRelationshipValue.data as string[];
+		} else {
+			normalizedBoundRelationship = {
+				field: boundRelationship.field,
+				value: parsedRelationshipValue.data as string
+			};
+			form.data[boundRelationship.field] = parsedRelationshipValue.data as string;
+		}
 	}
 
 	// `dataType: 'form'` submissions (models with a file field, e.g. Evidence) can't
@@ -145,47 +204,123 @@ export async function defaultWriteFormAction({
 	const fileFields = Object.fromEntries(
 		Object.entries(form.data).filter(([key]) => model.fileFields?.includes(key) ?? false)
 	) as Record<string, File>;
+	const writeData = normalizedBoundRelationship ? { ...form.data } : form.data;
 
 	Object.keys(fileFields).forEach((key) => {
 		form.data[key] = undefined;
+		writeData[key] = undefined;
 	});
 
 	const requestInitOptions: RequestInit = {
 		method: getHTTPMethod({ action, fileFields }),
-		body: JSON.stringify(form.data)
+		body: JSON.stringify(writeData)
 	};
 
-	const res = await event.fetch(endpoint, requestInitOptions);
+	let res: Response;
+	try {
+		res = await event.fetch(endpoint, requestInitOptions);
+	} catch (error) {
+		if (!normalizedBoundRelationship) throw error;
+		return writeFailure({ event, form, field: normalizedBoundRelationship.field, error });
+	}
 
-	if (!res.ok) return await handleErrorResponse({ event, response: res, form });
+	if (!res.ok) {
+		if (!normalizedBoundRelationship) {
+			return await handleErrorResponse({ event, response: res, form });
+		}
+		setError(form, normalizedBoundRelationship.field, m.error());
+		try {
+			return await handleErrorResponse({ event, response: res, form });
+		} catch (error) {
+			return writeFailure({
+				event,
+				form,
+				field: normalizedBoundRelationship.field,
+				error
+			});
+		}
+	}
 
-	const writtenObject = await res.json();
+	let writtenObject: Record<string, unknown>;
+	try {
+		writtenObject = await res.json();
+	} catch (error) {
+		if (!normalizedBoundRelationship) throw error;
+		return writeFailure({ event, form, field: normalizedBoundRelationship.field, error });
+	}
+	let boundObjectId: string | null = null;
+	if (normalizedBoundRelationship) {
+		const parsedWrittenObjectId = z.string().uuid().safeParse(writtenObject?.id);
+		if (!parsedWrittenObjectId.success) {
+			return writeFailure({
+				event,
+				form,
+				field: normalizedBoundRelationship.field,
+				error: new TypeError('Create response did not contain a UUID object id')
+			});
+		}
+		boundObjectId = parsedWrittenObjectId.data;
+	}
+	const writtenObjectId = normalizedBoundRelationship ? boundObjectId! : writtenObject.id;
 
 	if (fileFields) {
 		for (const [, file] of Object.entries(fileFields)) {
 			if (!file) continue;
 			if (file.size <= 0) continue;
-			const fileUploadEndpoint = `${BASE_API_URL}/${urlModel}/${writtenObject.id}/upload/`;
+			const fileUploadEndpoint = `${BASE_API_URL}/${urlModel}/${writtenObjectId}/upload/`;
 			const fileUploadRequestInitOptions: RequestInit = {
 				headers: {
-					'Content-Disposition': `attachment; filename=${encodeURIComponent(file.name)}`
+					'Content-Disposition': contentDispositionHeader(file.name)
 				},
 				method: 'POST',
 				body: file
 			};
-			const fileUploadRes = await event.fetch(fileUploadEndpoint, fileUploadRequestInitOptions);
+			let fileUploadRes: Response;
+			try {
+				fileUploadRes = await event.fetch(fileUploadEndpoint, fileUploadRequestInitOptions);
+			} catch (error) {
+				if (!normalizedBoundRelationship) throw error;
+				await bestEffortDeleteCreatedObject({ event, endpoint, objectId: boundObjectId! });
+				return writeFailure({
+					event,
+					form,
+					field: normalizedBoundRelationship.field,
+					error
+				});
+			}
 			if (!fileUploadRes.ok) {
 				// Clean up the created object if file upload fails during creation
 				if (action === 'create') {
-					const deleteEndpoint = `${BASE_API_URL}/${urlModel}/${writtenObject.id}/`;
-					await event.fetch(deleteEndpoint, { method: 'DELETE' });
+					if (normalizedBoundRelationship) {
+						await bestEffortDeleteCreatedObject({
+							event,
+							endpoint,
+							objectId: boundObjectId!
+						});
+					} else {
+						const deleteEndpoint = `${BASE_API_URL}/${urlModel}/${writtenObjectId}/`;
+						await event.fetch(deleteEndpoint, { method: 'DELETE' });
+					}
 				}
-				return await handleErrorResponse({ event, response: fileUploadRes, form });
+				if (!normalizedBoundRelationship) {
+					return await handleErrorResponse({ event, response: fileUploadRes, form });
+				}
+				setError(form, normalizedBoundRelationship.field, m.error());
+				try {
+					return await handleErrorResponse({ event, response: fileUploadRes, form });
+				} catch (error) {
+					return writeFailure({
+						event,
+						form,
+						field: normalizedBoundRelationship.field,
+						error
+					});
+				}
 			}
 		}
 	}
 
-	let flashParams = {
+	const flashParams: { type: 'success' | 'warning'; message: string } = {
 		type: 'success',
 		message: getSuccessMessage({ urlModel, action }) as string
 	};
@@ -204,6 +339,45 @@ export async function defaultWriteFormAction({
 	return message(form, { object: writtenObject });
 }
 
+async function bestEffortDeleteCreatedObject({
+	event,
+	endpoint,
+	objectId
+}: {
+	event: RequestEvent;
+	endpoint: string;
+	objectId: string;
+}) {
+	try {
+		const cleanupResponse = await event.fetch(`${endpoint}${objectId}/`, { method: 'DELETE' });
+		if (!cleanupResponse.ok) {
+			console.error('Failed to clean up object after follow-up file upload failure', {
+				status: cleanupResponse.status
+			});
+		}
+	} catch (error) {
+		console.error('Failed to clean up object after follow-up file upload failure', error);
+	}
+}
+
+function writeFailure({
+	event,
+	form,
+	field,
+	error
+}: {
+	event: RequestEvent;
+	form: SuperValidated<Record<string, unknown>>;
+	field: string;
+	error: unknown;
+}) {
+	console.error('Write failed closed', error);
+	const errorMessage = m.error();
+	setError(form, field, errorMessage);
+	setFlash({ type: 'error', message: errorMessage, timeout: 10000 }, event);
+	return message(form, { error: errorMessage });
+}
+
 export function normalizeServiceAccountAuthorization(data: Record<string, any>): void {
 	const mode = data.authorization_mode;
 	delete data.authorization_mode;
@@ -216,21 +390,28 @@ export function normalizeServiceAccountAuthorization(data: Record<string, any>):
 export async function nestedWriteFormAction({
 	event,
 	action,
-	redirectToWrittenObject = false
+	redirectToWrittenObject = false,
+	boundRelationship,
+	expectedUrlModel
 }: {
 	event: RequestEvent;
 	action: FormAction;
-	redirectToWrittenObject: boolean;
+	redirectToWrittenObject?: boolean;
+	boundRelationship?: BoundRelationshipWrite;
+	expectedUrlModel?: string;
 }) {
 	const request = event.request.clone();
 	const formData = await request.formData();
-	const urlModel = formData.get('urlmodel') as string;
+	const submittedUrlModel = formData.get('urlmodel');
+	const urlModel = expectedUrlModel ?? (submittedUrlModel as string);
 	return defaultWriteFormAction({
 		event,
 		urlModel,
 		action,
 		doRedirect: false,
-		redirectToWrittenObject
+		redirectToWrittenObject,
+		boundRelationship,
+		expectedUrlModel
 	});
 }
 
@@ -271,7 +452,7 @@ export async function defaultDeleteFormAction({
 		}
 		if (response.error) {
 			const errorMessages = Array.isArray(response.error) ? response.error : [response.error];
-			errorMessages.forEach((error) => {
+			errorMessages.forEach((error: string) => {
 				setFlash({ type: 'error', message: safeTranslate(error) }, event);
 			});
 			return message(deleteForm, { status: res.status });

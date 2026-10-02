@@ -11,11 +11,17 @@ time (only lazily, inside methods) so it is safe to import from model modules.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
+import structlog
+
+logger = structlog.get_logger(__name__)
+
 
 class IntegrationSyncableMixin:
     # Overridden per model.
     INTEGRATION_MODEL_KEY: str = ""
-    INTEGRATION_SYNCABLE_FIELDS: set[str] = set()
+    INTEGRATION_SYNCABLE_FIELDS: ClassVar[set[str]] = set()
 
     def _get_changed_fields(self, old_instance) -> list[str]:
         """Names of syncable fields that differ from ``old_instance``."""
@@ -52,30 +58,67 @@ class IntegrationSyncableMixin:
 
         from django.contrib.contenttypes.models import ContentType
         from django.db import transaction
-
         from iam.models import Folder
+
         from integrations.models import IntegrationConfiguration
-        from integrations.settings_access import is_model_configured
+        from integrations.settings_access import (
+            integration_sync_fingerprint,
+            is_model_configured,
+        )
         from integrations.tasks import sync_object_to_integrations
 
-        configurations = IntegrationConfiguration.objects.filter(
-            folder=Folder.get_root_folder(),
+        root_folder = Folder.get_root_folder()
+        configurations = IntegrationConfiguration.objects.select_related(
+            "provider"
+        ).filter(
+            folder=root_folder,
             provider__provider_type="itsm",
+            provider__is_active=True,
             is_active=True,
         )
-        config_ids = [
-            c.id
-            for c in configurations
-            if is_model_configured(c.settings, self.INTEGRATION_MODEL_KEY)
+        configured = [
+            configuration
+            for configuration in configurations
+            if is_model_configured(configuration.settings, self.INTEGRATION_MODEL_KEY)
         ]
+        config_ids = [configuration.id for configuration in configured]
         if not config_ids:
             return
+        config_fingerprints = {
+            str(configuration.id): integration_sync_fingerprint(
+                configuration, self.INTEGRATION_MODEL_KEY
+            )
+            for configuration in configured
+        }
 
         content_type = ContentType.objects.get_for_model(self)
         pk = self.pk
+
+        def schedule_sync() -> None:
+            try:
+                sync_object_to_integrations.schedule(
+                    args=(
+                        content_type,
+                        pk,
+                        config_ids,
+                        changed_fields,
+                        config_fingerprints,
+                    ),
+                    delay=1,
+                )
+            except Exception as exc:
+                # Persistence is authoritative.  A committed mutation must not
+                # surface as an API failure or prevent later robust callbacks
+                # (including the governed relationship webhook) from running.
+                logger.exception(
+                    "Failed to schedule integration sync after commit",
+                    model=content_type.model,
+                    object_id=str(pk),
+                    configuration_count=len(config_ids),
+                    error_type=type(exc).__name__,
+                )
+
         transaction.on_commit(
-            lambda: sync_object_to_integrations.schedule(
-                args=(content_type, pk, config_ids, changed_fields),
-                delay=1,
-            )
+            schedule_sync,
+            robust=True,
         )

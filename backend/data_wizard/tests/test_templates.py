@@ -8,9 +8,11 @@ the response and a spot-checked record are asserted against the template
 content.
 """
 
+import io
 from pathlib import Path
 
 import pytest
+from openpyxl import load_workbook
 
 from core.models import (
     AppliedControl,
@@ -180,7 +182,7 @@ class TestSimpleTemplates:
         assert first.name == "alpha"
         assert first.type == Asset.Type.PRIMARY
 
-    def test_applied_controls_template(
+    def test_mixed_applied_controls_template_stops_at_the_policy_boundary(
         self, api_client, domain_folder, template_domains, all_accessible
     ):
         resp = _post_template(
@@ -191,10 +193,57 @@ class TestSimpleTemplates:
         )
         assert resp.status_code == 200, resp.json()
         results = resp.json()["results"]
-        assert results["created"] == 20
+        # The upstream example mixes model types. Policy rows must not pass
+        # through AppliedControl permissions, even for an administrator.
+        assert results["created"] == 1
+        assert results["failed"] == 1
+        assert results["stopped"] is True
+        assert "Policies must be created and changed through the policy API." in str(
+            results["errors"]
+        )
+        assert not AppliedControl.objects.filter(ref_id="AC-002").exists()
+        assert not AppliedControl.objects.filter(ref_id="AC-003").exists()
         firewall = AppliedControl.objects.get(ref_id="AC-001")
         assert firewall.name == "Firewall"
         assert firewall.csf_function == "protect"
+
+    def test_non_policy_rows_of_applied_controls_template_are_supported(
+        self, api_client, domain_folder, template_domains, all_accessible
+    ):
+        # Preserve the shipped artifact. Build the documented model-specific
+        # input in memory and verify every non-policy row, not just the first.
+        workbook = load_workbook(
+            io.BytesIO(_read_template("applied_controls_template.xlsx"))
+        )
+        sheet = workbook.active
+        header = [cell.value for cell in sheet[1]]
+        category_column = header.index("category") + 1
+        policy_count = 0
+        for row_index in range(sheet.max_row, 1, -1):
+            if (
+                str(sheet.cell(row_index, category_column).value).strip().lower()
+                == "policy"
+            ):
+                sheet.delete_rows(row_index)
+                policy_count += 1
+        assert policy_count == 4
+        content = io.BytesIO()
+        workbook.save(content)
+        response = api_client.post(
+            URL,
+            data=content.getvalue(),
+            content_type="application/octet-stream",
+            HTTP_X_MODEL_TYPE="AppliedControl",
+            HTTP_X_FOLDER_ID=str(domain_folder.id),
+            HTTP_CONTENT_DISPOSITION="attachment; filename=applied_controls_template.xlsx",
+        )
+        assert response.status_code == 200, response.json()
+        results = response.json()["results"]
+        assert results["created"] == 16
+        assert results["failed"] == 0
+        assert results["stopped"] is False
+        assert results["errors"] == []
+        assert not Policy.objects.exists()
 
     def test_perimeters_template(
         self, api_client, domain_folder, template_domains, all_accessible
@@ -265,15 +314,21 @@ class TestSimpleTemplates:
         assert first.name == "Phishing Attack"
 
     def test_domains_template(self, api_client, root_folder, all_accessible):
+        """The shipped template nests domains under one another, which only the
+        enterprise edition accepts. Here the first nested row is rejected and the
+        import halts, leaving just the top-level domain.
+        """
         resp = _post_template(
             api_client, "domains_template.xlsx", "Folder", root_folder.id
         )
         assert resp.status_code == 200, resp.json()
         results = resp.json()["results"]
-        assert results["created"] == 4
-        acme = Folder.objects.get(name="ACME Corp", parent_folder=root_folder)
-        it = Folder.objects.get(name="IT Department")
-        assert it.parent_folder == acme
+        assert results["created"] == 1
+        assert results["failed"] == 1
+        assert results["stopped"] is True
+        assert "subDomainsRequirePro" in str(results["errors"])
+        Folder.objects.get(name="ACME Corp", parent_folder=root_folder)
+        assert not Folder.objects.filter(name="IT Department").exists()
 
     def test_security_exceptions_template(
         self, api_client, domain_folder, template_domains, all_accessible
@@ -355,14 +410,13 @@ class TestSimpleTemplates:
 
 def _make_audit(folder, name, ref_id):
     """Pre-existing audit for the EntityAssessments sheet's audit_ref_id/audit_name columns to link to."""
-    fw = Framework.objects.create(name=f"{name} FW", folder=folder, is_published=True)
+    fw = Framework.objects.create(name=f"{name} FW", folder=folder)
     RequirementNode.objects.create(
         framework=fw,
         urn=f"urn:test:{ref_id}:req:1",
         ref_id="REQ1",
         assessable=True,
         folder=folder,
-        is_published=True,
     )
     audit = ComplianceAssessment.objects.create(
         name=name, ref_id=ref_id, framework=fw, folder=folder
@@ -433,7 +487,20 @@ class TestAssessmentTemplates:
         template_domains,
         template_perimeter,
         all_accessible,
+        root_folder,
     ):
+        web_control = AppliedControl.objects.create(
+            name="Web frontend TLS hardening",
+            ref_id="AC-WEB-001",
+            folder=domain_folder,
+        )
+        k8s_control = AppliedControl.objects.create(
+            name="Kubernetes Hardening", folder=domain_folder
+        )
+        owner_user = User.objects.create_user("jane.doe@company.com")
+        owner_user.folder = root_folder
+        owner_user.save()
+
         resp = _post_template(
             api_client,
             "findings_assessment_template.xlsx",
@@ -453,7 +520,13 @@ class TestAssessmentTemplates:
         assert first.asset.name == "web frontend"
         assert first.asset.folder == domain_folder
         assert first.asset.type == Asset.Type.SUPPORT
+        assert list(first.applied_controls.all()) == [web_control]
+        assert list(first.owner.all()) == [owner_user.actor]
         assert results["details"]["assets_created"] == 3
+
+        third = Finding.objects.get(ref_id="F.07")
+        assert list(third.applied_controls.all()) == [k8s_control]
+        assert third.owner.count() == 0
 
     def test_risk_assessment_template(
         self,

@@ -29,6 +29,7 @@ from regulatory.models import (
     RegulatoryObligation,
     RegulatoryObligationProvision,
     RegulatoryProvision,
+    RegulatoryVersionSupersessionEvent,
 )
 
 from .common import (
@@ -398,6 +399,15 @@ def correct_regulatory_chain(
         return RegulatoryCorrectionResult(
             event=existing,
             chain=_chain_from_event(registration=registration, event=existing),
+        )
+
+    if RegulatoryVersionSupersessionEvent.objects.filter(
+        document=registration.document
+    ).exists():
+        raise ValidationError(
+            {
+                "document_version": "Correction of a supersession-bound document requires a reviewed rebind contract."
+            }
         )
 
     current = lock_current_regulatory_chain(

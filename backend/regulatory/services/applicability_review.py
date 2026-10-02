@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID
 
@@ -704,6 +704,8 @@ def get_regulatory_applicability_review(
     entity: Entity,
     document_id,
     recorded_as_of: datetime | None = None,
+    version_record_id: str | None = None,
+    valid_on: date | None = None,
 ) -> RegulatoryApplicabilityReviewSelection:
     """Select review state for the exact applicability decision at one cutoff."""
 
@@ -712,6 +714,8 @@ def get_regulatory_applicability_review(
         entity=entity,
         document_id=document_id,
         recorded_as_of=recorded_as_of,
+        version_record_id=version_record_id,
+        valid_on=valid_on,
     )
     actor = User.objects.get(pk=actor.pk)
     registration = applicability.chain.registration

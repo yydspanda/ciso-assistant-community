@@ -820,6 +820,11 @@ def record_regulatory_applicability_decision(
         raise ValidationError(
             {"valid_to": "The decision ends outside the obligation interval."}
         )
+    selected_end = getattr(chain.document_version, "selected_valid_to", None)
+    if selected_end is not None and (valid_to is None or valid_to > selected_end):
+        raise ValidationError(
+            {"valid_to": "The decision crosses a known version-replacement boundary."}
+        )
 
     result, rationale_code, rationale = _computed_outcome(
         normalized["observations"],
@@ -905,6 +910,8 @@ def get_regulatory_applicability(
     entity: Entity,
     document_id,
     recorded_as_of: datetime | None = None,
+    version_record_id: str | None = None,
+    valid_on: date | None = None,
 ) -> RegulatoryApplicabilitySelection:
     """Select one entity-scoped decision at the same time as its exact chain."""
 
@@ -927,6 +934,8 @@ def get_regulatory_applicability(
         folder=folder,
         registration=registration,
         recorded_as_of=selected_at,
+        version_record_id=version_record_id,
+        valid_on=valid_on,
     )
     decisions = list(
         RegulatoryApplicabilityDecision.objects.select_related(

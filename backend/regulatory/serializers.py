@@ -272,7 +272,7 @@ class RegulatoryDocumentVersionReadSerializer(serializers.ModelSerializer):
         return obj.provenance_payload()
 
     def get_supersedes_version_ids(self, obj: RegulatoryDocumentVersion) -> list[str]:
-        return []
+        return getattr(obj, "selected_supersedes_version_ids", [])
 
     def get_provisions(self, obj: RegulatoryDocumentVersion) -> list[dict]:
         provisions = getattr(obj, "selected_provisions", [])

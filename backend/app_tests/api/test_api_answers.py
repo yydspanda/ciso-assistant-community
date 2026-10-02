@@ -11,10 +11,13 @@ from core.models import (
     Framework,
     Question,
     QuestionChoice,
+    QuickForm,
+    QuickFormPage,
+    QuickFormResponse,
     RequirementAssessment,
     RequirementNode,
 )
-from iam.models import Folder
+from iam.models import Folder, User
 
 
 @pytest.fixture
@@ -24,7 +27,6 @@ def framework_with_questions(app_config):
     fw = Framework.objects.create(
         name="Answer Test Framework",
         folder=folder,
-        is_published=True,
         min_score=0,
         max_score=100,
     )
@@ -34,7 +36,6 @@ def framework_with_questions(app_config):
         ref_id="ANS-REQ-001",
         assessable=True,
         folder=folder,
-        is_published=True,
     )
     q = Question.objects.create(
         requirement_node=rn,
@@ -44,7 +45,6 @@ def framework_with_questions(app_config):
         type=Question.Type.UNIQUE_CHOICE,
         order=0,
         folder=folder,
-        is_published=True,
     )
     c1 = QuestionChoice.objects.create(
         question=q,
@@ -55,7 +55,6 @@ def framework_with_questions(app_config):
         compute_result="true",
         order=0,
         folder=folder,
-        is_published=True,
     )
     c2 = QuestionChoice.objects.create(
         question=q,
@@ -66,7 +65,6 @@ def framework_with_questions(app_config):
         compute_result="false",
         order=1,
         folder=folder,
-        is_published=True,
     )
 
     from core.models import Perimeter
@@ -80,7 +78,6 @@ def framework_with_questions(app_config):
         framework=fw,
         folder=folder,
         perimeter=perimeter,
-        is_published=True,
     )
     ra = RequirementAssessment.objects.create(
         compliance_assessment=ca,
@@ -105,7 +102,6 @@ def framework_with_multi_choice(app_config):
     fw = Framework.objects.create(
         name="Multi Choice FW",
         folder=folder,
-        is_published=True,
     )
     rn = RequirementNode.objects.create(
         framework=fw,
@@ -113,7 +109,6 @@ def framework_with_multi_choice(app_config):
         ref_id="MC-REQ",
         assessable=True,
         folder=folder,
-        is_published=True,
     )
     q = Question.objects.create(
         requirement_node=rn,
@@ -122,7 +117,6 @@ def framework_with_multi_choice(app_config):
         type=Question.Type.MULTIPLE_CHOICE,
         order=0,
         folder=folder,
-        is_published=True,
     )
     c1 = QuestionChoice.objects.create(
         question=q,
@@ -131,7 +125,6 @@ def framework_with_multi_choice(app_config):
         value="A",
         order=0,
         folder=folder,
-        is_published=True,
     )
     c2 = QuestionChoice.objects.create(
         question=q,
@@ -140,7 +133,6 @@ def framework_with_multi_choice(app_config):
         value="B",
         order=1,
         folder=folder,
-        is_published=True,
     )
     c3 = QuestionChoice.objects.create(
         question=q,
@@ -149,7 +141,6 @@ def framework_with_multi_choice(app_config):
         value="C",
         order=2,
         folder=folder,
-        is_published=True,
     )
 
     from core.models import Perimeter
@@ -160,7 +151,6 @@ def framework_with_multi_choice(app_config):
         framework=fw,
         folder=folder,
         perimeter=perimeter,
-        is_published=True,
     )
     ra = RequirementAssessment.objects.create(
         compliance_assessment=ca,
@@ -174,6 +164,37 @@ def framework_with_multi_choice(app_config):
         "choice_c": c3,
         "requirement_assessment": ra,
     }
+
+
+@pytest.fixture
+def quick_form_answer_context(authenticated_client):
+    folder = Folder.get_root_folder()
+    form = QuickForm.objects.create(
+        name="Answer API quick form",
+        urn="urn:test:answer-api:quick-form",
+        folder=folder,
+    )
+    page = QuickFormPage.objects.create(
+        quick_form=form,
+        name="Answer API page",
+        urn="urn:test:answer-api:quick-form:page",
+        folder=folder,
+    )
+    question = Question.objects.create(
+        page=page,
+        urn="urn:test:answer-api:quick-form:question",
+        ref_id="QF-Q1",
+        text="Quick-form answer",
+        type=Question.Type.TEXT,
+        folder=folder,
+    )
+    response = QuickFormResponse.objects.create(
+        name="Answer API response",
+        quick_form=form,
+        folder=folder,
+        submitted_by=User.objects.get(email="admin@tests.com"),
+    )
+    return {"question": question, "response": response}
 
 
 @pytest.mark.django_db
@@ -202,7 +223,7 @@ class TestAnswerEndpoints:
             },
             format="json",
         )
-        assert response.status_code == status.HTTP_201_CREATED
+        assert response.status_code == status.HTTP_201_CREATED, response.data
         answer = Answer.objects.get(requirement_assessment=ra, question=q)
         # Legacy value is resolved to M2M
         assert set(answer.selected_choices.all()) == {data["choice_a"]}
@@ -230,6 +251,78 @@ class TestAnswerEndpoints:
         assert response.status_code == status.HTTP_201_CREATED
         answer = Answer.objects.get(requirement_assessment=ra, question=q)
         assert set(answer.selected_choices.all()) == {data["choice_b"]}
+
+    def test_create_quick_form_answer_and_reject_duplicate(
+        self, authenticated_client, quick_form_answer_context
+    ):
+        data = quick_form_answer_context
+        payload = {
+            "response": str(data["response"].id),
+            "question": str(data["question"].id),
+            "value": "first",
+        }
+
+        created = authenticated_client.post(
+            reverse("answers-list"), payload, format="json"
+        )
+        assert created.status_code == status.HTTP_201_CREATED, created.data
+
+        duplicate = authenticated_client.post(
+            reverse("answers-list"), payload, format="json"
+        )
+        assert duplicate.status_code == status.HTTP_400_BAD_REQUEST, duplicate.data
+
+    def test_create_answer_rejects_missing_or_both_parents(
+        self,
+        authenticated_client,
+        framework_with_questions,
+        quick_form_answer_context,
+    ):
+        question = framework_with_questions["question"]
+        missing = authenticated_client.post(
+            reverse("answers-list"),
+            {"question": str(question.id), "value": "AC1"},
+            format="json",
+        )
+        assert missing.status_code == status.HTTP_400_BAD_REQUEST, missing.data
+        assert "requirement_assessment" in missing.data
+        assert not Answer.objects.exists()
+
+        mismatched_both = authenticated_client.post(
+            reverse("answers-list"),
+            {
+                "requirement_assessment": str(
+                    framework_with_questions["requirement_assessment"].id
+                ),
+                "response": str(quick_form_answer_context["response"].id),
+                "question": str(question.id),
+                "value": "AC1",
+            },
+            format="json",
+        )
+        assert mismatched_both.status_code == status.HTTP_403_FORBIDDEN, (
+            mismatched_both.data
+        )
+        assert str(mismatched_both.data["detail"]) == (
+            "One or more answer relationships are unavailable."
+        )
+        assert not Answer.objects.exists()
+
+        both = authenticated_client.post(
+            reverse("answers-list"),
+            {
+                "requirement_assessment": str(
+                    framework_with_questions["requirement_assessment"].id
+                ),
+                "response": str(quick_form_answer_context["response"].id),
+                "question": str(quick_form_answer_context["question"].id),
+                "value": "first",
+            },
+            format="json",
+        )
+        assert both.status_code == status.HTTP_400_BAD_REQUEST, both.data
+        assert "not both" in str(both.data)
+        assert not Answer.objects.exists()
 
     def test_unique_together_constraint(
         self, authenticated_client, framework_with_questions
@@ -342,7 +435,6 @@ class TestAnswerEndpoints:
             type=Question.Type.UNIQUE_CHOICE,
             order=1,
             folder=folder,
-            is_published=True,
         )
         other_choice = QuestionChoice.objects.create(
             question=other_q,
@@ -351,7 +443,6 @@ class TestAnswerEndpoints:
             value="Other",
             order=0,
             folder=folder,
-            is_published=True,
         )
 
         response = authenticated_client.post(

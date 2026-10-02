@@ -14,6 +14,43 @@ In CISO Assistant, **domains are the primary mechanism for restricting access**.
 
 Keep in mind that custom roles increase IAM complexity and make access reviews more difficult. In most cases, the default roles are sufficient.
 
+## Full compliance-assessment view after upgrading
+
+The `core.0172_view_compliance_assessment_full_permission` migration preserved
+the behavior of installations upgrading from an earlier release. At migration
+time, it granted `view_compliance_assessment_full` to every existing role except
+the built-in Auditee and Third-party respondent roles. This included custom
+roles that existed at the time. The migration was a compatibility backfill, not
+evidence that every affected custom role still requires full auditor access.
+
+New custom roles do not receive this permission automatically. Grant it only
+when the role must see every requirement and auditor-only field in a compliance
+assessment. Ordinary assessment access does not imply full-view access.
+
+After upgrading, an administrator can run this read-only audit from the backend
+directory:
+
+```bash
+uv run python manage.py audit_full_view_custom_roles
+```
+
+Use `--json` for machine-readable output. CI or an operational check can add
+`--fail-if-present` to return a non-zero exit status when any non-built-in role
+holds the permission:
+
+```bash
+uv run python manage.py audit_full_view_custom_roles --json --fail-if-present
+```
+
+The audit never changes permissions. It reports current custom-role holders; it
+cannot distinguish a grant created by migration 0172 from one deliberately
+added later. Review each reported role, its user groups, assignments, and domain
+scope with the accountable IAM owner. To remove access, open **Organization →
+Roles**, edit the named custom role, clear **Can view the full auditor view of a
+compliance assessment (all rows and fields)**, and save. Run the audit again to
+verify the intended result. Do not remove the permission from a role solely
+because it appears in the report.
+
 ## [Custom roles for CISO Assistant](https://app.guidde.com/playbooks/7f23K23PveNou6UuXdYRFe)
 
 {% embed url="https://app.guidde.com/share/playbooks/7f23K23PveNou6UuXdYRFe" %}

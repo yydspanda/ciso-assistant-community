@@ -1,25 +1,50 @@
+from types import SimpleNamespace
+
 import pytest
+from django.contrib.auth.models import Permission
 from rest_framework.exceptions import ValidationError
+
 from core.models import (
+    Assessment,
     Answer,
     ComplianceAssessment,
     Framework,
     Question,
     RequirementAssessment,
     RequirementNode,
-    Assessment,
 )
 from core.serializers import AnswerWriteSerializer
-from iam.models import Folder
+from iam.models import Folder, Role, RoleAssignment, User
 
 
 @pytest.fixture
 def validation_setup(db):
     folder = Folder.get_root_folder()
+    user = User.objects.create_user("answer-validation@tests.invalid")
+    role = Role.objects.create(name="Answer validation reader", folder=folder)
+    role.permissions.set(
+        Permission.objects.filter(
+            codename__in={
+                "view_complianceassessment",
+                "view_compliance_assessment_full",
+                "view_framework",
+                "view_question",
+                "view_questionchoice",
+                "view_requirementassessment",
+                "view_requirementnode",
+            }
+        )
+    )
+    role_assignment = RoleAssignment.objects.create(
+        user=user,
+        role=role,
+        folder=folder,
+        is_recursive=True,
+    )
+    role_assignment.perimeter_folders.add(folder)
     fw = Framework.objects.create(
         name="Validation FW",
         folder=folder,
-        is_published=True,
     )
     rn1 = RequirementNode.objects.create(
         framework=fw,
@@ -27,7 +52,6 @@ def validation_setup(db):
         ref_id="REQ1",
         assessable=True,
         folder=folder,
-        is_published=True,
     )
     rn2 = RequirementNode.objects.create(
         framework=fw,
@@ -35,7 +59,6 @@ def validation_setup(db):
         ref_id="REQ2",
         assessable=True,
         folder=folder,
-        is_published=True,
     )
     q1 = Question.objects.create(
         requirement_node=rn1,
@@ -43,7 +66,6 @@ def validation_setup(db):
         ref_id="Q1",
         type=Question.Type.TEXT,
         folder=folder,
-        is_published=True,
     )
     q2 = Question.objects.create(
         requirement_node=rn2,
@@ -51,7 +73,6 @@ def validation_setup(db):
         ref_id="Q2",
         type=Question.Type.TEXT,
         folder=folder,
-        is_published=True,
     )
     ca = ComplianceAssessment.objects.create(
         name="Validation CA",
@@ -70,6 +91,7 @@ def validation_setup(db):
         "q1": q1,
         "q2": q2,
         "folder": folder,
+        "request": SimpleNamespace(user=user),
     }
 
 
@@ -84,7 +106,8 @@ class TestAnswerValidation:
                 "question": data["q2"].id,  # q2 belongs to rn2, ra1 belongs to rn1
                 "value": "some text",
                 "folder": data["folder"].id,
-            }
+            },
+            context={"request": data["request"]},
         )
         with pytest.raises(ValidationError) as excinfo:
             serializer.is_valid(raise_exception=True)
@@ -105,7 +128,8 @@ class TestAnswerValidation:
                 "question": data["q1"].id,
                 "value": "some text",
                 "folder": data["folder"].id,
-            }
+            },
+            context={"request": data["request"]},
         )
         with pytest.raises(ValidationError) as excinfo:
             serializer.is_valid(raise_exception=True)
@@ -123,7 +147,8 @@ class TestAnswerValidation:
                 "question": data["q1"].id,
                 "value": "some text",
                 "folder": data["folder"].id,
-            }
+            },
+            context={"request": data["request"]},
         )
         with pytest.raises(ValidationError) as excinfo:
             serializer.is_valid(raise_exception=True)

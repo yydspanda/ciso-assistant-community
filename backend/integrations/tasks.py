@@ -1,4 +1,5 @@
 import uuid
+from secrets import compare_digest
 
 from django.contrib.contenttypes.models import ContentType
 from huey.contrib.djhuey import HUEY, lock_task, task
@@ -16,22 +17,86 @@ logger = get_logger(__name__)
 @task()
 def sync_object_to_integrations(
     content_type: ContentType,
-    object_id: int,
-    config_ids: list[int],
+    object_id: uuid.UUID,
+    config_ids: list[uuid.UUID],
     changed_fields: list[str],
+    config_fingerprints: dict[str, str] | None = None,
 ):
-    """Push local changes to all configured integrations"""
+    """Push local changes through configurations still authorized at execution."""
     from django.apps import apps
+    from iam.models import Folder
+
+    from integrations.settings_access import (
+        integration_sync_fingerprint,
+        is_model_configured,
+    )
+    from integrations.syncable import model_key_for_content_type
 
     Model = apps.get_model(content_type.app_label, content_type.model)
     obj = Model.objects.get(pk=object_id)
+    model_key = model_key_for_content_type(content_type)
+    if model_key is None:
+        logger.warning(
+            "Skipping outbound integration sync for an unregistered model",
+            content_type=f"{content_type.app_label}.{content_type.model}",
+            object_id=str(object_id),
+        )
+        return
+
+    expected_fingerprints = config_fingerprints or {}
+    root_folder = Folder.get_root_folder()
 
     for config_id in config_ids:
         try:
-            config = IntegrationConfiguration.objects.get(pk=config_id)
+            expected_fingerprint = expected_fingerprints.get(str(config_id))
+            if expected_fingerprint is None:
+                logger.warning(
+                    "Skipping outbound integration sync without an authority fingerprint",
+                    configuration_id=str(config_id),
+                    model=model_key,
+                    object_id=str(object_id),
+                )
+                continue
+
+            config = (
+                IntegrationConfiguration.objects.select_related("provider")
+                .filter(
+                    pk=config_id,
+                    folder=root_folder,
+                    is_active=True,
+                    provider__is_active=True,
+                    provider__provider_type="itsm",
+                )
+                .first()
+            )
+            if config is None:
+                logger.info(
+                    "Skipping outbound integration sync outside the active root ITSM boundary",
+                    configuration_id=str(config_id),
+                    model=model_key,
+                    object_id=str(object_id),
+                )
+                continue
 
             # Skip if outgoing sync is disabled
             if not config.settings.get("enable_outgoing_sync", False):
+                continue
+            if not is_model_configured(config.settings, model_key):
+                logger.info(
+                    "Skipping outbound integration sync for an unconfigured model",
+                    configuration_id=str(config_id),
+                    model=model_key,
+                    object_id=str(object_id),
+                )
+                continue
+            current_fingerprint = integration_sync_fingerprint(config, model_key)
+            if not compare_digest(expected_fingerprint, current_fingerprint):
+                logger.warning(
+                    "Skipping outbound integration sync after configuration changed",
+                    configuration_id=str(config_id),
+                    model=model_key,
+                    object_id=str(object_id),
+                )
                 continue
 
             orchestrator = IntegrationRegistry.get_orchestrator(config)

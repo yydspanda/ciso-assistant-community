@@ -68,6 +68,8 @@
 	const study = reportData.study;
 	const useBubbles = data.useBubbles;
 	const inherentRiskEnabled = data.inherentRiskEnabled;
+	const controlHref = (control: { id: string; category?: string | null }) =>
+		control.category === 'policy' ? `/policies/${control.id}` : `/applied-controls/${control.id}`;
 
 	const pertinenceColor: Record<string, string> = {
 		undefined: 'bg-surface-200-800 text-surface-700-300',
@@ -831,6 +833,20 @@
 									{/each}
 								</div>
 							{/if}
+							{#if data.featureflags?.ttps && opScenario.techniques && opScenario.techniques.length > 0}
+								<div class="mt-2 text-sm">
+									<span class="font-semibold text-surface-700-300">{m.techniques()}:</span>
+									{#each opScenario.techniques as technique, index}
+										{index > 0 ? ', ' : ''}
+										<Anchor
+											href={`/techniques/${technique.id}`}
+											label={technique.str}
+											class="space-x-2 text-primary-800-200 hover:text-primary-600-400"
+											>{technique.str}</Anchor
+										>
+									{/each}
+								</div>
+							{/if}
 							{#if opScenario.stakeholders && opScenario.stakeholders.length > 0}
 								<div class="mt-2 text-sm">
 									<span class="font-semibold text-surface-700-300">{m.stakeholders()}:</span>
@@ -1173,7 +1189,7 @@
 												<tr class="hover:bg-surface-50-950">
 													<td class="px-3 py-2 text-sm text-surface-950-50">
 														<Anchor
-															href="/applied-controls/{control.id}"
+															href={controlHref(control)}
 															class="text-primary-600 hover:text-primary-800-200 hover:underline"
 														>
 															{control.name}
@@ -1265,7 +1281,7 @@
 											<tr class="hover:bg-surface-50-950">
 												<td class="px-3 py-2 text-sm text-surface-950-50">
 													<Anchor
-														href="/applied-controls/{control.id}"
+														href={controlHref(control)}
 														class="text-primary-600 hover:text-primary-800-200 hover:underline"
 													>
 														{control.str}
@@ -1345,7 +1361,7 @@
 									<tr class="hover:bg-surface-50-950">
 										<td class="px-3 py-2 text-sm text-surface-950-50">
 											<Anchor
-												href="/applied-controls/{control.id}"
+												href={controlHref(control)}
 												class="text-primary-600 hover:text-primary-800-200 hover:underline"
 											>
 												{control.name}

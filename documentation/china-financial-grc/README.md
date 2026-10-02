@@ -41,6 +41,7 @@ a governed system of record with bounded AI capabilities:
 - [ADR 0002: controlled recorded-time correction and historical retrieval](adr/0002-recorded-time-correction.md)
 - [ADR 0003: bounded synthetic applicability persistence](adr/0003-bounded-synthetic-applicability-persistence.md)
 - [ADR 0004: bounded synthetic applicability review disposition](adr/0004-bounded-synthetic-applicability-review-disposition.md)
+- [ADR 0005: synthetic whole-version supersession and dual-time reads](adr/0005-synthetic-whole-version-supersession.md)
 - [`schemas/regulatory-record.schema.json`](schemas/regulatory-record.schema.json):
   the proposed `2.0.0-draft.1` interchange contract for regulatory knowledge
 - [`catalogs/regulatory-sources.json`](catalogs/regulatory-sources.json) and the
@@ -147,7 +148,7 @@ This bounded implementation remains draft, non-binding, unpublished, and
 synthetic. It has separate view and internal record permissions and no public
 write route. It does not add a general `ApplicabilityRule` approval lifecycle,
 real institution facts, binding legal conclusions, approval/publication,
-source text, source/legal-version supersession, a binding reviewer action/admin
+source text, real-law supersession review, a binding reviewer action/admin
 workflow, an agent, or a library projection. Flattening regulatory history into `Framework` and
 `RequirementNode` remains prohibited; those objects receive only reviewed
 projections in a later gated phase. See
@@ -207,3 +208,24 @@ component-level backup/restore equality, and a restored-runtime successor
 write. See
 [PostgreSQL and operational acceptance](postgresql-operational-acceptance.md).
 This is local synthetic technical evidence, not production approval.
+
+Migration `regulatory.0005` adds a separate synthetic whole-document replacement
+edge. It appends a distinct version/provision/obligation chain without changing
+the old source intervals. Known edges derive exclusive valid-time bounds, while
+`recorded_as_of` still selects only what was known at that time. The detail,
+applicability and disposition GETs share strict `valid_on`/`version_id` selectors
+and one typed selection anchor; the read-only frontend pins all three panels
+to that exact version, date and recorded instant.
+
+The new internal service requires a separately granted folder permission and
+an active named human. Sources remain metadata-only and legally unreviewed;
+edges remain non-binding and unpublished, and successors inherit no decisions
+or reviews. Partial amendments, repeal/transition, source authentication and
+binding legal approval are not implemented. New correction of an edge-bound
+document is refused pending a reviewed rebind contract. The upgraded synthetic
+candidate passes 168 PostgreSQL cases, including four new supersession
+concurrency cases, and 12 authenticated browser cases. Its separate upgrade/
+grant/restore chain and complete all-file freeze failed or remain incomplete;
+they are not new-table operational or production acceptance. See
+[ADR 0005](adr/0005-synthetic-whole-version-supersession.md) for its bounded
+contract, local verification and remaining gates.

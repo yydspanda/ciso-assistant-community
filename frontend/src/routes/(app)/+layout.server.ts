@@ -2,37 +2,28 @@ import type { LayoutServerLoad } from './$types';
 import { redirect } from '@sveltejs/kit';
 import { loadFlash } from 'sveltekit-flash-message/server';
 
-const loginPageRegex = /^[a-zA-Z0-9]+:\/\/[^\/]+\/login\/?.*$/;
-
-// get `locals.user` and pass it to the `page` store
-export const load = loadFlash(async ({ locals, url, cookies, request }) => {
-	if (!locals.user && !url.pathname.includes('/login')) {
+export const load = loadFlash(async ({ locals, url }) => {
+	const user = await locals.getUser();
+	if (!user && !url.pathname.includes('/login')) {
 		redirect(302, `/login?next=${url.pathname}`);
 	}
 
+	const [settings, featureflags] = await Promise.all([
+		locals.getSettings(),
+		locals.getFeatureFlags()
+	]);
+
 	if (
-		locals.user &&
-		locals.settings?.enforce_mfa &&
-		!locals.user.has_mfa_enabled &&
-		!locals.user.is_superuser &&
-		locals.user.is_local &&
-		!locals.user.is_sso &&
+		user &&
+		settings?.enforce_mfa &&
+		!user.has_mfa_enabled &&
+		!user.is_superuser &&
+		user.is_local &&
+		!user.is_sso &&
 		!url.pathname.startsWith('/setup-mfa')
 	) {
 		redirect(302, '/setup-mfa');
 	}
 
-	if (locals.user) {
-		const referer = request.headers.get('referer') ?? '';
-		const fromLogin = loginPageRegex.test(referer);
-		if (fromLogin) {
-			cookies.set('from_login', 'true', {
-				httpOnly: false,
-				sameSite: 'lax',
-				path: '/',
-				secure: true
-			});
-		}
-	}
-	return { user: locals.user, settings: locals.settings, featureflags: locals.featureflags };
+	return { user, settings, featureflags };
 }) satisfies LayoutServerLoad;

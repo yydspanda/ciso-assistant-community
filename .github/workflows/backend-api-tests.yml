@@ -18,6 +18,7 @@ env:
   BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
   GITHUB_WORKFLOW: github_actions
   PYTHON_VERSION: "3.14"
+  UV_VERSION: "0.12.7"
   UBUNTU_VERSION: "ubuntu-24.04"
   BACKEND_DIR: ./backend
 
@@ -54,6 +55,7 @@ jobs:
       - name: Install uv and set up python ${{ env.PYTHON_VERSION }}
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
 
@@ -154,6 +156,7 @@ jobs:
       - name: Install uv and set up python ${{ env.PYTHON_VERSION }}
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
 

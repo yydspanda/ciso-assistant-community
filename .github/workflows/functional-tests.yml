@@ -32,6 +32,7 @@ env:
   POSTGRES_VERSION: "16"
   UBUNTU_VERSION: "24.04"
   PYTHON_VERSION: "3.14"
+  UV_VERSION: "0.12.7"
 
 jobs:
   build_community_frontend:
@@ -177,6 +178,7 @@ jobs:
       - name: Install uv and set up python ${{ env.PYTHON_VERSION }}
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
 
@@ -238,6 +240,7 @@ jobs:
       - name: Install uv and set up python ${{ env.PYTHON_VERSION }}
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
 
@@ -306,8 +309,13 @@ jobs:
           POSTGRES_DB: postgres
         ports: ["5432:5432"]
         options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
-      mailhog:
-        image: ghcr.io/intuitem/ciso-assistant-community/mirror/mailhog:v1.0.1
+      mailpit:
+        image: ghcr.io/intuitem/ciso-assistant-community/mirror/mailpit:v1.31.1
+        # Unlike MailHog, Mailpit advertises no AUTH unless asked, and the Django
+        # SMTP backend calls login() whenever EMAIL_HOST_USER is set.
+        env:
+          MP_SMTP_AUTH_ACCEPT_ANY: 1
+          MP_SMTP_AUTH_ALLOW_INSECURE: 1
         ports: ["1025:1025", "8025:8025"]
 
     strategy:
@@ -333,6 +341,7 @@ jobs:
       - name: Install uv and set up python ${{ matrix.python-version }}
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ matrix.python-version }}
           enable-cache: true
 
@@ -429,14 +438,42 @@ jobs:
       - name: Run migrations
         working-directory: ${{ env.backend-directory }}
         run: |
-          uv run python manage.py makemigrations
+          uv run python manage.py makemigrations --check --dry-run
           uv run python manage.py migrate
 
       - name: Start test server
         working-directory: ${{ env.backend-directory }}
         run: |
           uv run python manage.py createsuperuser --noinput
-          nohup uv run python manage.py runserver localhost:8173 &
+          uv run python manage.py shell -c \
+            'from app_tests.browser_fixtures import seed_tprm_template_reader; seed_tprm_template_reader(synthetic_test_database=True)'
+          uv run python manage.py shell -c \
+            'from app_tests.browser_fixtures import seed_tprm_browser_admin_grant; import os; seed_tprm_browser_admin_grant(synthetic_test_database=True, synthetic_admin_email=os.environ["DJANGO_SUPERUSER_EMAIL"])'
+          BACKEND_LOG="$PWD/functional-backend-runserver.log"
+          nohup uv run python manage.py runserver localhost:8173 --noreload >"$BACKEND_LOG" 2>&1 &
+          BACKEND_PID=$!
+          BACKEND_READY=0
+          BACKEND_DEADLINE=$((SECONDS + 60))
+          while ((SECONDS < BACKEND_DEADLINE)); do
+            if curl --noproxy localhost,127.0.0.1 -fsS \
+              --connect-timeout 1 --max-time 2 \
+              http://localhost:8173/api/health/ >/dev/null 2>&1; then
+              BACKEND_READY=1
+              break
+            fi
+            if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+              echo "::error::Community test backend exited before becoming ready."
+              tail -n 200 "$BACKEND_LOG" || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [[ "$BACKEND_READY" -ne 1 ]]; then
+            echo "::error::Community test backend did not become ready within 60 seconds."
+            tail -n 200 "$BACKEND_LOG" || true
+            exit 1
+          fi
+          echo "Community test backend is ready."
 
       - name: Run tests with browser ${{ matrix.playwright-browser }}
         working-directory: ${{ env.frontend-directory }}/
@@ -506,8 +543,13 @@ jobs:
           POSTGRES_DB: postgres
         ports: ["5432:5432"]
         options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
-      mailhog:
-        image: ghcr.io/intuitem/ciso-assistant-community/mirror/mailhog:v1.0.1
+      mailpit:
+        image: ghcr.io/intuitem/ciso-assistant-community/mirror/mailpit:v1.31.1
+        # Unlike MailHog, Mailpit advertises no AUTH unless asked, and the Django
+        # SMTP backend calls login() whenever EMAIL_HOST_USER is set.
+        env:
+          MP_SMTP_AUTH_ACCEPT_ANY: 1
+          MP_SMTP_AUTH_ALLOW_INSECURE: 1
         ports: ["1025:1025", "8025:8025"]
 
     strategy:
@@ -533,6 +575,7 @@ jobs:
       - name: Install uv and set up python ${{ matrix.python-version }}
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: ${{ matrix.python-version }}
           enable-cache: true
 
@@ -631,14 +674,46 @@ jobs:
         working-directory: ${{ env.backend-directory }}
         env:
           SETTINGS_MODULE: ${{ env.enterprise-backend-settings-module }}
-        run: uv run --project ../enterprise/backend python manage.py migrate --settings="$SETTINGS_MODULE"
+        run: |
+          uv run --project ../enterprise/backend python manage.py makemigrations --check --dry-run --settings="$SETTINGS_MODULE"
+          uv run --project ../enterprise/backend python manage.py migrate --settings="$SETTINGS_MODULE"
+
       - name: Start test server
         working-directory: ${{ env.backend-directory }}
         env:
           SETTINGS_MODULE: ${{ env.enterprise-backend-settings-module }}
         run: |
           uv run --project ../enterprise/backend python manage.py createsuperuser --noinput --settings="$SETTINGS_MODULE"
-          nohup uv run --project ../enterprise/backend python manage.py runserver localhost:8173 --settings="$SETTINGS_MODULE" &
+          uv run --project ../enterprise/backend python manage.py shell --settings="$SETTINGS_MODULE" -c \
+            'from app_tests.browser_fixtures import seed_tprm_template_reader; seed_tprm_template_reader(synthetic_test_database=True)'
+          uv run --project ../enterprise/backend python manage.py shell --settings="$SETTINGS_MODULE" -c \
+            'from app_tests.browser_fixtures import seed_tprm_browser_admin_grant; import os; seed_tprm_browser_admin_grant(synthetic_test_database=True, synthetic_admin_email=os.environ["DJANGO_SUPERUSER_EMAIL"])'
+          BACKEND_LOG="$PWD/functional-backend-runserver.log"
+          nohup uv run --project ../enterprise/backend python manage.py runserver localhost:8173 \
+            --noreload --settings="$SETTINGS_MODULE" >"$BACKEND_LOG" 2>&1 &
+          BACKEND_PID=$!
+          BACKEND_READY=0
+          BACKEND_DEADLINE=$((SECONDS + 60))
+          while ((SECONDS < BACKEND_DEADLINE)); do
+            if curl --noproxy localhost,127.0.0.1 -fsS \
+              --connect-timeout 1 --max-time 2 \
+              http://localhost:8173/api/health/ >/dev/null 2>&1; then
+              BACKEND_READY=1
+              break
+            fi
+            if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+              echo "::error::Enterprise test backend exited before becoming ready."
+              tail -n 200 "$BACKEND_LOG" || true
+              exit 1
+            fi
+            sleep 1
+          done
+          if [[ "$BACKEND_READY" -ne 1 ]]; then
+            echo "::error::Enterprise test backend did not become ready within 60 seconds."
+            tail -n 200 "$BACKEND_LOG" || true
+            exit 1
+          fi
+          echo "Enterprise test backend is ready."
 
       - name: Run tests with browser ${{ matrix.playwright-browser }}
         working-directory: ${{ env.enterprise-frontend-build-directory }}/

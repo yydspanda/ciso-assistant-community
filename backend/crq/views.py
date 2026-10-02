@@ -1,30 +1,34 @@
 import structlog
-
-from rest_framework import status
-from rest_framework.views import Response
-from rest_framework.decorators import action
-from django.utils.decorators import method_decorator
-from django.views.decorators.cache import cache_page
-from django.db import transaction
-
+from core.models import AppliedControl
+from core.utils import format_currency as _fmt_currency
+from core.utils import get_global_currency
 from core.views import (
-    BaseModelViewSet as AbstractBaseModelViewSet,
-    ActionPlanList,
     ActionPlanBudgetOverview,
+    ActionPlanList,
     GenericFilterSet,
     NullableChoiceFilter,
+    filter_caller_visible_applied_controls,
 )
-from core.models import AppliedControl, Folder
-from core.utils import format_currency as _fmt_currency, get_global_currency
+from core.views import (
+    BaseModelViewSet as AbstractBaseModelViewSet,
+)
+from django.db import transaction
+from django.db.models import Prefetch
+from django.utils.decorators import method_decorator
+from django.views.decorators.cache import cache_page
 from iam.models import RoleAssignment
+from rest_framework import status
+from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.views import Response
 
 from .models import (
-    QuantitativeRiskStudy,
-    QuantitativeRiskScenario,
     QuantitativeRiskHypothesis,
+    QuantitativeRiskScenario,
+    QuantitativeRiskStudy,
 )
 from .serializers import QuantitativeRiskStudyActionPlanSerializer
+from .visibility import visible_quantitative_risk_chain
 
 logger = structlog.get_logger(__name__)
 
@@ -1275,6 +1279,21 @@ class QuantitativeRiskHypothesisViewSet(BaseModelViewSet):
     search_fields = ["name", "description", "ref_id"]
     ordering = ["-created_at"]
 
+    def get_queryset(self):
+        return (
+            super()
+            .get_queryset()
+            .select_related(
+                "quantitative_risk_scenario",
+                "quantitative_risk_scenario__quantitative_risk_study",
+            )
+            .prefetch_related(
+                "existing_applied_controls",
+                "added_applied_controls",
+                "removed_applied_controls",
+            )
+        )
+
     def _perform_write(self, serializer):
         if not serializer.validated_data.get(
             "ref_id"
@@ -1436,23 +1455,20 @@ class QuantitativeRiskStudyActionPlanList(ActionPlanList):
         """RBAC not automatic as we don't inherit from BaseModelViewSet -> enforce it explicitly"""
         study_id = self.kwargs["pk"]
 
-        if not RoleAssignment.is_object_readable(
-            self.request.user,
-            QuantitativeRiskStudy,
-            study_id,
-        ):
+        visible_chain = visible_quantitative_risk_chain(
+            user=self.request.user,
+            study_ids=(study_id,),
+        )
+        if not visible_chain.studies.exists():
             raise PermissionDenied()
 
-        quantitative_risk_study: QuantitativeRiskStudy = (
-            QuantitativeRiskStudy.objects.get(id=study_id)
-        )
-
-        # Get all scenarios for this study
-        scenarios = quantitative_risk_study.risk_scenarios.all()
-
-        # Get all hypotheses from these scenarios that are selected
-        hypotheses = QuantitativeRiskHypothesis.objects.filter(
-            quantitative_risk_scenario__in=scenarios, is_selected=True
+        hypotheses = (
+            visible_chain.hypotheses.filter(is_selected=True)
+            .select_related(
+                "quantitative_risk_scenario",
+                "quantitative_risk_scenario__quantitative_risk_study",
+            )
+            .order_by("quantitative_risk_scenario_id", "id")
         )
 
         # Get all added controls from these selected hypotheses
@@ -1460,10 +1476,16 @@ class QuantitativeRiskStudyActionPlanList(ActionPlanList):
             quantitative_risk_hypotheses_added__in=hypotheses
         ).distinct()
 
-        viewable_controls = RoleAssignment.get_viewable_object_ids(
-            self.request.user, AppliedControl
+        return filter_caller_visible_applied_controls(
+            qs,
+            self.request.user,
+        ).prefetch_related(
+            Prefetch(
+                "quantitative_risk_hypotheses_added",
+                queryset=hypotheses,
+                to_attr="action_plan_quantitative_hypotheses",
+            )
         )
-        return qs.filter(id__in=viewable_controls)
 
 
 class QuantitativeRiskStudyActionPlanBudgetOverview(
@@ -1471,4 +1493,4 @@ class QuantitativeRiskStudyActionPlanBudgetOverview(
 ):
     def get(self, request, *args, **kwargs):
         qs = self.filter_queryset(self.get_queryset())
-        return Response(self.compute_budget_overview(qs))
+        return Response(self.compute_budget_overview(qs, user=request.user))

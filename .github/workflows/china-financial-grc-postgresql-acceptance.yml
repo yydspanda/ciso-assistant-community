@@ -10,12 +10,16 @@ on:
     paths:
       - "backend/**"
       - "tools/china_financial_grc/postgresql/**"
+      - "tools/china_financial_grc/tests/test_postgresql_acceptance_harness.py"
       - ".github/workflows/china-financial-grc-postgresql-acceptance.yml"
   workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.12.7"
 
 jobs:
   postgresql-synthetic-technical-acceptance:
@@ -27,8 +31,12 @@ jobs:
       - name: Install uv and Python
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           python-version: "3.14"
           enable-cache: true
+
+      - name: Test PostgreSQL harness safety contracts
+        run: python -m unittest tools.china_financial_grc.tests.test_postgresql_acceptance_harness
 
       - name: Install locked backend dependencies
         working-directory: backend
@@ -47,5 +55,6 @@ jobs:
           path: |
             ${{ runner.temp }}/ciso-china-grc-postgresql-*/*
             !${{ runner.temp }}/ciso-china-grc-postgresql-*/*.dump
+            !${{ runner.temp }}/ciso-china-grc-postgresql-*/*.pem
             !${{ runner.temp }}/ciso-china-grc-postgresql-*/SHA256SUMS
           retention-days: 14

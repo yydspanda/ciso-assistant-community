@@ -112,6 +112,25 @@ function expectBothUnavailable(result: ReturnType<typeof enforceRegulatoryPanelC
 	});
 }
 
+function selectedPanels() {
+	const selectedDocument = structuredClone(document);
+	const version = selectedDocument.document_versions[0];
+	version.record_id = 'SYNTHETIC-VERSION-001';
+	version.revision = 1;
+	const selection = {
+		version_id: version.record_id,
+		version_revision: version.revision,
+		valid_on: '2026-08-26',
+		recorded_at: selectedAt
+	};
+	selectedDocument.selection = selection;
+	const pair = panels();
+	pair.applicability.data!.selection = { ...selection };
+	pair.applicability.data!.recorded_as_of = selectedAt;
+	pair.review.data!.selection = { ...selection };
+	return { document: selectedDocument, request, ...pair };
+}
+
 describe('regulatory response coherence', () => {
 	it('accepts timezone-equivalent historical request echoes and a matching chain', () => {
 		const historicalDocument = {
@@ -322,5 +341,111 @@ describe('regulatory response coherence', () => {
 		const wrongHash = panels();
 		wrongHash.review.data!.decision!.semantic_payload_sha256 = 'b'.repeat(64);
 		expectBothUnavailable(enforceRegulatoryPanelCoherence({ document, request, ...wrongHash }));
+	});
+
+	it('accepts a complete selection echo and pins both panels to the detail instant', () => {
+		const selected = selectedPanels();
+		selected.review.data!.selection!.recorded_at = '2026-08-26T09:30:00+08:00';
+		const result = enforceRegulatoryPanelCoherence(selected);
+		expect(result.applicability.state).toBe('ok');
+		expect(result.review.state).toBe('ok');
+
+		selected.applicability.data!.recorded_as_of = null;
+		expectBothUnavailable(enforceRegulatoryPanelCoherence(selected));
+	});
+
+	it.each(['document', 'applicability', 'review'] as const)(
+		'rejects a partial selection echo missing from %s',
+		(missing) => {
+			const selected = selectedPanels();
+			if (missing === 'document') delete selected.document.selection;
+			else delete selected[missing].data!.selection;
+			expectBothUnavailable(enforceRegulatoryPanelCoherence(selected));
+		}
+	);
+
+	it.each([
+		{ version_id: 'SYNTHETIC-VERSION-OTHER' },
+		{ version_revision: 2 },
+		{ valid_on: '2026-08-27' },
+		{ valid_on: null },
+		{ recorded_at: '2026-08-26T01:30:00.000001Z' }
+	])('rejects a successful panel with a mixed selection: %j', (override) => {
+		for (const kind of ['applicability', 'review'] as const) {
+			const selected = selectedPanels();
+			Object.assign(selected[kind].data!.selection!, override);
+			expectBothUnavailable(enforceRegulatoryPanelCoherence(selected));
+		}
+	});
+
+	it('rejects a detail selection that mismatches its version or explicit request', () => {
+		for (const override of [{ version_id: 'SYNTHETIC-VERSION-OTHER' }, { version_revision: 2 }]) {
+			const selected = selectedPanels();
+			Object.assign(selected.document.selection!, override);
+			expect(isRegulatoryDocumentResponseCoherent(selected.document, request)).toBe(false);
+		}
+		const selected = selectedPanels();
+		expect(
+			isRegulatoryDocumentResponseCoherent(selected.document, {
+				...request,
+				validOn: '2026-08-27'
+			})
+		).toBe(false);
+		expect(
+			isRegulatoryDocumentResponseCoherent(selected.document, {
+				...request,
+				versionId: 'SYNTHETIC-VERSION-OTHER'
+			})
+		).toBe(false);
+		expect(
+			isRegulatoryDocumentResponseCoherent(document, {
+				...request,
+				validOn: '2026-08-26'
+			})
+		).toBe(false);
+	});
+
+	it('does not require a selection echo from an independently restricted review', () => {
+		const selected = selectedPanels();
+		selected.review = { state: 'restricted', data: null };
+		const result = enforceRegulatoryPanelCoherence(selected);
+		expect(result.applicability.state).toBe('ok');
+		expect(result.review).toEqual({ state: 'restricted', data: null });
+	});
+
+	it('rejects a superseding version when every selection echo is missing', () => {
+		const superseding = structuredClone(document);
+		superseding.document_versions[0].supersedes_version_ids = ['SYNTHETIC-VERSION-OLDER'];
+		expect(isRegulatoryDocumentResponseCoherent(superseding, request)).toBe(false);
+		expectBothUnavailable(
+			enforceRegulatoryPanelCoherence({ document: superseding, request, ...panels() })
+		);
+	});
+
+	it('rejects a top-level panel anchor even one microsecond from its selection instant', () => {
+		for (const kind of ['applicability', 'review'] as const) {
+			const selected = selectedPanels();
+			selected[kind].data!.selected_recorded_at = '2026-08-26T01:30:00.000001Z';
+			expectBothUnavailable(enforceRegulatoryPanelCoherence(selected));
+		}
+	});
+
+	it('accepts a null-date future version preview without creating a legal conclusion', () => {
+		const selected = selectedPanels();
+		selected.document.selection!.valid_on = null;
+		selected.applicability.data!.selection!.valid_on = null;
+		selected.review.data!.selection!.valid_on = null;
+		selected.document.document_versions[0].status = 'published_future_effective';
+		selected.document.document_versions[0].valid_from = '2027-01-01';
+		selected.document.legal_conclusion = false;
+		selected.applicability.data!.is_binding = false;
+		selected.review.data!.is_binding = false;
+		selected.request = { ...request, versionId: 'SYNTHETIC-VERSION-001' };
+		const result = enforceRegulatoryPanelCoherence(selected);
+		expect(result.applicability.state).toBe('ok');
+		expect(result.review.state).toBe('ok');
+		expect(result.applicability.data!.is_binding).toBe(false);
+		expect(result.review.data!.is_binding).toBe(false);
+		expect(selected.document.legal_conclusion).toBe(false);
 	});
 });

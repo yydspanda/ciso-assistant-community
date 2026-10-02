@@ -8,8 +8,8 @@ enum State {
 }
 
 export class LoginPage extends BasePage {
-	static readonly defaultEmail: string = 'admin@tests.com';
-	static readonly defaultPassword: string = '1234';
+	static readonly defaultEmail: string = process.env.PLAYWRIGHT_ADMIN_EMAIL ?? 'admin@tests.com';
+	static readonly defaultPassword: string = process.env.PLAYWRIGHT_ADMIN_PASSWORD ?? '1234';
 	readonly usernameInput: Locator;
 	readonly passwordInput: Locator;
 	readonly loginButton: Locator;

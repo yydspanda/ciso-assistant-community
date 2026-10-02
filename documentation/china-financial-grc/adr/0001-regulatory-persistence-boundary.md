@@ -7,7 +7,11 @@
 > **Extended by [ADR 0002](0002-recorded-time-correction.md) on 2026-08-24.**
 > ADR 0002 implements the reserved recorded-time correction and historical-read
 > contract. It does not implement source/legal-version supersession, which
-> remains outside the current boundary.
+> remains outside that recorded-time correction boundary.
+>
+> **Further extended by [ADR 0005](0005-synthetic-whole-version-supersession.md)
+> on 2026-10-02:** synthetic whole-version metadata edges and dual-time reads
+> are separate from correction. Real-law approval and publication remain absent.
 
 ## Context
 

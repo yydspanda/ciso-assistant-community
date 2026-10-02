@@ -18,7 +18,12 @@ from core.models import AppliedControl, Asset, RiskScenario
 import textwrap
 
 
-def ecosystem_circular_chart_data(stakeholders_queryset: QuerySet):
+def ecosystem_circular_chart_data(
+    stakeholders_queryset: QuerySet,
+    *,
+    jitter_seed: str | None = None,
+    max_value: float | None = None,
+):
     """
     Generate data for circular ecosystem chart.
     Returns stakeholders grouped by maturity clusters (cyber reliability) with simple format:
@@ -34,7 +39,15 @@ def ecosystem_circular_chart_data(stakeholders_queryset: QuerySet):
     }
     """
     qs = stakeholders_queryset
-    max_val = GlobalSettings.objects.get(name="general").value.get("ebios_radar_max", 6)
+    # The interactive endpoint keeps the historical non-deterministic layout.
+    # Formal report callers pass a stable seed so the same governed snapshot
+    # produces byte-for-byte comparable chart data during terminal re-proof.
+    jitter_source = random.Random(jitter_seed) if jitter_seed is not None else random
+    max_val = (
+        max_value
+        if max_value is not None
+        else GlobalSettings.objects.get(name="general").value.get("ebios_radar_max", 6)
+    )
 
     def get_maturity_group(reliability_value):
         """Group by cyber reliability (maturity * trust)"""
@@ -120,7 +133,7 @@ def ecosystem_circular_chart_data(stakeholders_queryset: QuerySet):
                 # Spread multiple items evenly
                 offset = (idx / (num_in_category - 1) - 0.5) * section_width
 
-            jitter = random.uniform(-2, 2)  # Small jitter for natural look
+            jitter = jitter_source.uniform(-2, 2)  # Small jitter for natural look
             angle = cat_info["base"] + offset + jitter
 
             # Normalize angle to 0-360

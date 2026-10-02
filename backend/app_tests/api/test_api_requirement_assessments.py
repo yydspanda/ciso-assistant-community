@@ -127,10 +127,6 @@ class TestRequirementAssessmentsAuthenticated:
                     "id": str(compliance_assessment.id),
                     "str": compliance_assessment.name,
                     "is_locked": False,
-                    "min_score": compliance_assessment.min_score,
-                    "max_score": compliance_assessment.max_score,
-                    "scores_definition": compliance_assessment.scores_definition,
-                    "score_calculation_method": compliance_assessment.score_calculation_method,
                     "extended_result_enabled": compliance_assessment.extended_result_enabled,
                     "progress_status_enabled": compliance_assessment.progress_status_enabled,
                     "field_visibility": compliance_assessment.field_visibility,
@@ -144,6 +140,7 @@ class TestRequirementAssessmentsAuthenticated:
                 "requirement": {
                     "id": str(RequirementNode.objects.all()[0].id),
                     "urn": RequirementNode.objects.all()[0].urn,
+                    "parent_urn": RequirementNode.objects.all()[0].parent_urn,
                     "annotation": RequirementNode.objects.all()[0].annotation,
                     "name": RequirementNode.objects.all()[0].name,
                     "questions": None,
@@ -162,12 +159,6 @@ class TestRequirementAssessmentsAuthenticated:
                         0
                     ].implementation_groups,
                     "display_mode": RequirementNode.objects.all()[0].display_mode,
-                    "min_score": RequirementNode.objects.all()[0].min_score,
-                    "max_score": RequirementNode.objects.all()[0].max_score,
-                    "scores_definition_ref": RequirementNode.objects.all()[
-                        0
-                    ].scores_definition_ref,
-                    "weight": RequirementNode.objects.all()[0].weight,
                     "parent_requirement": {
                         "str": RequirementNode.objects.all()[0].parent_requirement.get(
                             "str"
@@ -316,6 +307,7 @@ class TestRequirementAssessmentsAuthenticated:
                 "requirement": {
                     "id": str(RequirementNode.objects.all()[0].id),
                     "urn": RequirementNode.objects.all()[0].urn,
+                    "parent_urn": RequirementNode.objects.all()[0].parent_urn,
                     "annotation": RequirementNode.objects.all()[0].annotation,
                     "name": RequirementNode.objects.all()[0].name,
                     "questions": None,

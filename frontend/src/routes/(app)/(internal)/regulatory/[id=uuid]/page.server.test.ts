@@ -7,8 +7,9 @@ const selectedEntityId = '3dd2af97-4c34-4e51-82b8-ceb92645e784';
 const selectedRecordedAt = '2026-08-26T01:30:00Z';
 const hash = 'a'.repeat(64);
 const userWithSecondaryReadPermissions = {
+	permission_sets: [['view_entity', 'view_regulatoryapplicabilitydecision']],
 	domain_permissions: {
-		'synthetic-folder': ['view_entity', 'view_regulatoryapplicabilitydecision']
+		'synthetic-folder': 0
 	}
 };
 
@@ -324,5 +325,151 @@ describe('regulatory detail server loader fail-closed gates', () => {
 		expect(requestedUrls).toContain(
 			`http://localhost:8000/api/regulatory/v1/documents/${documentId}/applicability-review/?entity=${selectedEntityId}&recorded_as_of=2026-08-26T01%3A30%3A00Z`
 		);
+	});
+
+	it.each([
+		{ query: '', validOn: '2026-08-26' },
+		{
+			query: 'version_id=SYNTHETIC-VERSION-001&valid_on=2026-08-26',
+			validOn: '2026-08-26'
+		},
+		{ query: 'version_id=SYNTHETIC-VERSION-001', validOn: null }
+	])('pins both dependent reads to the detail selection for %j', async ({ query, validOn }) => {
+		const selection = {
+			version_id: 'SYNTHETIC-VERSION-001',
+			version_revision: 1,
+			valid_on: validOn,
+			recorded_at: selectedRecordedAt
+		};
+		const selectedDocument = structuredClone(document);
+		if (validOn === null) {
+			selectedDocument.document_versions[0].status = 'published_future_effective';
+			selectedDocument.document_versions[0].effective_date = '2027-01-01';
+			selectedDocument.document_versions[0].valid_from = '2027-01-01';
+		}
+		const fetchFn = vi.fn(async (input: RequestInfo | URL) => {
+			const requestedUrl = new URL(String(input));
+			if (requestedUrl.pathname.endsWith(`/documents/${documentId}/`)) {
+				return jsonResponse({ ...selectedDocument, selection });
+			}
+			if (requestedUrl.pathname.endsWith('/entities/')) {
+				return jsonResponse({ count: 0, next: null, previous: null, results: [] });
+			}
+			if (requestedUrl.pathname.endsWith('/applicability/')) {
+				return jsonResponse({ ...applicability, recorded_as_of: selectedRecordedAt, selection });
+			}
+			if (requestedUrl.pathname.endsWith('/applicability-review/')) {
+				return jsonResponse({ ...review, selection });
+			}
+			return new Response(null, { status: 500 });
+		}) as unknown as typeof fetch;
+		const loaded = await callLoad({
+			fetchFn,
+			url: `http://localhost/regulatory/${documentId}?entity=${selectedEntityId}${query ? `&${query}` : ''}`
+		});
+		expect(loaded).toMatchObject({
+			documentState: 'ok',
+			document: { selection, legal_conclusion: false },
+			applicability: { state: 'ok', data: { selection, is_binding: false } },
+			review: { state: 'ok', data: { selection, is_binding: false } }
+		});
+		const urls = vi.mocked(fetchFn).mock.calls.map(([input]) => new URL(String(input)));
+		expect(urls[0].searchParams.get('version_id')).toBe(query ? selection.version_id : null);
+		expect(urls[0].searchParams.get('valid_on')).toBe(query.includes('valid_on') ? validOn : null);
+		const dependentUrls = urls.filter((requestedUrl) =>
+			/\/applicability(?:-review)?\/$/.test(requestedUrl.pathname)
+		);
+		expect(dependentUrls).toHaveLength(2);
+		for (const requestedUrl of dependentUrls) {
+			expect(requestedUrl.searchParams.get('entity')).toBe(selectedEntityId);
+			expect(requestedUrl.searchParams.get('version_id')).toBe(selection.version_id);
+			expect(requestedUrl.searchParams.get('valid_on')).toBe(validOn);
+			expect(requestedUrl.searchParams.get('recorded_as_of')).toBe(selectedRecordedAt);
+		}
+		if (validOn === null) {
+			expect(loaded).toMatchObject({
+				document: { document_versions: [{ status: 'published_future_effective' }] },
+				applicability: { data: { non_binding_result: 'needs_review' } },
+				review: { data: { workflow_attention: 'needs_review' } }
+			});
+		}
+	});
+
+	it('uses the backend UTC legal date rather than deriving it from the request timezone', async () => {
+		const recordedAsOf = '2026-08-26T00:30:00+14:00';
+		const selectedAt = '2026-08-25T10:30:00Z';
+		const selection = {
+			version_id: 'SYNTHETIC-VERSION-001',
+			version_revision: 1,
+			valid_on: '2026-08-25',
+			recorded_at: selectedAt
+		};
+		const fetchFn = vi.fn(async (input: RequestInfo | URL) => {
+			const requestedUrl = new URL(String(input));
+			if (requestedUrl.pathname.endsWith(`/documents/${documentId}/`)) {
+				return jsonResponse({ ...document, recorded_as_of: recordedAsOf, selection });
+			}
+			if (requestedUrl.pathname.endsWith('/entities/')) {
+				return jsonResponse({ count: 0, next: null, previous: null, results: [] });
+			}
+			if (requestedUrl.pathname.endsWith('/applicability/')) {
+				return jsonResponse({
+					...applicability,
+					recorded_as_of: selectedAt,
+					selected_recorded_at: selectedAt,
+					selection
+				});
+			}
+			return jsonResponse({
+				...review,
+				recorded_as_of: selectedAt,
+				selected_recorded_at: selectedAt,
+				selection
+			});
+		}) as unknown as typeof fetch;
+		expect(
+			await callLoad({
+				fetchFn,
+				url: `http://localhost/regulatory/${documentId}?entity=${selectedEntityId}&recorded_as_of=${encodeURIComponent(recordedAsOf)}`
+			})
+		).toMatchObject({
+			documentState: 'ok',
+			applicability: { state: 'ok' },
+			review: { state: 'ok' }
+		});
+		const urls = vi.mocked(fetchFn).mock.calls.map(([input]) => new URL(String(input)));
+		for (const requestedUrl of urls.filter((url) =>
+			/\/applicability(?:-review)?\/$/.test(url.pathname)
+		)) {
+			expect(requestedUrl.searchParams.get('valid_on')).toBe('2026-08-25');
+			expect(requestedUrl.searchParams.get('recorded_as_of')).toBe(selectedAt);
+		}
+	});
+
+	it.each([
+		'valid_on=',
+		'valid_on=2026-02-30',
+		'valid_on=2026-08-26&valid_on=2026-08-27',
+		'version_id=',
+		'version_id=bad%20version',
+		`version_id=${'a'.repeat(161)}`,
+		'version_id=SYNTHETIC-VERSION-001&version_id=SYNTHETIC-VERSION-002'
+	])('rejects invalid or repeated dual-time selectors without fetching: %s', async (query) => {
+		const fetchFn = vi.fn() as unknown as typeof fetch;
+		expect(
+			await callLoad({ fetchFn, url: `http://localhost/regulatory/${documentId}?${query}` })
+		).toMatchObject({ documentState: 'invalid', document: null });
+		expect(fetchFn).not.toHaveBeenCalled();
+	});
+
+	it('does not silently honour an explicit selector against a legacy response without selection', async () => {
+		const fetchFn = vi.fn(async () => jsonResponse(document)) as unknown as typeof fetch;
+		expect(
+			await callLoad({
+				fetchFn,
+				url: `http://localhost/regulatory/${documentId}?version_id=SYNTHETIC-VERSION-001`
+			})
+		).toMatchObject({ documentState: 'unavailable', document: null });
+		expect(fetchFn).toHaveBeenCalledOnce();
 	});
 });

@@ -4,6 +4,8 @@ ManagedDocument conflict detection + resolution, source-count cap, and
 registry-drift guards."""
 
 import pytest
+from auditlog.models import LogEntry
+from django.contrib.contenttypes.models import ContentType
 
 from core.models import (
     AppliedControl,
@@ -11,6 +13,7 @@ from core.models import (
     Comment,
     Evidence,
     Framework,
+    Policy,
     RequirementAssessment,
     RequirementNode,
     RiskAssessment,
@@ -20,6 +23,7 @@ from core.models import (
 from iam.models import Folder
 
 MERGE_URL = "/api/applied-controls/merge/"
+POLICY_MERGE_URL = "/api/policies/merge/"
 
 
 # --- helpers -----------------------------------------------------------------
@@ -321,7 +325,7 @@ def test_policy_documents_union_onto_target(authenticated_client, folder):
         "source_ids": [str(src1.id), str(src2.id)],
         "target": {"type": "existing", "id": str(target.id)},
     }
-    resp = authenticated_client.post(MERGE_URL, payload, format="json")
+    resp = authenticated_client.post(POLICY_MERGE_URL, payload, format="json")
     assert resp.status_code == 200, resp.json()
     assert target.id in set(c1.policies.values_list("id", flat=True))
     assert target.id in set(c2.policies.values_list("id", flat=True))
@@ -338,7 +342,7 @@ def test_single_policy_document_repoints_onto_target(authenticated_client, folde
         "source_ids": [str(src.id)],
         "target": {"type": "existing", "id": str(target.id)},
     }
-    resp = authenticated_client.post(MERGE_URL, payload, format="json")
+    resp = authenticated_client.post(POLICY_MERGE_URL, payload, format="json")
     assert resp.status_code == 200, resp.json()
     policy_ids = set(c.policies.values_list("id", flat=True))
     assert target.id in policy_ids
@@ -346,9 +350,6 @@ def test_single_policy_document_repoints_onto_target(authenticated_client, folde
 
 
 # --- policy proxy path ------------------------------------------------------
-
-
-POLICY_MERGE_URL = "/api/policies/merge/"
 
 
 @pytest.mark.django_db
@@ -405,6 +406,91 @@ def test_policy_merge_target_new_overrides_caller_category(
     target_id = resp.json()["target_id"]
     assert Policy.objects.filter(id=target_id).exists()
     assert AppliedControl.objects.get(id=target_id).category == "policy"
+
+
+@pytest.mark.django_db
+def test_policy_merge_records_concrete_delete_and_create_audit(
+    authenticated_client, folder
+):
+    source = Policy.objects.create(name="policy-audit-source", folder=folder)
+    source_id = source.id
+    payload = {
+        "source_ids": [str(source_id)],
+        "target": {
+            "type": "new",
+            "fields": {"name": "policy-audit-target", "folder": str(folder.id)},
+        },
+    }
+
+    response = authenticated_client.post(POLICY_MERGE_URL, payload, format="json")
+
+    assert response.status_code == 200, response.json()
+    concrete_ct = ContentType.objects.get_for_model(AppliedControl)
+    delete_entry = LogEntry.objects.get(
+        content_type=concrete_ct,
+        object_pk=str(source_id),
+        action=LogEntry.Action.DELETE,
+    )
+    create_entry = LogEntry.objects.get(
+        content_type=concrete_ct,
+        object_pk=response.json()["target_id"],
+        action=LogEntry.Action.CREATE,
+    )
+    assert delete_entry.additional_data["folder_id"] == str(folder.id)
+    assert create_entry.additional_data["folder_id"] == str(folder.id)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ("target_type", "target_event"),
+    (("existing", "appliedcontrol.updated"), ("new", "appliedcontrol.created")),
+)
+def test_policy_merge_dispatches_concrete_webhook_contract(
+    authenticated_client, folder, monkeypatch, target_type, target_event
+):
+    from core import applied_controls_helper
+    from webhooks.registry import webhook_registry
+
+    source = Policy.objects.create(name=f"webhook-source-{target_type}", folder=folder)
+    source_id = source.id
+    existing_target = (
+        Policy.objects.create(name="webhook-target-existing", folder=folder)
+        if target_type == "existing"
+        else None
+    )
+    calls = []
+
+    def record_event(instance, action, serializer=None):
+        config = webhook_registry.get_config(instance)
+        calls.append(
+            (
+                type(instance),
+                str(instance.id),
+                config.get_event_type(instance, action) if config else None,
+            )
+        )
+
+    monkeypatch.setattr(applied_controls_helper, "dispatch_webhook_event", record_event)
+    target = (
+        {"type": "existing", "id": str(existing_target.id)}
+        if existing_target is not None
+        else {
+            "type": "new",
+            "fields": {"name": "webhook-target-new", "folder": str(folder.id)},
+        }
+    )
+
+    response = authenticated_client.post(
+        POLICY_MERGE_URL,
+        {"source_ids": [str(source_id)], "target": target},
+        format="json",
+    )
+
+    assert response.status_code == 200, response.json()
+    assert calls == [
+        (AppliedControl, str(source_id), "appliedcontrol.deleted"),
+        (AppliedControl, response.json()["target_id"], target_event),
+    ]
 
 
 # --- permission denial paths ------------------------------------------------

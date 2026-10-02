@@ -31,10 +31,19 @@ applicability conclusion.
 | Regulatory JSON Schemas and official-source registers | Added in this fork | Explicitly draft contract; 76 metadata records across four packs remain legally unreviewed |
 | Controlled applicability-fact registry | Added in this fork | 56 fact definitions; unknown values route to review rather than non-applicability |
 | Temporal regulatory Django models and APIs | First bounded slice added | Synthetic metadata-only chain, fixed-rule applicability decision, independent named-human disposition, and read-only `/api/regulatory/v1/`; all remain non-binding |
+| Synthetic whole-version replacement | Bounded implementation added | Append-only metadata relationship with legal/recorded-time selection; old source history is preserved, new obligations inherit no decisions, and real-law review/publication remains absent |
 | Read-only regulatory register and viewer | Added in this fork | `/regulatory` exposes IAM-scoped metadata lineage, microsecond-anchored recorded-time selection, separately labelled valid time, non-binding applicability, and review state; browser projection is HTTPS/metadata-only and has no write, approval, publication, export, or submission controls |
 | Reviewed regulatory-to-library projection | Proposed | Projects approved obligations into frameworks and requirements |
 | General multi-rule applicability and action policy | Proposed | The implemented fixed synthetic rule remains bounded; unknown facts must route to review |
 | Continuous evidence and privacy/data integrations | Proposed external integration | Evidence providers must not become competing GRC masters |
+
+The read-only viewer accepts `valid_on=YYYY-MM-DD` and a portable `version_id`
+alongside `recorded_as_of`. Its source, applicability and review panels share
+one exact version/date/recorded-time anchor. A version-only selection is a
+preview, not a statement that it applies today. New-version metadata still
+requires legal review; no approval, publication or regulator submission is
+enabled. Partial amendments, repeal/transition and corrections of a source
+already bound to a replacement edge remain outside the bounded implementation.
 
 ## Blueprint pages
 

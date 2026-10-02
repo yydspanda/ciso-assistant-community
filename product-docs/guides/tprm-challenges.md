@@ -16,10 +16,22 @@ Walk through this checklist in order:
 1. **Assignment/Respondent mode feature flag is off.** Without it, the external respondent surface is not exposed at all. Toggle it from **Extra → Settings → [Feature flags](../configuration/settings/feature-flags.md)** **→ Assignment/Respondent mode**
 2. **The representative has no user account.** When you create a representative, the **Create user** checkbox is what actually provisions credentials. Without it, the representative is only a contact record — no one to log in or be assigned questions. Re-open the representative form and tick the box, or recreate the representative.
 3. **The entity assessment has no audit.** The questionnaire lives on the audit attached to the assessment. If **Create audit** was not ticked at assessment creation, there is no questionnaire to send. Either edit the assessment and attach an audit using an existing framework, or recreate it with **Create audit** checked.
-4. **The auditee-assessment is still in Draft.** If the assignments never transitioned to **In progress** after you clicked **Send questionnaire**, the invitation mail almost certainly failed to send. See [the mailer section below](#the-mailer-is-not-configured) to fix SMTP, then retry. In parallel, you can start the assessment manually from the underlying audit by flipping the assignment statuses yourself — this follows the same mechanics as the internal [respondent mode](../features/assignments.md), so the same workflow applies once you open the audit's **Assignments** panel.
+4. **Check activation and delivery separately.** If the assignment stays in
+   **Draft**, the activation request was rejected and no delivery intent was
+   committed; verify the recipient, permissions, and mailer configuration. If
+   it is **In progress**, the invitation may still be queued or may have failed
+   in the background. Ask an operator to inspect the durable mail-outbox status
+   rather than inferring delivery from the assignment status. A
+   `claim_timeout` must not be retried until the operator checks whether the
+   mail server already accepted the message, because an automatic retry could
+   send a duplicate invitation.
 5. **Field visibility hides the requirements from the respondent.** If every assessable field is set to **Auditor only** or **Hidden**, the respondent loads the audit and sees nothing actionable. See [Field visibility on the entity-assessment audit](#field-visibility-on-the-entity-assessment-audit).
 
-If all five are clean and the assignment still does not progress, check the backend logs for mailer errors and confirm the representative's email is reachable from your network.
+If all five are clean and the assignment still does not progress, check the
+backend logs and outbox state for mailer errors and confirm the representative's
+email is reachable from your network. Do not edit assignment or outbox rows
+directly to force a retry. Use an approved operational recovery procedure; if
+none exists, escalate rather than improvising one.
 
 ## The mailer is not configured
 

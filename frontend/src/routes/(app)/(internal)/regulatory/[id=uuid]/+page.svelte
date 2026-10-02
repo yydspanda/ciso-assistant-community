@@ -22,10 +22,14 @@
 		if (isRegulatoryRecordedAsOfQueryInvalid(recordedValues)) return true;
 		if (recordedValues.length === 0 || recordedValues[0].trim() === '') return false;
 
-		// A detail 400 can only be caused by its recorded-time query. Repeated
-		// entity parameters are rejected before that request and are reported by
-		// the general selection error instead.
-		return data.documentState === 'invalid' && page.url.searchParams.getAll('entity').length <= 1;
+		// Other explicit selectors can also cause a 400; do not blame a valid
+		// recorded timestamp for a legal-date or version-identity error.
+		return (
+			data.documentState === 'invalid' &&
+			page.url.searchParams.getAll('entity').length <= 1 &&
+			!page.url.searchParams.has('valid_on') &&
+			!page.url.searchParams.has('version_id')
+		);
 	});
 	let recordedAsOfDescription = $derived(
 		recordedAsOfInvalid
@@ -136,6 +140,11 @@
 
 		<div class="mt-4 grid gap-4 lg:grid-cols-2">
 			<form method="GET" class="rounded-lg border border-surface-200-800 p-4">
+				{#each ['valid_on', 'version_id'] as selector}
+					{#each page.url.searchParams.getAll(selector) as value}
+						<input type="hidden" name={selector} {value} />
+					{/each}
+				{/each}
 				<label for="regulatory-entity-search" class="label">{m.regulatoryEntitySearch()}</label>
 				<div class="mt-1 flex gap-2">
 					<input
@@ -162,6 +171,11 @@
 				class="grid gap-4 rounded-lg border border-surface-200-800 p-4 xl:grid-cols-[1fr_1fr_auto] xl:items-end"
 			>
 				<input type="hidden" name="entity_search" value={data.entitySearch} />
+				{#each ['valid_on', 'version_id'] as selector}
+					{#each page.url.searchParams.getAll(selector) as value}
+						<input type="hidden" name={selector} {value} />
+					{/each}
+				{/each}
 				<input type="hidden" name="mode" value="apply" />
 				{#if entitySelectDisabled && selectedEntityIsBound && data.selectedEntity}
 					<input type="hidden" name="entity" value={data.selectedEntity} />
