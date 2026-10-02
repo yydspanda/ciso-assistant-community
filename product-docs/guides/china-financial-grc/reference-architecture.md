@@ -87,7 +87,9 @@ five SQL/constraint probes, backup/restore across all 30 captured components,
 restored append and 168 PostgreSQL regressions. Source/dependency/seven-harness
 freeze matches. No native MFA or historical DDL changes. This is synthetic
 logical recovery, not physical-schema identity, WORM, PITR or production approval.
-The changed CI/ledger head still needs its own hosted and protected-main checks.
+The exact CI/ledger candidate passes its hosted checks and is merged normally
+into protected fork main. Legal, target-environment and production gates
+remain open.
 See
 [ADR 0005](../../../documentation/china-financial-grc/adr/0005-synthetic-whole-version-supersession.md).
 
