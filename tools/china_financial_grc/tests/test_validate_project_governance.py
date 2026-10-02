@@ -1,7 +1,11 @@
+import ast
 import contextlib
 import io
+import os
 import re
+import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -433,7 +437,7 @@ Older completed record.
             with self.subTest(found=found):
                 self.write(self.progress, PROGRESS)
                 self.replace(self.progress, link, replacement)
-                self.assert_invalid(f"must contain exactly one relative Markdown link")
+                self.assert_invalid("must contain exactly one relative Markdown link")
 
     def test_recent_record_link_must_resolve_to_its_archive(self) -> None:
         self.replace(
@@ -735,6 +739,151 @@ class PublicationWorkflowPolicyTests(unittest.TestCase):
         self.assertIn("DEST_BASE: ghcr.io/${{ github.repository }}/mirror", jobs)
         self.assertIn("  packages: write\n", workflow)
         self.assertIn("  workflow_dispatch:\n", workflow)
+
+
+class NativeVersionPolicyTests(unittest.TestCase):
+    """Retire the dead file gate without replacing tag-based release authority."""
+
+    REPOSITORY = Path(__file__).resolve().parents[3]
+    WORKFLOWS = REPOSITORY / ".github" / "workflows"
+    RELEASE_WORKFLOWS = ("docker-build-and-push.yml", "docker-build-and-push-ee.yml")
+
+    def assert_no_obsolete_requirement(self, workflow: str) -> None:
+        self.assertNotIn("ciso_assistant/VERSION", workflow)
+
+    def test_obsolete_file_requirement_is_retired(self) -> None:
+        self.assertFalse((self.WORKFLOWS / "version-change-check.yml").exists())
+        for path in sorted(self.WORKFLOWS.iterdir()):
+            if path.suffix in {".yaml", ".yml"}:
+                with self.subTest(workflow=path.name):
+                    self.assert_no_obsolete_requirement(
+                        path.read_text(encoding="utf-8")
+                    )
+
+    def test_reintroduced_obsolete_requirement_is_rejected(self) -> None:
+        for requirement in (
+            'version_file="ciso_assistant/VERSION"',
+            "git diff --name-only HEAD^1 HEAD | grep -q ciso_assistant/VERSION",
+            "echo 'ciso_assistant/VERSION must be modified'",
+        ):
+            with (
+                self.subTest(requirement=requirement),
+                self.assertRaises(AssertionError),
+            ):
+                self.assert_no_obsolete_requirement(requirement)
+
+    def test_unchanged_native_release_scripts_select_tag_version(self) -> None:
+        # Execute only the existing version-generation step in a new local Git
+        # fixture. No registry login, publisher, remote, or release tag is used.
+        with tempfile.TemporaryDirectory(prefix="cfgrc-version-policy-") as temporary:
+            directory = Path(temporary)
+            environment = {
+                "PATH": os.defpath,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+            }
+            for arguments in (
+                ["init", "--quiet"],
+                [
+                    "-c",
+                    "user.name=Synthetic Version Test",
+                    "-c",
+                    "user.email=version-test@synthetic.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=" + os.devnull,
+                    "commit",
+                    "--allow-empty",
+                    "--quiet",
+                    "-m",
+                    "Synthetic version fixture",
+                ],
+                ["tag", "v1.2.3"],
+                ["tag", "powerbi-v9.9.9"],
+            ):
+                subprocess.run(
+                    ["git", *arguments],
+                    cwd=directory,
+                    env=environment,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            build = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=directory,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            for name in self.RELEASE_WORKFLOWS:
+                workflow = (self.WORKFLOWS / name).read_text(encoding="utf-8")
+                step = workflow.index("      - name: Generate version\n")
+                marker = "\n        run: |\n"
+                start = workflow.index(marker, step) + len(marker)
+                end = workflow.index("\n  build-frontend:\n", start)
+                script = textwrap.dedent(workflow[start:end])
+                self.assertIn("--match 'v[0-9]*'", script)
+                for ref_type in ("tag", "branch"):
+                    with self.subTest(workflow=name, ref_type=ref_type):
+                        output_path = directory / f"{name}-{ref_type}.output"
+                        subprocess.run(
+                            ["bash", "-euc", script],
+                            cwd=directory,
+                            env={
+                                **environment,
+                                "GITHUB_REF_TYPE": ref_type,
+                                "GITHUB_REF_NAME": "v1.2.3"
+                                if ref_type == "tag"
+                                else "main",
+                                "GITHUB_OUTPUT": str(output_path),
+                            },
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        )
+                        actual = dict(
+                            line.split("=", 1)
+                            for line in output_path.read_text(
+                                encoding="utf-8"
+                            ).splitlines()
+                        )
+                        self.assertEqual(actual, {"version": "v1.2.3", "build": build})
+
+    def test_runtime_version_remains_build_metadata_not_a_checked_in_file(self) -> None:
+        # Parse settings without importing Django or opening local .meta/.env.
+        tree = ast.parse(
+            (self.REPOSITORY / "backend/ciso_assistant/settings.py").read_text(
+                encoding="utf-8"
+            )
+        )
+        assignments = [
+            node.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "VERSION"
+                for target in node.targets
+            )
+        ]
+        self.assertEqual(len(assignments), 1)
+        expected = ast.parse(
+            'os.getenv("CISO_ASSISTANT_VERSION", "unset")', mode="eval"
+        ).body
+        self.assertEqual(ast.dump(assignments[0]), ast.dump(expected))
+        for name in self.RELEASE_WORKFLOWS:
+            with self.subTest(workflow=name):
+                workflow = (self.WORKFLOWS / name).read_text(encoding="utf-8")
+                self.assertIn(
+                    "CISO_ASSISTANT_VERSION: ${{ needs.prepare.outputs.version }}",
+                    workflow,
+                )
+                self.assertIn(
+                    'echo "CISO_ASSISTANT_VERSION=$CISO_ASSISTANT_VERSION"', workflow
+                )
+                self.assertIn("cp .meta ./backend/", workflow)
 
 
 if __name__ == "__main__":
