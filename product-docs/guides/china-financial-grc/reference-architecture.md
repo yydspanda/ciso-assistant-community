@@ -77,7 +77,13 @@ remain absent. New correction of a document bound to an edge is refused until
 a separate rebind contract is reviewed. A local synthetic upgrade passes 168
 PostgreSQL regulatory cases and 12 authenticated Chromium/Firefox cases.
 The separate new-table upgrade/privilege/restore chain and full-file freeze are
-failed or incomplete; exact-head hosted and production acceptance remain open.
+not yet wholly accepted. A fresh frozen actual-old-code upgrade preserves old
+records/audit and passes populated-history rollback protection and five
+new-table SQL/constraint probes. Backup/restore commands succeed, but the
+columns/indexes fingerprint comparison fails; restored append and that run's
+suite are not executed. Source/dependency freeze passes, and the failed trial
+is retained. The prior exact hosted 168-case result does not cover this changed
+CI/ledger head. Full restore, new-head and production acceptance remain open.
 See
 [ADR 0005](../../../documentation/china-financial-grc/adr/0005-synthetic-whole-version-supersession.md).
 

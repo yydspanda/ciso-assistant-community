@@ -1,7 +1,7 @@
 # China Financial GRC Progress Ledger / 中国金融 GRC 进度台账
 
 > Status: **Authoritative current execution record / 权威当前执行记录**
-> Updated: **2026-10-02**
+> Updated: **2026-10-03**
 > Branch: `agent/cfgrc-upstream-reconciliation-20260827`
 
 This file is the bounded current dashboard: one stage pointer, one active task,
@@ -22,7 +22,7 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 | Phase 0 public foundation | Architecture/governance/domain design, high-level libraries, source metadata packs, applicability facts, and deterministic artifact validation are delivered; they are not legal review or production readiness. |
 | Regulatory persistence | A bounded synthetic metadata-only chain, recorded-time correction, whole-version replacement edges, fixed-rule non-binding applicability, and named-human review-disposition services are implemented. Replacement preserves old source rows and transfers no decisions/reviews. |
 | Read boundary | Entity/folder-scoped read actions and the read-only register/viewer support one shared version/valid-date/recorded-time selection; binding publication, public mutation APIs, real-law lifecycle and a binding reviewer workflow remain absent. |
-| Database evidence | Exact `5c04fe2cef` hosted PostgreSQL 16.15 acceptance passes 168 regulatory tests, including four new supersession concurrency cases, source 0001–0005, isolated populated-0004 reverse refusal, unchanged source/restored fingerprints and restored review successor sequence 2. Its operational supersession event table is empty: populated-0005 reverse, new-table SQL probes and supersession restore are not proved by that run. Prior local upgrade/grants/key-freeze failures are preserved. Docker is restored; a new private actual-0004 upgrade/0005 operations rehearsal is being prepared. Target operations and production approval remain open. |
+| Database evidence | Exact `5c04fe2cef` hosted PostgreSQL 16.15 passes 168 regulatory tests and its legacy/restore adapter, but its operational supersession table is empty. A new frozen private real-0004 upgrade preserves old rows/all 565 existing audit entries and passes empty rollback/reapply, populated-0005 refusal and five exact SQLSTATE/constraint probes. Backup/restore commands pass, but columns/indexes fingerprint comparison fails: operations exit one; restored v3/suite unrun. After-freeze passes. Prior failures are preserved; target/production approval remains open. |
 | Regulatory content | The public source seed remains metadata-only and legally unreviewed; no real institution profile or reviewed pilot source set exists. |
 | AI and private data | No production agent or private-policy ingestion exists, and no regulated/private data is authorised for an external model. |
 | Workflow isolation | Regulatory writes remain in `django-auditlog` but are excluded from the generic workflow event catalog, forwarder, and dispatch boundary; future regulatory automation requires a reviewed typed adapter, exact IAM, minimised payload, and human authority. |
@@ -36,7 +36,8 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   PostgreSQL cases. The extension then passes **168/168 PostgreSQL regulatory
   cases**, including four new real multi-connection supersession cases. One
   fresh full graph/check/drift/plan passes; the separate upgrade/grants/restore
-  chain and delayed all-file freeze remain failed or incomplete, not accepted.
+  chain and delayed all-file freeze in that earlier attempt remain failed or
+  incomplete, not accepted. The fresh frozen trial is recorded separately below.
 - The upgraded extension passes **208 focused / 789 complete frontend units**,
   CE/isolated native EE builds, private dependency/link/overlay checks and
   **12/12 authenticated Chromium/Firefox cases**, zero retries/skips/flaky.
@@ -59,6 +60,18 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
   metadata, publishers, branch protection and monitoring remain unchanged.
   The changed candidate is not covered by the preceding head's green result.
   See [CFGRC-REC-20261002-04](progress-archive/2026-10.md#cfgrc-rec-20261002-04).
+- A fresh private actual-0004-to-0005 run verifies the real full graph, old
+  regulatory rows/all 565 pre-existing audit entries, empty reverse/reapply,
+  populated-0005 exact reverse refusal and five new-table SQL probes. Backup,
+  restore and reference grants exit zero; the full bounded comparison fails
+  on columns/indexes (**26/28 components match**). Operations exit one,
+  restored v3 and its suite are unrun. Before/after freeze manifests match
+  **1690 current / 1685 prior source files, 41100 dependency files/four links**
+  and all harness/SQL/private input hashes. Independent audit confirms it.
+  A scoped CI regression refinement allows legitimate backend VERSION paths;
+  **56 stdlib / 103 tool tests / 129 subtests** pass. Fresh `dc85f15acd`
+  checkpoint measures **60 ahead / zero behind**, not protected-main acceptance.
+  See [CFGRC-REC-20261003-01](progress-archive/2026-10.md#cfgrc-rec-20261003-01).
 - The bounded synthetic whole-version replacement and dual-time read slice
   passes **71 focused backend cases**, then **160 passed / four PostgreSQL-only
   skips / zero failures/errors** in both complete regulatory runs, including
@@ -243,12 +256,12 @@ verification evidence live in `progress-archive/YYYY-MM.md`.
 
 ## Current next action
 
-Complete and independently audit the fresh private actual-0004-to-0005
-upgrade/privilege/restore chain with signing-key output outside source and a
-complete freeze. Record only verified outcomes, then submit the real CI/ledger
-candidate to PR #4 and inspect every re-triggered exact-head workflow before
-the owner-authorised protected-main merge. Preserve failed attempts and the
-Helm-only/fork-mirror policy; no binding/legal/production scope is added.
+Diagnose the fresh private restore's exact columns/indexes differences with
+read-only schema queries on only its owned upgrade/restore databases. Preserve
+the failed operations run and matching complete freeze; use a new reviewed,
+frozen rerun if a correction is justified. Then update the ledger, submit the
+real CI candidate and inspect every exact-head workflow before the authorised
+protected-main merge. No schema component, authority or production gate is waived.
 
 ## Active task board
 
@@ -256,7 +269,7 @@ Helm-only/fork-mirror policy; no binding/legal/production scope is added.
 | --- | --- | --- | --- | --- |
 | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | P0 | Dedicated canonical-upstream reconciliation | Clean branch after PR #3, fresh canonical fetch, conflict review, proportional regression, protected-main PR | In Progress |
 | `CFGRC-P1-TARGET-ACCEPTANCE` | P0 | Versioned target-environment charter, representative plans, PITR/RPO/RTO, role integration, retention, and audit-export acceptance | Named operations/security/privacy/records/legal owners | Pending external owners |
-| `CFGRC-P1-SUPERSESSION` | P0 | Source/legal-version supersession | Reviewed source evidence and legal lifecycle contract | Synthetic service/168 hosted PG/12 browser and live legacy adapter verified; fresh new-table operations/freeze, real-law/rebind and target gates open |
+| `CFGRC-P1-SUPERSESSION` | P0 | Source/legal-version supersession | Reviewed source evidence and legal lifecycle contract | Synthetic service/168 hosted PG/12 browser, actual old-code upgrade, new-table guards and full freeze verified; restore schema comparison failed, v3/suite unrun; real-law/rebind/target gates open |
 | `CFGRC-P1-PILOT-CHARTER` | P0 | Real-pilot ownership charter | Accountable business/legal/content-rights/privacy/security/product owners | Blocked on external ownership |
 | `CFGRC-P1-PILOT-SOURCES` | P0 | Small human-reviewed pilot source set | Accepted pilot charter, reviewers, rights, and approved data/model location | Blocked on external ownership |
 | `CFGRC-P1-REVIEWER-UI` | P1 | Reviewer UI/admin workflow | Stable binding review/publication contract | Pending |
@@ -270,6 +283,7 @@ the ten most recent records and does not duplicate their evidence.
 
 | Completed | Record | Task IDs | Result |
 | --- | --- | --- | --- |
+| 2026-10-03 | [CFGRC-REC-20261003-01](progress-archive/2026-10.md#cfgrc-rec-20261003-01) | `CFGRC-GOV-UPSTREAM-RECONCILIATION`, `CFGRC-P1-SUPERSESSION` | Real 0004 upgrade/old audit preservation, empty rollback, populated-0005 refusal, five SQL probes and full freeze pass. Restore schema comparison fails; v3/suite unrun. Narrow version-policy regressions pass 56/103 tests; new-head/main gates open. |
 | 2026-10-02 | [CFGRC-REC-20261002-04](progress-archive/2026-10.md#cfgrc-rec-20261002-04) | `CFGRC-GOV-UPSTREAM-RECONCILIATION`, `CFGRC-P1-SUPERSESSION` | Exact 5c04 hosted 17 workflows/216 checks/one tag-only skip pass; PG168 artifact and legacy/restore evidence audited. Owner-approved obsolete root-version gate retirement passes 4 new/56 stdlib/103 tool tests. New CI/ledger head, new-table operations and protected main remain pending. |
 | 2026-10-02 | [CFGRC-REC-20261002-03](progress-archive/2026-10.md#cfgrc-rec-20261002-03) | `CFGRC-GOV-UPSTREAM-RECONCILIATION`, `CFGRC-P1-SUPERSESSION` | Dedicated historical clone preserves source 0005; exact old guard/table/migration/fingerprint checks and private PEM exclusion pass 13 deterministic tests. Hosted collection added; real canonical PG/restore, new-table operations and exact-head/main gates open. |
 | 2026-10-02 | [CFGRC-REC-20261002-02](progress-archive/2026-10.md#cfgrc-rec-20261002-02) | `CFGRC-GOV-UPSTREAM-RECONCILIATION`, `CFGRC-P1-SUPERSESSION` | Separate pure upstream merge/fixture adaptation; 148/82 baseline PG, 168 extension PG, 208/789 units, CE/EE and frozen 12/12 browsers pass. Upgrade/grants/full-file freeze failed; restore unrun, full types failed, new-head/main gates open. |
@@ -279,7 +293,6 @@ the ten most recent records and does not duplicate their evidence.
 | 2026-10-01 | [CFGRC-REC-20261001-08](progress-archive/2026-10.md#cfgrc-rec-20261001-08) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Local `35b76ed2e`: 68/749 units, CE/isolated EE and actual 24/24 browser cases passed with frozen source/runtime. Full types retain 2061 errors; stricter private-cache packaging supplement failed before building. Latest fresh upstream count 54/1; new-head hosted/publication/main gates remain open. |
 | 2026-10-01 | [CFGRC-REC-20261001-07](progress-archive/2026-10.md#cfgrc-rec-20261001-07) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Two-test follow-up passed 68/749 and 24-case collection with original business/cleanup preserved. Click experiment measured two selected tabs but failed its Actor cleanup assumption; separate exact cleanup passed. Original 18/2/2 and new-candidate/owner gates remain open. |
 | 2026-10-01 | [CFGRC-REC-20261001-06](progress-archive/2026-10.md#cfgrc-rec-20261001-06) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Exact 749 units / CE / EE passed; hosted checks: 215 success / one tag-only skip / zero failures. Local browser failed 18/2/2. Private inbound correction passed 68/749 and 24-case collection; cache-config experiment records current authorised-read absence, not historical cause. Release/owner gates remain open. |
-| 2026-10-01 | [CFGRC-REC-20261001-05](progress-archive/2026-10.md#cfgrc-rec-20261001-05) | `CFGRC-GOV-UPSTREAM-RECONCILIATION` | Exact 732 units / CE / EE and backend-content evidence passed; browser failed 15/3/0, hosted 213/2/1; separate test-only correction passed 88/749 and 22-case collection; final gates and publication-owner decision remain open. |
 
 ## Ledger update rules
 

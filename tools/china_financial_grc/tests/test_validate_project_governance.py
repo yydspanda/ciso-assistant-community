@@ -749,7 +749,10 @@ class NativeVersionPolicyTests(unittest.TestCase):
     RELEASE_WORKFLOWS = ("docker-build-and-push.yml", "docker-build-and-push-ee.yml")
 
     def assert_no_obsolete_requirement(self, workflow: str) -> None:
-        self.assertNotIn("ciso_assistant/VERSION", workflow)
+        self.assertNotRegex(
+            workflow,
+            r"(?<![\w./-])(?:\./)?ciso_assistant/VERSION(?![\w./-])",
+        )
 
     def test_obsolete_file_requirement_is_retired(self) -> None:
         self.assertFalse((self.WORKFLOWS / "version-change-check.yml").exists())
@@ -763,6 +766,7 @@ class NativeVersionPolicyTests(unittest.TestCase):
     def test_reintroduced_obsolete_requirement_is_rejected(self) -> None:
         for requirement in (
             'version_file="ciso_assistant/VERSION"',
+            'version_file="./ciso_assistant/VERSION"',
             "git diff --name-only HEAD^1 HEAD | grep -q ciso_assistant/VERSION",
             "echo 'ciso_assistant/VERSION must be modified'",
         ):
@@ -771,6 +775,12 @@ class NativeVersionPolicyTests(unittest.TestCase):
                 self.assertRaises(AssertionError),
             ):
                 self.assert_no_obsolete_requirement(requirement)
+        for allowed in (
+            "sha256sum backend/ciso_assistant/VERSION",
+            'version_file="./backend/ciso_assistant/VERSION"',
+        ):
+            with self.subTest(allowed=allowed):
+                self.assert_no_obsolete_requirement(allowed)
 
     def test_unchanged_native_release_scripts_select_tag_version(self) -> None:
         # Execute only the existing version-generation step in a new local Git

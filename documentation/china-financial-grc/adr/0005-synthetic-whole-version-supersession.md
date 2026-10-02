@@ -156,8 +156,20 @@ runtime signing key while pre-existing code/dependencies remain unchanged.
 Repeat that interrupted chain in new owned resources with key output outside
 source; preserve the failures. Legacy-0004 operational probing must also be
 isolated from the current 0005 source schema before hosted submission.
-Exact-head hosted CI, legal review, real source rights and named production/
-operations acceptance remain open.
+
+The exact 5c04 hosted follow-up passes 168 PostgreSQL cases and the isolated
+legacy/restore adapter, but its operational supersession table is empty. A new
+fully frozen actual-old-code 0004-to-0005 trial preserves prior rows/all 565
+existing audit entries and passes empty reversal/reapplication, the precise
+populated-0005 reverse refusal and five new-table SQLSTATE/constraint probes.
+Backup, restore and reference grants exit zero; the full comparison nevertheless
+fails on columns/indexes fingerprints (26 of 28 components match). Operations
+exit one, restored v3 and the trial's suite remain unrun. The before/after source,
+dependency, harness and private-input manifests match. This failure is retained,
+not converted to restore acceptance by excluding schema checks. See
+[CFGRC-REC-20261003-01](../../../.notes/china_financial_grc/progress-archive/2026-10.md#cfgrc-rec-20261003-01).
+The changed CI/ledger candidate still requires its own hosted checks. Legal
+review, real source rights and named production/operations acceptance remain open.
 
 This slice does not claim WORM protection against privileged SQL or cryptographic
 authentication of source bytes; semantic SHA-256 is not a source signature.
