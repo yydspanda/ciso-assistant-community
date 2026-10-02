@@ -42,6 +42,19 @@ const RATIONALE_UNKNOWN = 'The required institution-type fact is explicitly unkn
 const recordedTimestampSchema = z
 	.string()
 	.refine(isAwareRfc3339, { message: 'Expected a timezone-aware RFC 3339 date-time' });
+export const regulatoryValidOnSchema = z
+	.string()
+	.regex(/^\d{4}-\d{2}-\d{2}$/)
+	.refine((value) => isAwareRfc3339(`${value}T00:00:00Z`), {
+		message: 'Expected a valid YYYY-MM-DD calendar date'
+	});
+export const regulatoryVersionIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{2,159}$/);
+export const regulatorySelectionSchema = z.object({
+	version_id: regulatoryVersionIdSchema,
+	version_revision: z.number().int().positive(),
+	valid_on: regulatoryValidOnSchema.nullable(),
+	recorded_at: recordedTimestampSchema
+});
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
 export const regulatorySourceHashSchema = z.union([sha256Schema, z.literal(''), z.null()]);
 const phaseOneProvisionTextSchema = z.union([z.literal(''), z.null()]);
@@ -215,6 +228,7 @@ export const regulatoryDocumentDetailSchema = regulatoryDocumentSummarySchema
 		contract_status: z.literal('draft'),
 		legal_conclusion: z.literal(false),
 		recorded_as_of: nullableString,
+		selection: regulatorySelectionSchema.optional(),
 		document_versions: z.array(versionSchema).min(1).max(1)
 	})
 	.superRefine((document, context) => {
@@ -232,6 +246,24 @@ export const regulatoryDocumentDetailSchema = regulatoryDocumentSummarySchema
 			});
 		}
 		const version = document.document_versions[0];
+		if (document.selection === undefined && (version?.supersedes_version_ids.length ?? 0) > 0) {
+			context.addIssue({
+				code: 'custom',
+				path: ['selection'],
+				message: 'A superseding version must include its dual-time selection'
+			});
+		}
+		if (
+			document.selection !== undefined &&
+			(version?.record_id !== document.selection.version_id ||
+				version.revision !== document.selection.version_revision)
+		) {
+			context.addIssue({
+				code: 'custom',
+				path: ['selection'],
+				message: 'The selection must bind the exact selected version identity and revision'
+			});
+		}
 		if (
 			version !== undefined &&
 			provision !== undefined &&
@@ -389,6 +421,7 @@ const applicabilityBaseSchema = z.object({
 	obligation_revision: z.number().int().positive(),
 	recorded_as_of: nullableString,
 	selected_recorded_at: recordedTimestampSchema,
+	selection: regulatorySelectionSchema.optional(),
 	evaluation_status: z.enum(['evaluated', 'not_evaluated']),
 	decision: applicabilityDecisionSchema.nullable()
 });

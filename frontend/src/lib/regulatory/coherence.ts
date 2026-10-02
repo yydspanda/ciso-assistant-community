@@ -3,7 +3,8 @@ import type {
 	RegulatoryApplicability,
 	RegulatoryApplicabilityReview,
 	RegulatoryDocumentDetail,
-	RegulatoryReadPanel
+	RegulatoryReadPanel,
+	RegulatorySelection
 } from './types';
 
 export interface RegulatoryRequestIdentity {
@@ -11,6 +12,8 @@ export interface RegulatoryRequestIdentity {
 	entityId: string;
 	recordedAsOf: string;
 	currentSelectionAnchor?: string;
+	validOn?: string;
+	versionId?: string;
 }
 
 export interface RegulatoryPanelPair {
@@ -25,6 +28,7 @@ interface RegulatoryPanelIdentity {
 	obligation_revision: number;
 	recorded_as_of: string | null;
 	selected_recorded_at: string;
+	selection?: RegulatorySelection;
 	evaluation_status: string;
 	decision: RegulatoryApplicability['decision'];
 }
@@ -40,6 +44,25 @@ function sameInstant(left: string, right: string): boolean {
 function matchesRequestedRecordedAsOf(actual: string | null, requested: string): boolean {
 	if (requested === '') return actual === null;
 	return actual !== null && sameInstant(actual, requested);
+}
+
+function selectionBindsDocument(
+	selection: RegulatorySelection,
+	document: RegulatoryDocumentDetail
+): boolean {
+	const version = document.document_versions[0];
+	return (
+		version?.record_id === selection.version_id && version.revision === selection.version_revision
+	);
+}
+
+function selectionsAgree(left: RegulatorySelection, right: RegulatorySelection): boolean {
+	return (
+		left.version_id === right.version_id &&
+		left.version_revision === right.version_revision &&
+		left.valid_on === right.valid_on &&
+		sameInstant(left.recorded_at, right.recorded_at)
+	);
 }
 
 function intervalContains(
@@ -132,13 +155,39 @@ function documentHasObligationAt(
 
 export function isRegulatoryDocumentResponseCoherent(
 	document: RegulatoryDocumentDetail,
-	request: Pick<RegulatoryRequestIdentity, 'documentId' | 'recordedAsOf' | 'currentSelectionAnchor'>
+	request: Pick<
+		RegulatoryRequestIdentity,
+		'documentId' | 'recordedAsOf' | 'currentSelectionAnchor' | 'validOn' | 'versionId'
+	>
 ): boolean {
 	if (
 		!sameUuid(document.id, request.documentId) ||
 		!matchesRequestedRecordedAsOf(document.recorded_as_of, request.recordedAsOf)
 	) {
 		return false;
+	}
+
+	const selection = document.selection;
+	if (
+		selection === undefined &&
+		(request.validOn ||
+			request.versionId ||
+			(document.document_versions[0]?.supersedes_version_ids?.length ?? 0) > 0)
+	) {
+		return false;
+	}
+	if (selection !== undefined) {
+		const selectedMicroseconds = rfc3339TimestampMicroseconds(selection.recorded_at);
+		if (
+			!selectionBindsDocument(selection, document) ||
+			(request.validOn && selection.valid_on !== request.validOn) ||
+			(request.versionId && selection.version_id !== request.versionId) ||
+			(request.recordedAsOf !== '' && !sameInstant(selection.recorded_at, request.recordedAsOf)) ||
+			selectedMicroseconds === null ||
+			!documentHasChainAt(document, selectedMicroseconds)
+		) {
+			return false;
+		}
 	}
 
 	if (request.recordedAsOf === '') return documentHasCurrentChain(document);
@@ -152,12 +201,20 @@ function panelIdentityIsCoherent(
 	request: RegulatoryRequestIdentity,
 	kind: 'applicability' | 'review'
 ): boolean {
+	if ((panel.selection === undefined) !== (document.selection === undefined)) return false;
+	if (
+		document.selection !== undefined &&
+		(panel.selection === undefined || !selectionsAgree(panel.selection, document.selection))
+	) {
+		return false;
+	}
 	const expectedRecordedAsOf =
-		request.recordedAsOf !== ''
+		document.selection?.recorded_at ??
+		(request.recordedAsOf !== ''
 			? request.recordedAsOf
 			: kind === 'review'
 				? (request.currentSelectionAnchor ?? '')
-				: '';
+				: '');
 	if (
 		!sameUuid(panel.document_id, request.documentId) ||
 		panel.scope.type !== 'legal_entity' ||
@@ -177,6 +234,12 @@ function panelIdentityIsCoherent(
 
 	const selectedMicroseconds = rfc3339TimestampMicroseconds(panel.selected_recorded_at);
 	if (selectedMicroseconds === null) return false;
+	if (
+		document.selection !== undefined &&
+		!sameInstant(panel.selected_recorded_at, document.selection.recorded_at)
+	) {
+		return false;
+	}
 	if (
 		request.recordedAsOf !== '' &&
 		!sameInstant(panel.selected_recorded_at, request.recordedAsOf)

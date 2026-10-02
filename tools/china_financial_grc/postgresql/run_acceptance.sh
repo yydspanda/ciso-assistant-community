@@ -15,6 +15,7 @@ acceptance_port="${PG_ACCEPTANCE_PORT:-55432}"
 project_name="ciso-china-grc-pg-acceptance-${PPID}-$$"
 database_name="ciso_regulatory_acceptance"
 migration_database="ciso_regulatory_acceptance_migration"
+legacy_rollback_database="ciso_regulatory_acceptance_legacy_rollback"
 restore_database="ciso_regulatory_acceptance_restored"
 test_database="test_${database_name}"
 migrator_role="ciso_regulatory_migrator"
@@ -43,6 +44,10 @@ if [[ -n "${HOME:-}" ]]; then
     fi
 fi
 evidence_dir="$(mktemp -d "$evidence_parent/ciso-china-grc-postgresql-$timestamp-XXXXXX")"
+# All Django subprocesses must use one new private acceptance signing key,
+# never read a configured runtime key or generate files in backend/db.
+export IDP_OIDC_PRIVATE_KEY=""
+export IDP_OIDC_PRIVATE_KEY_FILE="$evidence_dir/idp_oidc_private_key.pem"
 
 for dependency in docker openssl sha256sum git grep; do
     if ! command -v "$dependency" >/dev/null 2>&1; then
@@ -270,6 +275,56 @@ CROSS JOIN membership_contract;
 SQL
 }
 
+verify_legacy_review_reverse() {
+    echo "Fingerprinting the unchanged full-graph source before the legacy probe"
+    run_fixture verify "$database_name" "$evidence_dir/legacy-source-before.json" \
+        >"$evidence_dir/legacy-source-before.log" 2>&1
+    create_owned_database "$legacy_rollback_database" "$database_name"
+    apply_grants "$legacy_rollback_database" legacy-rollback-grants
+
+    # Django commits each reverse migration separately. A 0003 target on the
+    # source would drop empty 0005 before the populated 0004 guard rejects it.
+    # Exercise that actual guard only on a dedicated historical-schema clone.
+    run_manage "$legacy_rollback_database" "$migrator_role" "$migrator_password" \
+        migrate regulatory 0004 --noinput \
+        >"$evidence_dir/legacy-0005-to-0004.log" 2>&1
+    run_fixture verify-legacy-0004 "$legacy_rollback_database" \
+        "$evidence_dir/legacy-0004-before.json" \
+        >"$evidence_dir/legacy-0004-before.log" 2>&1
+    if run_manage "$legacy_rollback_database" "$migrator_role" "$migrator_password" \
+        migrate regulatory 0003 --noinput \
+        >"$evidence_dir/populated-reverse-refusal.log" 2>&1; then
+        echo "populated reverse migration unexpectedly succeeded" >&2
+        return 1
+    fi
+    if ! grep -Fxq \
+        'RuntimeError: Cannot remove regulatory applicability review history; retain migration 0004.' \
+        "$evidence_dir/populated-reverse-refusal.log"; then
+        echo "legacy reverse failed for a reason other than the exact review-history guard" >&2
+        return 1
+    fi
+    run_fixture verify-legacy-0004 "$legacy_rollback_database" \
+        "$evidence_dir/legacy-0004-after.json" \
+        >"$evidence_dir/legacy-0004-after.log" 2>&1
+    if ! cmp --silent "$evidence_dir/legacy-0004-before.json" \
+        "$evidence_dir/legacy-0004-after.json"; then
+        echo "legacy review reverse changed historical rows, schema, or migration state" >&2
+        return 1
+    fi
+    run_fixture verify "$database_name" "$evidence_dir/source-fingerprint.json" \
+        >"$evidence_dir/pre-backup-domain-service.log" 2>&1
+    if ! cmp --silent "$evidence_dir/legacy-source-before.json" \
+        "$evidence_dir/source-fingerprint.json"; then
+        echo "legacy rollback probe changed the full-graph source fingerprint" >&2
+        return 1
+    fi
+    if ! cmp --silent "$evidence_dir/seed-fingerprint.json" \
+        "$evidence_dir/source-fingerprint.json"; then
+        echo "full-graph source fingerprint differs from the seeded state" >&2
+        return 1
+    fi
+}
+
 echo "Starting isolated PostgreSQL 16 acceptance environment"
 echo "Evidence directory: $evidence_dir"
 compose up --detach --wait
@@ -336,19 +391,10 @@ run_fixture seed "$database_name" "$evidence_dir/seed-fingerprint.json" \
     >"$evidence_dir/runtime-domain-service.log" 2>&1
 
 echo "Proving that populated review history refuses destructive reverse migration"
-if run_manage "$database_name" "$migrator_role" "$migrator_password" \
-    migrate regulatory 0003 --noinput \
-    >"$evidence_dir/populated-reverse-refusal.log" 2>&1; then
-    echo "populated reverse migration unexpectedly succeeded" >&2
-    exit 1
-fi
+verify_legacy_review_reverse
 role_psql "$runtime_role" "$runtime_password" "$database_name" \
     "SELECT count(*) AS review_rows FROM regulatory_regulatoryapplicabilityreviewdisposition" \
     >"$evidence_dir/populated-history-preserved.log"
-
-echo "Capturing the exact source state immediately before backup"
-run_fixture verify "$database_name" "$evidence_dir/source-fingerprint.json" \
-    >"$evidence_dir/pre-backup-domain-service.log" 2>&1
 
 echo "Creating a synthetic-only custom-format backup with the read-only role"
 dump_path="$evidence_dir/synthetic-regulatory-acceptance.dump"
@@ -476,6 +522,7 @@ PY
         ! -name SHA256SUMS \
         ! -name SHAREABLE_SHA256SUMS \
         ! -name '*.dump' \
+        ! -name '*.pem' \
         -print0 \
         | LC_ALL=C sort -z \
         | xargs -0 -r sha256sum -- >SHAREABLE_SHA256SUMS

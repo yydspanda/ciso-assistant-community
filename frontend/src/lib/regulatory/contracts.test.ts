@@ -6,8 +6,10 @@ import {
 	parseRegulatoryDocumentDetail,
 	parseRegulatoryDocumentPage,
 	parseRegulatoryEntityPage,
-	regulatorySourceHashSchema
+	regulatorySourceHashSchema,
+	regulatorySelectionSchema
 } from './contracts';
+import { isFutureEffective } from './presentation';
 
 const summary = {
 	id: '4819de76-fce4-4a1c-bb3b-e97d80b61ab7',
@@ -653,5 +655,122 @@ describe('regulatory runtime contracts', () => {
 		expect(() =>
 			parseRegulatoryApplicabilityReview({ ...payload, review_state: 'not_reviewed' })
 		).toThrow();
+	});
+
+	it('retains a typed optional dual-time selection on all three read projections', () => {
+		const selection = {
+			version_id: version.record_id,
+			version_revision: version.revision,
+			valid_on: '2026-08-26',
+			recorded_at: selectedRecordedAt
+		};
+		expect(parseRegulatoryDocumentDetail({ ...detail, selection }).selection).toEqual(selection);
+		expect(
+			parseRegulatoryApplicability({
+				...applicabilityBase,
+				selection,
+				non_binding_result: 'needs_review',
+				reason_code: 'missing_or_unknown_fact'
+			}).selection
+		).toEqual(selection);
+		expect(
+			parseRegulatoryApplicabilityReview({
+				...applicabilityBase,
+				selection,
+				computed_non_binding_result: 'needs_review',
+				review_state: 'not_reviewed',
+				workflow_attention: 'needs_review',
+				latest_disposition: null
+			}).selection
+		).toEqual(selection);
+	});
+
+	it.each([{ version_id: 'OTHER-VERSION' }, { version_revision: 2 }])(
+		'rejects a selection detached from the selected version: %j',
+		(override) => {
+			expect(() =>
+				parseRegulatoryDocumentDetail({
+					...detail,
+					selection: {
+						version_id: version.record_id,
+						version_revision: version.revision,
+						valid_on: '2026-08-26',
+						recorded_at: selectedRecordedAt,
+						...override
+					}
+				})
+			).toThrow();
+		}
+	);
+
+	it.each([
+		{ valid_on: '2026-02-29' },
+		{ valid_on: '2026-02-30' },
+		{ valid_on: '0000-01-01' },
+		{ valid_on: '2026-8-26' },
+		{ recorded_at: '2026-08-26T09:30:00' },
+		{ version_id: 'bad version' },
+		{ version_id: 'a'.repeat(161) },
+		{ version_revision: 0 }
+	])('rejects malformed selection fields: %j', (override) => {
+		expect(() =>
+			regulatorySelectionSchema.parse({
+				version_id: version.record_id,
+				version_revision: 1,
+				valid_on: '2026-08-26',
+				recorded_at: selectedRecordedAt,
+				...override
+			})
+		).toThrow();
+	});
+
+	it('requires the complete selection envelope without widening version cardinality', () => {
+		expect(() => regulatorySelectionSchema.parse({ version_id: version.record_id })).toThrow();
+		expect(() =>
+			parseRegulatoryDocumentDetail({ ...detail, document_versions: [version, version] })
+		).toThrow();
+	});
+
+	it('does not downgrade a superseding version into a legacy selection-free response', () => {
+		const superseding = {
+			...detail,
+			document_versions: [{ ...version, supersedes_version_ids: ['SYNTHETIC-VERSION-OLDER'] }]
+		};
+		expect(() => parseRegulatoryDocumentDetail(superseding)).toThrow();
+		expect(
+			parseRegulatoryDocumentDetail({
+				...superseding,
+				selection: {
+					version_id: version.record_id,
+					version_revision: version.revision,
+					valid_on: '2026-08-26',
+					recorded_at: selectedRecordedAt
+				}
+			}).document_versions[0].supersedes_version_ids
+		).toEqual(['SYNTHETIC-VERSION-OLDER']);
+	});
+
+	it('preserves future-effectivity and non-binding authority on an explicit version preview', () => {
+		const future = parseRegulatoryDocumentDetail({
+			...detail,
+			selection: {
+				version_id: version.record_id,
+				version_revision: version.revision,
+				valid_on: null,
+				recorded_at: selectedRecordedAt
+			},
+			document_versions: [
+				{
+					...version,
+					status: 'published_future_effective',
+					effective_date: '2027-01-01',
+					valid_from: '2027-01-01'
+				}
+			]
+		});
+		expect(future.selection?.valid_on).toBeNull();
+		expect(isFutureEffective(future.document_versions[0])).toBe(true);
+		expect(future.legal_conclusion).toBe(false);
+		expect(future.document_versions[0].legal_review_status).toBe('unreviewed');
 	});
 });

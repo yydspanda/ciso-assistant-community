@@ -6,6 +6,14 @@ export interface RegulatoryReadPanel<T> {
 	data: T | null;
 }
 
+export interface RegulatorySelection {
+	version_id: string;
+	version_revision: number;
+	/** Null is a version preview or legacy draft read, not an assertion of legal applicability. */
+	valid_on: string | null;
+	recorded_at: string;
+}
+
 export interface RegulatoryProvenance {
 	method: 'human' | 'parser' | 'model_proposal' | 'import';
 	created_at: string;
@@ -119,6 +127,7 @@ export interface RegulatoryDocumentDetail extends RegulatoryDocumentSummary {
 	contract_status: 'draft';
 	legal_conclusion: false;
 	recorded_as_of: string | null;
+	selection?: RegulatorySelection;
 	document_versions: RegulatoryDocumentVersion[];
 }
 
@@ -193,6 +202,7 @@ export interface RegulatoryApplicability {
 	obligation_revision: number;
 	recorded_as_of: string | null;
 	selected_recorded_at: string;
+	selection?: RegulatorySelection;
 	evaluation_status: 'evaluated' | 'not_evaluated';
 	non_binding_result: RegulatoryApplicabilityResult;
 	reason_code: RegulatoryDecisionReason | 'no_decision_for_selected_obligation_revision';
@@ -234,6 +244,7 @@ export interface RegulatoryApplicabilityReview {
 	obligation_revision: number;
 	recorded_as_of: string | null;
 	selected_recorded_at: string;
+	selection?: RegulatorySelection;
 	evaluation_status: 'evaluated' | 'not_evaluated';
 	computed_non_binding_result: RegulatoryApplicabilityResult;
 	decision: RegulatoryApplicabilityDecision | null;

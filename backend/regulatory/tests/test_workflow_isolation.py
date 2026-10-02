@@ -60,6 +60,7 @@ def test_regulatory_models_remain_audited_but_opt_out_of_workflow_events():
         "regulatoryapplicabilitydecision",
         "regulatoryapplicabilityreviewdisposition",
         "regulatorychaincorrectionevent",
+        "regulatoryversionsupersessionevent",
         "regulatorydocument",
         "regulatorydocumentversion",
         "regulatoryobligation",

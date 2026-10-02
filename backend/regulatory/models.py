@@ -28,6 +28,7 @@ from .validators import (
 )
 
 CORRECTION_DIGEST_SCHEMA = "regulatory-chain-correction/v1"
+SUPERSESSION_DIGEST_SCHEMA = "regulatory-version-supersession/v1"
 APPLICABILITY_DIGEST_SCHEMA = "regulatory-applicability-evaluation/v1"
 APPLICABILITY_EVALUATOR_PROFILE = "synthetic-single-condition/v1"
 APPLICABILITY_REVIEW_DISPOSITION_DIGEST_PROFILE = (
@@ -2303,6 +2304,343 @@ class RegulatoryChainCorrectionEvent(RegulatoryFolderModel):
         super().clean()
 
 
+class RegulatoryVersionSupersessionEvent(RegulatoryFolderModel):
+    """Immutable synthetic whole-version metadata edge; never legal approval."""
+
+    document = models.ForeignKey(
+        RegulatoryDocument, on_delete=models.PROTECT, related_name="supersession_events"
+    )
+    registration = models.ForeignKey(
+        EntityDocumentRegistration,
+        on_delete=models.PROTECT,
+        related_name="supersession_events",
+    )
+    predecessor_document_version = models.ForeignKey(
+        RegulatoryDocumentVersion,
+        on_delete=models.PROTECT,
+        related_name="supersession_events_as_predecessor",
+        db_index=False,
+    )
+    successor_document_version = models.ForeignKey(
+        RegulatoryDocumentVersion,
+        on_delete=models.PROTECT,
+        related_name="supersession_events_as_successor",
+        db_index=False,
+    )
+    predecessor_provision = models.ForeignKey(
+        RegulatoryProvision,
+        on_delete=models.PROTECT,
+        related_name="supersession_events_as_predecessor",
+    )
+    successor_provision = models.ForeignKey(
+        RegulatoryProvision,
+        on_delete=models.PROTECT,
+        related_name="supersession_events_as_successor",
+    )
+    predecessor_obligation = models.ForeignKey(
+        RegulatoryObligation,
+        on_delete=models.PROTECT,
+        related_name="supersession_events_as_predecessor",
+    )
+    successor_obligation = models.ForeignKey(
+        RegulatoryObligation,
+        on_delete=models.PROTECT,
+        related_name="supersession_events_as_successor",
+    )
+    predecessor_version_record_id = models.CharField(
+        max_length=160, validators=[validate_regulatory_identifier]
+    )
+    successor_version_record_id = models.CharField(
+        max_length=160, validators=[validate_regulatory_identifier]
+    )
+    replacement_kind = models.CharField(
+        max_length=24, default="whole_document", editable=False
+    )
+    effective_on = models.DateField()
+    occurred_at = models.DateTimeField(editable=False)
+    recorded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="regulatory_version_supersessions",
+    )
+    rationale = models.TextField(max_length=4000)
+    idempotency_key = models.CharField(max_length=200)
+    digest_schema = models.CharField(
+        max_length=64, default=SUPERSESSION_DIGEST_SCHEMA, editable=False
+    )
+    payload_sha256 = models.CharField(max_length=64, validators=[validate_sha256])
+    before_payload_sha256 = models.CharField(
+        max_length=64, validators=[validate_sha256]
+    )
+    after_payload_sha256 = models.CharField(max_length=64, validators=[validate_sha256])
+    is_binding = models.BooleanField(default=False, editable=False)
+
+    class Meta:
+        default_permissions = ("view",)
+        ordering = ["occurred_at", "id"]
+        permissions = [
+            (
+                "supersede_regulatoryversion",
+                "Can append a synthetic whole regulatory version replacement",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=["folder", "document", "occurred_at"],
+                name="reg_sup_doc_time_idx",
+            )
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["folder", "idempotency_key"], name="reg_sup_idempotency_uniq"
+            ),
+            models.UniqueConstraint(
+                fields=["predecessor_document_version"],
+                name="reg_sup_pred_physical_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["successor_document_version"], name="reg_sup_succ_physical_uniq"
+            ),
+            models.UniqueConstraint(
+                fields=["folder", "document", "predecessor_version_record_id"],
+                name="reg_sup_pred_stable_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["folder", "document", "successor_version_record_id"],
+                name="reg_sup_succ_stable_uniq",
+            ),
+            models.CheckConstraint(
+                condition=Q(replacement_kind="whole_document"),
+                name="reg_sup_whole_document",
+            ),
+            models.CheckConstraint(
+                condition=Q(digest_schema=SUPERSESSION_DIGEST_SCHEMA),
+                name="reg_sup_digest_schema",
+            ),
+            models.CheckConstraint(
+                condition=Q(is_binding=False), name="reg_sup_not_binding"
+            ),
+            models.CheckConstraint(
+                condition=Q(is_published=False), name="reg_sup_not_published"
+            ),
+            models.CheckConstraint(
+                condition=~Q(
+                    predecessor_version_record_id=F("successor_version_record_id")
+                ),
+                name="reg_sup_stable_changed",
+            ),
+            models.CheckConstraint(
+                condition=~Q(
+                    predecessor_document_version=F("successor_document_version")
+                ),
+                name="reg_sup_physical_changed",
+            ),
+            models.CheckConstraint(
+                condition=~Q(before_payload_sha256=F("after_payload_sha256")),
+                name="reg_sup_payload_changed",
+            ),
+            models.CheckConstraint(
+                condition=~Q(rationale=""), name="reg_sup_rationale_present"
+            ),
+            models.CheckConstraint(
+                condition=~Q(idempotency_key=""), name="reg_sup_key_present"
+            ),
+        ]
+
+    def clean(self) -> None:
+        errors = {}
+        if self.is_binding or self.replacement_kind != "whole_document":
+            errors["replacement_kind"] = (
+                "Only non-binding whole-document metadata is enabled."
+            )
+        if self.digest_schema != SUPERSESSION_DIGEST_SCHEMA:
+            errors["digest_schema"] = "The supersession digest schema is fixed."
+        if (
+            not (self.rationale or "").strip()
+            or not (self.idempotency_key or "").strip()
+        ):
+            errors["rationale"] = "A rationale and idempotency key are required."
+        if self.document_id and self.document.folder_id != self.folder_id:
+            errors["document"] = "The document must be in the event folder."
+        if self.registration_id and (
+            self.registration.folder_id != self.folder_id
+            or self.registration.document_id != self.document_id
+            or self.registration.registration_kind != "synthetic_pilot"
+        ):
+            errors["registration"] = "An exact synthetic registration is required."
+
+        required_links = (
+            "predecessor_document_version",
+            "successor_document_version",
+            "predecessor_provision",
+            "successor_provision",
+            "predecessor_obligation",
+            "successor_obligation",
+        )
+        if all(getattr(self, f"{field}_id") for field in required_links):
+            predecessor = self.predecessor_document_version
+            successor = self.successor_document_version
+            for field in required_links:
+                record = getattr(self, field)
+                try:
+                    record.full_clean()
+                except ValidationError as exc:
+                    errors[field] = exc.messages
+                if record.folder_id != self.folder_id or record.is_published:
+                    errors[field] = (
+                        "Every chain row must be unpublished in the event folder."
+                    )
+                if record.recorded_to is not None:
+                    errors[field] = "Every bound recorded interval must remain open."
+                if record.recorded_from is None or timezone.is_naive(
+                    record.recorded_from
+                ):
+                    errors[field] = "Every bound recorded epoch must be aware."
+            for prefix in ("predecessor", "successor"):
+                version = getattr(self, f"{prefix}_document_version")
+                provision = getattr(self, f"{prefix}_provision")
+                obligation = getattr(self, f"{prefix}_obligation")
+                if not (
+                    version.recorded_from
+                    == provision.recorded_from
+                    == obligation.recorded_from
+                ):
+                    errors[f"{prefix}_document_version"] = (
+                        "Each bound chain must share one recorded epoch."
+                    )
+                if version.document_id != self.document_id:
+                    errors[f"{prefix}_document_version"] = (
+                        "Both versions must belong to the document."
+                    )
+                if provision.document_version_id != version.id:
+                    errors[f"{prefix}_provision"] = (
+                        "The provision must cite the exact version."
+                    )
+                links = list(
+                    obligation.provision_links.values_list("folder_id", "provision_id")
+                )
+                if links != [(self.folder_id, provision.id)]:
+                    errors[f"{prefix}_obligation"] = (
+                        "Exactly the matching source provision is required."
+                    )
+                if (
+                    version.content_storage_policy != "metadata_only"
+                    or version.legal_review_status != "unreviewed"
+                ):
+                    errors[f"{prefix}_document_version"] = (
+                        "Sources remain metadata-only and unreviewed."
+                    )
+                if (
+                    version.valid_to is not None
+                    or version.transition_end is not None
+                    or version.repeal_date is not None
+                ):
+                    errors[f"{prefix}_document_version"] = (
+                        "Closed, repealed and transition versions are unsupported."
+                    )
+                if provision.text not in (None, ""):
+                    errors[f"{prefix}_provision"] = "Source text is forbidden."
+                if version.record_id != getattr(self, f"{prefix}_version_record_id"):
+                    errors[f"{prefix}_version_record_id"] = (
+                        "The stable ID must match its exact version."
+                    )
+            if predecessor.record_id == successor.record_id:
+                errors["successor_version_record_id"] = (
+                    "Replacement versions require distinct stable identities."
+                )
+            if (
+                predecessor.effective_date is None
+                or self.effective_on is None
+                or self.effective_on <= predecessor.effective_date
+            ):
+                errors["effective_on"] = (
+                    "Replacement must be strictly after a known predecessor effective date."
+                )
+            if (
+                successor.effective_date != self.effective_on
+                or successor.valid_from != self.effective_on
+                or self.successor_obligation.valid_from != self.effective_on
+            ):
+                errors["effective_on"] = (
+                    "The successor and obligation must start at the replacement date."
+                )
+            if self.successor_obligation.valid_to is not None:
+                errors["successor_obligation"] = (
+                    "The new obligation cannot have a closed interval."
+                )
+            if (
+                self.predecessor_obligation.valid_to is not None
+                or self.predecessor_obligation.valid_from != predecessor.effective_date
+            ):
+                errors["predecessor_obligation"] = (
+                    "The predecessor obligation must remain open from its effective date."
+                )
+            for field in (
+                "successor_document_version",
+                "successor_provision",
+                "successor_obligation",
+            ):
+                record = getattr(self, field)
+                if (
+                    record.revision != 1
+                    or record.previous_revision_id is not None
+                    or record.recorded_to is not None
+                    or record.recorded_from != self.occurred_at
+                ):
+                    errors[field] = (
+                        "A fresh revision 1 must begin at the server event time."
+                    )
+            if (
+                self.occurred_at is None
+                or timezone.is_naive(self.occurred_at)
+                or any(
+                    record.recorded_from is None
+                    or timezone.is_naive(record.recorded_from)
+                    for record in (
+                        predecessor,
+                        self.predecessor_provision,
+                        self.predecessor_obligation,
+                    )
+                )
+                or self.occurred_at
+                <= max(
+                    predecessor.recorded_from,
+                    self.predecessor_provision.recorded_from,
+                    self.predecessor_obligation.recorded_from,
+                )
+            ):
+                errors["occurred_at"] = (
+                    "An aware event time after the predecessor is required."
+                )
+            if not errors:
+                # Semantic digests intentionally omit revision and recorded-time
+                # metadata, so physical row/revision/epoch invariants are checked
+                # separately above. This is not privileged-SQL tamper protection.
+                from .services.corrections import regulatory_chain_semantic_sha256
+                from .services.records import RegulatoryChain
+
+                for prefix, digest_field in (
+                    ("predecessor", "before_payload_sha256"),
+                    ("successor", "after_payload_sha256"),
+                ):
+                    chain = RegulatoryChain(
+                        registration=self.registration,
+                        document=self.document,
+                        document_version=getattr(self, f"{prefix}_document_version"),
+                        provision=getattr(self, f"{prefix}_provision"),
+                        obligation=getattr(self, f"{prefix}_obligation"),
+                    )
+                    if getattr(self, digest_field) != regulatory_chain_semantic_sha256(
+                        chain
+                    ):
+                        errors[digest_field] = (
+                            "The digest must match the exact persisted chain."
+                        )
+        if errors:
+            raise ValidationError(errors)
+        super().clean()
+
+
 common_exclude = ["created_at", "updated_at"]
 auditlog.register(RegulatoryDocument, exclude_fields=common_exclude)
 auditlog.register(EntityDocumentRegistration, exclude_fields=common_exclude)
@@ -2317,3 +2655,4 @@ auditlog.register(
     exclude_fields=common_exclude,
 )
 auditlog.register(RegulatoryChainCorrectionEvent, exclude_fields=common_exclude)
+auditlog.register(RegulatoryVersionSupersessionEvent, exclude_fields=common_exclude)

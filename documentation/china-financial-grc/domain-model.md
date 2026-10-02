@@ -91,8 +91,30 @@ DocumentVersion -> Provision -> Obligation revision set.
 - correction kind fixed to `recorded_time` and publication fixed to false.
 
 The event does not mean that an authority changed, amended, repealed, or
-superseded a legal instrument. Source/legal-version supersession needs a
-separate future contract with source evidence and legal review.
+superseded a legal instrument. The synthetic whole-version edge below is
+separate; real-law lifecycle still needs source evidence and legal review.
+
+### RegulatoryVersionSupersessionEvent
+
+The bounded synthetic implementation records an immutable whole-document
+metadata relationship, not a legal approval. It binds the document and exact
+synthetic registration, six physical version/provision/obligation references,
+distinct stable legal-version IDs, explicit effective date, server recorded
+time, named human, rationale, idempotency/request digest, and recomputed
+before/after semantic digests. It remains non-binding and unpublished.
+
+The edge does not close or rewrite the old source rows. At a chosen recorded
+time it supplies a derived half-open valid-time boundary. Known future versions
+can therefore coexist with the old version. Every selection validates one
+connected linear graph and its exact source snapshots; missing or ambiguous
+state fails closed. New versions inherit no review or applicability history.
+Existing semantic digests are not source signatures or a hash of every physical
+time column; temporal row/revision/epoch invariants are also revalidated.
+
+Only metadata-only unreviewed synthetic whole replacements with resolved dates
+are enabled. Partial amendments, repeal/transition, real-law review and
+correction of edge-bound documents remain outside this contract. See
+[ADR 0005](adr/0005-synthetic-whole-version-supersession.md).
 
 ### RegulatoryApplicabilityDecision (implemented bounded persistence)
 
@@ -366,7 +388,7 @@ entity-scoped read-only GET operations. Mutation is available only through
 named-human internal services; there is no public write route. The general
 multi-rule/multi-scope models remain target design.
 Neither boundary adds control or policy mappings, `DecisionRecord` approval,
-source/legal supersession, source text, approval/publication, real institution
+real-law supersession review, source text, approval/publication, real institution
 facts, or agents.
 
 With ADR 0004 included, all 72 regulatory tests pass both with migrations
@@ -386,3 +408,9 @@ recording service, permissions, and separate read action. It adds no legal
 approval, publication, real fact, UI, public mutation, generic workflow, or
 agent claim. Its accepted contract and remaining production gates are in
 [ADR 0004](adr/0004-bounded-synthetic-applicability-review-disposition.md).
+
+The additional synthetic whole-version edge is defined by
+[ADR 0005](adr/0005-synthetic-whole-version-supersession.md). It preserves old
+source rows, derives valid-time bounds from known edges and adds a shared
+version/date/recorded-time read anchor without approving law. Its PostgreSQL,
+live-browser and production gates are separate from the older slice evidence.

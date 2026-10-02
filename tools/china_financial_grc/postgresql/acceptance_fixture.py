@@ -10,12 +10,12 @@ write path rather than through fixture SQL.
 from __future__ import annotations
 
 import argparse
-from datetime import timedelta
 import hashlib
 import json
 import os
-from pathlib import Path
 import sys
+from datetime import timedelta
+from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
@@ -31,8 +31,9 @@ from auditlog.models import LogEntry  # noqa: E402
 from django.apps import apps  # noqa: E402
 from django.core.serializers.json import DjangoJSONEncoder  # noqa: E402
 from django.db import connection  # noqa: E402
+from django.db.migrations.loader import MigrationLoader  # noqa: E402
 from django.db.migrations.recorder import MigrationRecorder  # noqa: E402
-
+from iam.models import User  # noqa: E402
 from regulatory.models import (  # noqa: E402
     RegulatoryApplicabilityDecision,
     RegulatoryApplicabilityReviewDisposition,
@@ -58,7 +59,6 @@ from regulatory.tests.factories import (  # noqa: E402
     make_user_with_permissions,
 )
 from tprm.models import Entity  # noqa: E402
-from iam.models import User  # noqa: E402
 
 
 ACCEPTANCE_DOCUMENT_ID = "TEST-CN-REG-PG-ACCEPTANCE"
@@ -67,6 +67,13 @@ ACCEPTANCE_DATABASES = {
     "ciso_regulatory_acceptance",
     "ciso_regulatory_acceptance_restored",
 }
+LEGACY_ROLLBACK_DATABASE = "ciso_regulatory_acceptance_legacy_rollback"
+LEGACY_REGULATORY_MIGRATIONS = (
+    "0001_initial",
+    "0002_regulatorychaincorrectionevent_and_more",
+    "0003_regulatoryapplicabilitydecision",
+    "0004_regulatoryapplicabilityreviewdisposition",
+)
 
 
 def _require(condition: bool, message: str) -> None:
@@ -74,13 +81,16 @@ def _require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
-def _guard_acceptance_database() -> None:
+def _guard_acceptance_database(*, legacy_0004: bool = False) -> None:
     database_name = connection.settings_dict["NAME"]
     if os.environ.get("CHINA_GRC_POSTGRES_ACCEPTANCE") != "1":
         raise SystemExit("CHINA_GRC_POSTGRES_ACCEPTANCE=1 is required")
     if connection.vendor != "postgresql":
         raise SystemExit("the acceptance fixture requires PostgreSQL")
-    if str(database_name) not in ACCEPTANCE_DATABASES:
+    allowed_databases = (
+        {LEGACY_ROLLBACK_DATABASE} if legacy_0004 else ACCEPTANCE_DATABASES
+    )
+    if str(database_name) not in allowed_databases:
         raise SystemExit(
             "refusing to operate on a database outside the acceptance namespace"
         )
@@ -430,6 +440,71 @@ def _fingerprint() -> dict:
     }
 
 
+def _legacy_0004_fingerprint() -> dict:
+    """Inspect only the actual historical schema, never current read services."""
+
+    _require(
+        str(connection.settings_dict["NAME"]) == LEGACY_ROLLBACK_DATABASE,
+        "legacy inspection is restricted to the legacy rollback acceptance database",
+    )
+    applied = list(
+        MigrationRecorder.Migration.objects.filter(app="regulatory")
+        .order_by("name")
+        .values_list("app", "name")
+    )
+    _require(
+        applied == [("regulatory", name) for name in LEGACY_REGULATORY_MIGRATIONS],
+        "legacy rollback database must have exactly regulatory migrations 0001-0004",
+    )
+    historical_apps = (
+        MigrationLoader(connection)
+        .project_state([("regulatory", LEGACY_REGULATORY_MIGRATIONS[-1])])
+        .apps
+    )
+    models = sorted(
+        historical_apps.get_app_config("regulatory").get_models(),
+        key=lambda item: item._meta.label,
+    )
+    expected_tables = {model._meta.db_table for model in models}
+    actual_tables = {
+        table
+        for table in connection.introspection.table_names()
+        if table.startswith("regulatory_")
+    }
+    _require(
+        actual_tables == expected_tables,
+        "legacy regulatory tables do not exactly match the historical 0004 schema",
+    )
+    state = {}
+    counts = {}
+    for model in models:
+        rows = _jsonable(list(model.objects.order_by("pk").values()))
+        state[model._meta.label_lower] = rows
+        counts[model._meta.label_lower] = len(rows)
+    _require(
+        counts.get("regulatory.regulatoryapplicabilityreviewdisposition", 0) > 0,
+        "legacy rollback probe requires populated applicability review history",
+    )
+    audit_rows = list(
+        LogEntry.objects.filter(content_type__app_label="regulatory")
+        .order_by("pk")
+        .values()
+    )
+    state["auditlog.regulatory_entries"] = _jsonable(audit_rows)
+    counts["auditlog.regulatory_entries"] = len(audit_rows)
+    state["database.contract"] = _jsonable(_database_contract_state())
+    return {
+        "contract": "china-financial-grc/postgresql-legacy-0004-rollback/v1",
+        "synthetic_only": True,
+        "regulatory_migration_leaf": LEGACY_REGULATORY_MIGRATIONS[-1],
+        "state_sha256": _canonical_sha256(state),
+        "state_component_sha256": {
+            key: _canonical_sha256(value) for key, value in sorted(state.items())
+        },
+        "counts": counts,
+    }
+
+
 def _exercise_restored_runtime() -> dict:
     database_name = str(connection.settings_dict["NAME"])
     _require(
@@ -482,13 +557,18 @@ def _exercise_restored_runtime() -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("seed", "verify", "mutate-restored"))
+    parser.add_argument(
+        "command",
+        choices=("seed", "verify", "verify-legacy-0004", "mutate-restored"),
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    _guard_acceptance_database()
+    _guard_acceptance_database(legacy_0004=args.command == "verify-legacy-0004")
     if args.command == "seed":
         _seed()
-    if args.command == "mutate-restored":
+    if args.command == "verify-legacy-0004":
+        result = _legacy_0004_fingerprint()
+    elif args.command == "mutate-restored":
         result = _exercise_restored_runtime()
     else:
         result = _fingerprint()

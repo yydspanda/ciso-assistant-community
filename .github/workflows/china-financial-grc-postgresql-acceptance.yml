@@ -10,6 +10,7 @@ on:
     paths:
       - "backend/**"
       - "tools/china_financial_grc/postgresql/**"
+      - "tools/china_financial_grc/tests/test_postgresql_acceptance_harness.py"
       - ".github/workflows/china-financial-grc-postgresql-acceptance.yml"
   workflow_dispatch:
 
@@ -34,6 +35,9 @@ jobs:
           python-version: "3.14"
           enable-cache: true
 
+      - name: Test PostgreSQL harness safety contracts
+        run: python -m unittest tools.china_financial_grc.tests.test_postgresql_acceptance_harness
+
       - name: Install locked backend dependencies
         working-directory: backend
         run: uv sync --locked
@@ -51,5 +55,6 @@ jobs:
           path: |
             ${{ runner.temp }}/ciso-china-grc-postgresql-*/*
             !${{ runner.temp }}/ciso-china-grc-postgresql-*/*.dump
+            !${{ runner.temp }}/ciso-china-grc-postgresql-*/*.pem
             !${{ runner.temp }}/ciso-china-grc-postgresql-*/SHA256SUMS
           retention-days: 14

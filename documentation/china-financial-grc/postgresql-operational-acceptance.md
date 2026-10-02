@@ -51,13 +51,15 @@ available, run:
 The harness uses an acceptance-only Compose project, a localhost-bound
 PostgreSQL 16 container with temporary storage, random per-run credentials, and
 fixture writes restricted to the exact source and restored acceptance database
-names. It always removes the container and network on exit. The default evidence
+names. A separate exact-name legacy rollback database permits historical-state
+inspection only. It always removes the container and network on exit. The default evidence
 parent is `/tmp`; override only with
 `CHINA_GRC_ACCEPTANCE_EVIDENCE_PARENT` pointing to an approved, existing,
 non-symlink local parent outside the repository and not equal to the user-home
 root. The harness always creates a new private child with `mktemp` and never
-reuses an existing evidence directory. Never commit or upload the generated
-database dump.
+reuses an existing evidence directory. Django signing-key output is pinned to
+that private directory before any Django subprocess; no runtime signing key is
+used. Never commit or upload the generated database dump or PEM signing key.
 
 One verified local run on 2026-08-26 produced these bounded facts:
 
@@ -88,9 +90,25 @@ One verified local run on 2026-08-26 produced these bounded facts:
 The manifest records the base commit, dirty state, tested backend/harness source
 tree digest, PostgreSQL server version and image ID, and unresolved external
 gates. `SHA256SUMS` uses portable relative paths and covers the private dump;
-`SHAREABLE_SHA256SUMS` excludes the dump. The GitHub workflow executes this
-complete harness for backend or harness changes and uploads only the synthetic
-shareable evidence. A local pass does not assert that the hosted CI job ran.
+`SHAREABLE_SHA256SUMS` excludes dumps and PEM keys. The GitHub workflow is
+configured to execute the complete harness for backend/harness/safety-test
+changes and upload only the synthetic shareable evidence, excluding both secret
+file types and the complete private hash index. A local pass does not assert
+that the hosted CI job ran.
+
+With migration 0005 present, the legacy populated-review reverse probe is
+isolated in a new source clone. Only that clone reverses empty 0005 to 0004,
+then attempts the actual 0004-to-0003 CLI operation. Acceptance requires the
+precise review-history guard, exactly four historical migrations/tables and
+unchanged historical regulatory/audit/database fingerprints. The original
+full-graph source must still match both its seed and pre-probe fingerprints.
+No current-model query skips a missing legacy table, and no outer transaction
+changes the native migration semantics. Thirteen deterministic safety tests
+and shell syntax checks pass; this revised operational path still requires a
+live exact-candidate PostgreSQL run. It does not yet seed/test populated 0005
+operational reverse, new-table constraint/privilege probes or restored
+supersession append. Prior successful review/correction restore evidence does
+not cover those gates.
 
 The runtime grant file is a bounded reference profile, not a complete
 least-privilege policy for every upstream CISO Assistant table. It deliberately
@@ -146,8 +164,9 @@ digests and outcomes in the public progress ledger after the material slice is
 verified. The dossier contains:
 
 - application commit and image or package digest;
-- full Django migration plan and current `regulatory` migration leaf (currently
-  `0004`, but the run must record the actual leaf rather than assume it);
+- full Django migration plan and current `regulatory` migration leaf (the
+  synthetic extension includes `0005`; record the actual leaf rather than
+  assume it from this document or the old 0004 probe);
 - PostgreSQL product, major/minor version, deployment topology, relevant
   transaction/locking settings, and configuration digest;
 - synthetic dataset generator version, size profile, and data classification;

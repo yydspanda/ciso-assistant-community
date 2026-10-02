@@ -133,12 +133,41 @@ SQLite tests were not used as that evidence. Representative production-volume
 plans, target topology, recovery, retention, and named operational approval
 remain external production gates.
 
-This verified as-built subset does not own source bytes or legal supersession,
+This verified as-built subset does not own source bytes or real-law lifecycle,
 binding decisions, approval/publication, real institution facts, library
 projections, UI writes, a binding reviewer action workflow, or agent execution.
 Those remain target components gated by the delivery roadmap. The exact
 correction decision is in
 [ADR 0002](adr/0002-recorded-time-correction.md).
+
+### Bounded synthetic whole-version replacement
+
+Additive migration `regulatory.0005` and the internal
+`supersede_regulatory_version` service append a distinct synthetic legal-version
+identity and an immutable whole-document metadata edge. The old source chain
+keeps its recorded and valid intervals unchanged. A known replacement supplies
+a derived exclusive valid-time end, separate from recorded-time correction.
+Both sources remain metadata-only, legally unreviewed and unpublished; the
+edge is explicitly non-binding. A dedicated folder-scoped permission requires
+an active named human and is not automatically granted to existing roles.
+
+Detail, applicability and disposition GETs retain exactly one coherent chain
+and accept the same `valid_on`, portable `version_id` and `recorded_as_of`
+selectors. Each returns a typed `selection` anchor. The frontend pins its two
+dependent reads to the detail's exact version, legal date and recorded instant,
+and rejects missing/mismatched anchors for supersession responses. Existing
+single-version draft reads remain compatible. Dates select proposed metadata,
+not legal applicability or a present violation.
+
+The graph must be connected, linear and date-increasing; each read revalidates
+the exact source relations and semantic digests. New recorded-time corrections
+of edge-bound documents require a future rebind contract and are refused;
+old correction history is preserved. Applicability and review do not carry
+over to new obligations. New decision intervals cannot cross a known outgoing
+replacement boundary. Source text, partial amendments, repeal, transitions,
+binding decisions, publication and reviewer writes are not introduced.
+See [ADR 0005](adr/0005-synthetic-whole-version-supersession.md) for authority,
+compatibility, migration/rollback and the explicit external acceptance gates.
 
 ## Implemented bounded Phase 1 applicability boundary
 

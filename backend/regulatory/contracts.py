@@ -173,6 +173,20 @@ class RegulatoryChainCorrectionPayload(TypedDict):
     obligation: RegulatoryObligationCorrectionPayload
 
 
+class RegulatoryVersionSupersessionPayload(TypedDict):
+    """One synthetic whole-version replacement, not a recorded-time correction.
+
+    The sole ``supersedes_version_ids`` value identifies the current predecessor.
+    Successor stable IDs must be new; physical IDs, revision and recorded times
+    remain server-owned. The complete metadata types do not confer approval.
+    """
+
+    expected_revisions: RegulatoryRevisionExpectations
+    document_version: RegulatoryDocumentVersionCorrectionPayload
+    provision: RegulatoryProvisionCorrectionPayload
+    obligation: RegulatoryObligationCorrectionPayload
+
+
 class RegulatoryProvenancePayload(TypedDict):
     method: Literal["human", "parser", "model_proposal", "import"]
     created_at: str

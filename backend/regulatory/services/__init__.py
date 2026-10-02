@@ -21,6 +21,7 @@ from .corrections import (
 )
 from .records import RegulatoryChain, create_regulatory_chain, get_regulatory_chain
 from .review import transition_obligation_review
+from .supersession import RegulatorySupersessionResult, supersede_regulatory_version
 
 __all__ = [
     "RegulatoryApplicabilityResult",
@@ -31,6 +32,7 @@ __all__ = [
     "RegulatoryChain",
     "RegulatoryCorrectionResult",
     "RegulatoryReviewerReference",
+    "RegulatorySupersessionResult",
     "correct_regulatory_chain",
     "create_regulatory_chain",
     "get_regulatory_applicability",
@@ -38,8 +40,9 @@ __all__ = [
     "get_regulatory_chain",
     "record_regulatory_applicability_decision",
     "record_regulatory_applicability_review_disposition",
-    "regulatory_applicability_semantic_sha256",
     "regulatory_applicability_review_event_sha256",
+    "regulatory_applicability_semantic_sha256",
     "regulatory_chain_semantic_sha256",
+    "supersede_regulatory_version",
     "transition_obligation_review",
 ]

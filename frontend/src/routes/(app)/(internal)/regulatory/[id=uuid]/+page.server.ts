@@ -25,7 +25,9 @@ import {
 	parseRegulatoryApplicability,
 	parseRegulatoryApplicabilityReview,
 	parseRegulatoryDocumentDetail,
-	parseRegulatoryEntityPage
+	parseRegulatoryEntityPage,
+	regulatoryValidOnSchema,
+	regulatoryVersionIdSchema
 } from '$lib/regulatory/contracts';
 
 const idlePanel = <T>(): RegulatoryReadPanel<T> => ({ state: 'idle', data: null });
@@ -34,9 +36,17 @@ const emptyPanel = <T = never>(state: RegulatoryReadState): RegulatoryReadPanel<
 	data: null
 });
 
+function addVersionSelection(query: URLSearchParams, versionId: string, validOn: string | null) {
+	if (versionId) query.set('version_id', versionId);
+	if (validOn) query.set('valid_on', validOn);
+	return query;
+}
+
 export const load: PageServerLoad = async ({ fetch, params, url, locals }) => {
 	const entityValues = url.searchParams.getAll('entity');
 	const recordedValues = url.searchParams.getAll('recorded_as_of');
+	const validValues = url.searchParams.getAll('valid_on');
+	const versionValues = url.searchParams.getAll('version_id');
 	const mode = url.searchParams.get('mode') ?? 'apply';
 	const rawRequestedEntity = entityValues.length === 1 ? entityValues[0].trim() : '';
 	const requestedEntity = isUuid(rawRequestedEntity) ? rawRequestedEntity.toLowerCase() : '';
@@ -46,11 +56,17 @@ export const load: PageServerLoad = async ({ fetch, params, url, locals }) => {
 	const recordedAsOfIsValid =
 		rawRecordedAsOf === '' || (rawRecordedAsOf.length <= 80 && isAwareRfc3339(rawRecordedAsOf));
 	const recordedAsOf = recordedAsOfIsValid ? rawRecordedAsOf : '';
+	const validOn = validValues.length === 1 ? validValues[0] : '';
+	const versionId = versionValues.length === 1 ? versionValues[0] : '';
 	const selectionIsInvalid =
 		entityValues.length > 1 ||
 		(rawRequestedEntity !== '' && requestedEntity === '') ||
 		recordedValues.length > 1 ||
-		!recordedAsOfIsValid;
+		!recordedAsOfIsValid ||
+		validValues.length > 1 ||
+		(validValues.length === 1 && !regulatoryValidOnSchema.safeParse(validOn).success) ||
+		versionValues.length > 1 ||
+		(versionValues.length === 1 && !regulatoryVersionIdSchema.safeParse(versionId).success);
 
 	let document: RegulatoryDocumentDetail | null = null;
 	let documentState: RegulatoryReadState = selectionIsInvalid ? 'invalid' : 'ok';
@@ -67,11 +83,11 @@ export const load: PageServerLoad = async ({ fetch, params, url, locals }) => {
 	const canSelectApplicability = canViewEntities && canViewApplicability;
 	if (!canSelectApplicability) entityState = 'restricted';
 
-	const detailQuery = buildRegulatorySelectionQuery({
-		entity: '',
-		recordedAsOf,
-		includeEntity: false
-	});
+	const detailQuery = addVersionSelection(
+		buildRegulatorySelectionQuery({ entity: '', recordedAsOf, includeEntity: false }),
+		versionId,
+		validOn
+	);
 	const detailUrl = `${BASE_API_URL}/regulatory/v1/documents/${params.id}/${
 		detailQuery.size ? `?${detailQuery}` : ''
 	}`;
@@ -89,7 +105,9 @@ export const load: PageServerLoad = async ({ fetch, params, url, locals }) => {
 				if (
 					isRegulatoryDocumentResponseCoherent(candidate, {
 						documentId: params.id,
-						recordedAsOf
+						recordedAsOf,
+						validOn,
+						versionId
 					})
 				) {
 					document = candidate;
@@ -146,23 +164,34 @@ export const load: PageServerLoad = async ({ fetch, params, url, locals }) => {
 				applicability = emptyPanel(state);
 				review = emptyPanel(state);
 			} else {
-				const selectionQuery = buildRegulatorySelectionQuery({
-					entity: selectedEntity,
-					recordedAsOf
-				});
+				const pinnedVersionId = document.selection?.version_id ?? versionId;
+				const pinnedValidOn = document.selection ? document.selection.valid_on : validOn;
+				const selectionQuery = addVersionSelection(
+					buildRegulatorySelectionQuery({
+						entity: selectedEntity,
+						recordedAsOf: document.selection?.recorded_at ?? recordedAsOf
+					}),
+					pinnedVersionId,
+					pinnedValidOn
+				);
 				const applicabilityResponse = await fetchRegulatoryReadPanel<RegulatoryApplicability>(
 					fetch,
 					`${BASE_API_URL}/regulatory/v1/documents/${params.id}/applicability/?${selectionQuery}`,
 					parseRegulatoryApplicability
 				);
 				const currentSelectionAnchor =
-					recordedAsOf === '' && applicabilityResponse.state === 'ok'
+					document.selection?.recorded_at ??
+					(recordedAsOf === '' && applicabilityResponse.state === 'ok'
 						? applicabilityResponse.data?.selected_recorded_at
-						: undefined;
-				const reviewQuery = buildRegulatorySelectionQuery({
-					entity: selectedEntity,
-					recordedAsOf: currentSelectionAnchor ?? recordedAsOf
-				});
+						: undefined);
+				const reviewQuery = addVersionSelection(
+					buildRegulatorySelectionQuery({
+						entity: selectedEntity,
+						recordedAsOf: currentSelectionAnchor ?? recordedAsOf
+					}),
+					pinnedVersionId,
+					pinnedValidOn
+				);
 				const reviewResponse = await fetchRegulatoryReadPanel<RegulatoryApplicabilityReview>(
 					fetch,
 					`${BASE_API_URL}/regulatory/v1/documents/${params.id}/applicability-review/?${reviewQuery}`,
@@ -174,6 +203,8 @@ export const load: PageServerLoad = async ({ fetch, params, url, locals }) => {
 						documentId: params.id,
 						entityId: selectedEntity,
 						recordedAsOf,
+						validOn,
+						versionId,
 						currentSelectionAnchor
 					},
 					applicability: applicabilityResponse,
@@ -200,6 +231,8 @@ export const load: PageServerLoad = async ({ fetch, params, url, locals }) => {
 		selectedEntity,
 		entitySearch,
 		recordedAsOf,
+		validOn,
+		versionId,
 		currentViewHref: buildRegulatoryCurrentViewHref({
 			entity: selectedEntity,
 			entitySearch

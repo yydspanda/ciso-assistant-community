@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timezone as datetime_timezone
 from decimal import Decimal
 
 from django.core.exceptions import (
@@ -28,6 +28,7 @@ from regulatory.models import (
     RegulatoryObligationProvision,
     RegulatoryObligationReviewEvent,
     RegulatoryProvision,
+    RegulatoryVersionSupersessionEvent,
 )
 
 from .common import (
@@ -46,6 +47,7 @@ class RegulatoryChain:
     provision: RegulatoryProvision
     obligation: RegulatoryObligation
     recorded_as_of: datetime | None = None
+    valid_on: date | None = None
 
 
 class RegulatoryRecordedStateUnavailable(ValidationError):
@@ -412,6 +414,10 @@ def regulatory_document_recorded_floor(
             decision__obligation__folder=folder,
         ).aggregate(value=Max("occurred_at"))["value"]
     )
+    supersession_floor = RegulatoryVersionSupersessionEvent.objects.filter(
+        document=document,
+        folder=folder,
+    ).aggregate(value=Max("occurred_at"))["value"]
     return max(
         (
             value
@@ -420,6 +426,7 @@ def regulatory_document_recorded_floor(
                 review_floor,
                 applicability_floor,
                 applicability_review_floor,
+                supersession_floor,
             )
             if value is not None
         ),
@@ -431,6 +438,7 @@ def lock_current_regulatory_chain(
     *,
     registration: EntityDocumentRegistration,
     folder: Folder,
+    version_record_id: str | None = None,
 ) -> RegulatoryChain:
     """Lock one current physical chain after its registration and folder are locked."""
 
@@ -438,10 +446,17 @@ def lock_current_regulatory_chain(
         pk=registration.document_id,
         folder=folder,
     )
-    version = RegulatoryDocumentVersion.objects.select_for_update().get(
+    floor = regulatory_document_recorded_floor(document=document, folder=folder)
+    selected_at = max(timezone.now(), floor) if floor is not None else timezone.now()
+    selected = select_regulatory_chain_at(
         document=document,
         folder=folder,
-        recorded_to__isnull=True,
+        registration=registration,
+        recorded_as_of=selected_at,
+        version_record_id=version_record_id,
+    )
+    version = RegulatoryDocumentVersion.objects.select_for_update().get(
+        pk=selected.document_version.pk, folder=folder, recorded_to__isnull=True
     )
     provision = RegulatoryProvision.objects.select_for_update().get(
         document_version=version,
@@ -465,7 +480,189 @@ def lock_current_regulatory_chain(
         document_version=version,
         provision=provision,
         obligation=obligation,
+        recorded_as_of=selected_at,
+        valid_on=selected.valid_on,
     )
+
+
+def _select_version_at(
+    *,
+    document: RegulatoryDocument,
+    folder: Folder,
+    recorded_as_of: datetime,
+    version_record_id: str | None,
+    valid_on: date | None,
+) -> tuple[RegulatoryDocumentVersion, date | None]:
+    """Resolve a known synthetic replacement graph, never infer legal approval."""
+
+    from .corrections import regulatory_chain_semantic_sha256
+
+    versions = list(
+        RegulatoryDocumentVersion.objects.filter(
+            document=document, folder=folder
+        ).filter(_recorded_interval_query("", recorded_as_of))
+    )
+    by_id = {version.record_id: version for version in versions}
+    if not versions or len(by_id) != len(versions):
+        raise RegulatoryRecordedStateUnavailable(
+            "No complete unique regulatory chain exists at this recorded time."
+        )
+    events = list(
+        RegulatoryVersionSupersessionEvent.objects.filter(
+            document=document, occurred_at__lte=recorded_as_of
+        ).select_related(
+            "registration",
+            "predecessor_document_version",
+            "predecessor_provision",
+            "predecessor_obligation",
+            "successor_document_version",
+            "successor_provision",
+            "successor_obligation",
+        )
+    )
+    outgoing = {}
+    incoming = {}
+    for event in events:
+        try:
+            event.full_clean()
+        except ValidationError as exc:
+            raise RegulatoryRecordedStateUnavailable(
+                "Invalid supersession source binding."
+            ) from exc
+        predecessor = event.predecessor_document_version
+        successor = event.successor_document_version
+        if (
+            event.folder_id != folder.id
+            or event.registration.folder_id != folder.id
+            or event.registration.document_id != document.pk
+            or event.is_binding
+            or event.is_published
+            or event.replacement_kind != "whole_document"
+            or predecessor.record_id not in by_id
+            or successor.record_id not in by_id
+            or by_id[predecessor.record_id].pk != predecessor.pk
+            or by_id[successor.record_id].pk != successor.pk
+            or predecessor.record_id in outgoing
+            or successor.record_id in incoming
+            or predecessor.effective_date is None
+            or event.effective_on <= predecessor.effective_date
+            or event.effective_on != successor.effective_date
+            or successor.recorded_from != event.occurred_at
+            or predecessor.recorded_from >= event.occurred_at
+        ):
+            raise RegulatoryRecordedStateUnavailable("Invalid supersession graph.")
+        for prefix, version, digest in (
+            ("predecessor", predecessor, event.before_payload_sha256),
+            ("successor", successor, event.after_payload_sha256),
+        ):
+            provision = getattr(event, f"{prefix}_provision")
+            obligation = getattr(event, f"{prefix}_obligation")
+            if (
+                version.document_id != document.pk
+                or version.folder_id != folder.id
+                or provision.folder_id != folder.id
+                or obligation.folder_id != folder.id
+                or provision.document_version_id != version.pk
+                or version.valid_from != version.effective_date
+                or obligation.valid_from != version.valid_from
+                or version.valid_to is not None
+                or version.transition_end is not None
+                or version.repeal_date is not None
+                or version.content_storage_policy != "metadata_only"
+                or version.legal_review_status != "unreviewed"
+                or version.is_published
+                or obligation.is_published
+                or provision.is_published
+                or not RegulatoryObligationProvision.objects.filter(
+                    folder=folder, provision=provision, obligation=obligation
+                ).exists()
+                or regulatory_chain_semantic_sha256(
+                    RegulatoryChain(
+                        registration=event.registration,
+                        document=document,
+                        document_version=version,
+                        provision=provision,
+                        obligation=obligation,
+                    )
+                )
+                != digest
+            ):
+                raise RegulatoryRecordedStateUnavailable(
+                    "The supersession source snapshot changed or is inconsistent."
+                )
+        outgoing[predecessor.record_id] = event
+        incoming[successor.record_id] = event
+
+    if events or len(versions) > 1:
+        roots = set(by_id) - set(incoming)
+        if len(roots) != 1 or len(events) != len(versions) - 1:
+            raise RegulatoryRecordedStateUnavailable("Disconnected supersession graph.")
+        visited = set()
+        current_id = roots.pop()
+        while current_id not in visited:
+            visited.add(current_id)
+            edge = outgoing.get(current_id)
+            if edge is None:
+                break
+            current_id = edge.successor_document_version.record_id
+        if visited != set(by_id):
+            raise RegulatoryRecordedStateUnavailable("Cyclic supersession graph.")
+        if valid_on is None and version_record_id is None:
+            valid_on = recorded_as_of.astimezone(datetime_timezone.utc).date()
+
+    candidates = versions
+    if version_record_id is not None:
+        candidates = [
+            version for version in candidates if version.record_id == version_record_id
+        ]
+    if valid_on is not None:
+        candidates = [
+            version
+            for version in candidates
+            if version.valid_from is not None
+            and version.valid_from <= valid_on
+            and (
+                (
+                    outgoing[version.record_id].effective_on
+                    if version.record_id in outgoing
+                    else version.valid_to
+                )
+                is None
+                or valid_on
+                < (
+                    outgoing[version.record_id].effective_on
+                    if version.record_id in outgoing
+                    else version.valid_to
+                )
+            )
+        ]
+    if len(candidates) != 1:
+        raise RegulatoryRecordedStateUnavailable(
+            "No unique version matches the selection."
+        )
+    selected = candidates[0]
+    selected.selected_supersedes_version_ids = (
+        [incoming[selected.record_id].predecessor_document_version.record_id]
+        if selected.record_id in incoming
+        else []
+    )
+    selected.selected_valid_to = (
+        outgoing[selected.record_id].effective_on
+        if selected.record_id in outgoing
+        else selected.valid_to
+    )
+    return selected, valid_on
+
+
+def regulatory_selection_payload(chain: RegulatoryChain) -> dict:
+    """One cross-response anchor; raw source metadata remains unchanged."""
+
+    return {
+        "version_id": chain.document_version.record_id,
+        "version_revision": chain.document_version.revision,
+        "valid_on": chain.valid_on.isoformat() if chain.valid_on is not None else None,
+        "recorded_at": chain.recorded_as_of.isoformat(),
+    }
 
 
 def select_regulatory_chain_at(
@@ -474,6 +671,8 @@ def select_regulatory_chain_at(
     folder: Folder,
     recorded_as_of: datetime,
     registration: EntityDocumentRegistration | None = None,
+    version_record_id: str | None = None,
+    valid_on: date | None = None,
 ) -> RegulatoryChain:
     """Select one coherent revision set while the caller holds the folder lock."""
 
@@ -481,12 +680,23 @@ def select_regulatory_chain_at(
         raise ValidationError(
             {"recorded_as_of": "A timezone-aware datetime is required."}
         )
+    if valid_on is not None and (
+        not isinstance(valid_on, date) or isinstance(valid_on, datetime)
+    ):
+        raise ValidationError({"valid_on": "A calendar date is required."})
     if document.folder_id != folder.id:
         raise ValidationError("The regulatory document folder is inconsistent.")
     if registration is not None and (
         registration.folder_id != folder.id or registration.document_id != document.id
     ):
         raise ValidationError("The regulatory registration is inconsistent.")
+    selected_version, valid_on = _select_version_at(
+        document=document,
+        folder=folder,
+        recorded_as_of=recorded_as_of,
+        version_record_id=version_record_id,
+        valid_on=valid_on,
+    )
     try:
         link = (
             RegulatoryObligationProvision.objects.select_related(
@@ -499,6 +709,7 @@ def select_regulatory_chain_at(
                 provision__folder=folder,
                 provision__document_version__folder=folder,
                 provision__document_version__document=document,
+                provision__document_version=selected_version,
             )
             .filter(
                 _recorded_interval_query(
@@ -525,6 +736,7 @@ def select_regulatory_chain_at(
         RegulatoryDocumentVersion.objects.filter(
             folder=folder,
             document=document,
+            record_id=version.record_id,
         )
         .filter(_recorded_interval_query("", recorded_as_of))
         .values_list("pk", flat=True)[:2]
@@ -534,6 +746,7 @@ def select_regulatory_chain_at(
             folder=folder,
             document_version__folder=folder,
             document_version__document=document,
+            document_version=version,
         )
         .filter(
             _recorded_interval_query("document_version__", recorded_as_of),
@@ -553,6 +766,10 @@ def select_regulatory_chain_at(
         active_versions != [version.pk]
         or active_provisions != [provision.pk]
         or active_obligations != [obligation.pk]
+        or not (
+            version.recorded_from == provision.recorded_from == obligation.recorded_from
+        )
+        or not (version.recorded_to == provision.recorded_to == obligation.recorded_to)
     ):
         raise RegulatoryRecordedStateUnavailable(
             {
@@ -570,6 +787,10 @@ def select_regulatory_chain_at(
     obligation.selected_source_provisions = [provision]
     provision.selected_obligations = [obligation]
     version.selected_provisions = [provision]
+    version.selected_supersedes_version_ids = (
+        selected_version.selected_supersedes_version_ids
+    )
+    version.selected_valid_to = selected_version.selected_valid_to
     document.selected_versions = [version]
     return RegulatoryChain(
         registration=registration,
@@ -578,6 +799,7 @@ def select_regulatory_chain_at(
         provision=provision,
         obligation=obligation,
         recorded_as_of=recorded_as_of,
+        valid_on=valid_on,
     )
 
 
@@ -588,6 +810,8 @@ def get_regulatory_chain(
     entity: Entity,
     document_id,
     recorded_as_of: datetime | None = None,
+    version_record_id: str | None = None,
+    valid_on: date | None = None,
 ) -> RegulatoryChain:
     """Retrieve one coherent recorded-time chain within entity folder IAM."""
 
@@ -631,4 +855,6 @@ def get_regulatory_chain(
         folder=folder,
         registration=registration,
         recorded_as_of=recorded_as_of or request_time,
+        version_record_id=version_record_id,
+        valid_on=valid_on,
     )
