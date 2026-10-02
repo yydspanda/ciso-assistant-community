@@ -153,9 +153,9 @@ The separate PostgreSQL upgrade graph lost its connection, reference grants
 failed with a Docker-client SIGBUS, and new-table privilege/backup/restore gates
 were not completed. A delayed all-file freeze fails on a generated ignored
 runtime signing key while pre-existing code/dependencies remain unchanged.
-Repeat that interrupted chain in new owned resources with key output outside
-source; preserve the failures. Legacy-0004 operational probing must also be
-isolated from the current 0005 source schema before hosted submission.
+That interruption required a separate run in new owned resources with key output
+outside source and legacy-0004 probing isolated from the current 0005 schema.
+The subsequent trials below retain these original failures.
 
 The exact 5c04 hosted follow-up passes 168 PostgreSQL cases and the isolated
 legacy/restore adapter, but its operational supersession table is empty. A new
@@ -182,8 +182,13 @@ before/after; prior failures remain failures. This is bounded synthetic logical
 recovery, not physical-schema identity, universal MFA/IAM, WORM or PITR approval.
 See [CFGRC-REC-20261003-03](../../../.notes/china_financial_grc/progress-archive/2026-10.md#cfgrc-rec-20261003-03).
 
-The changed CI/ledger candidate still requires its own hosted checks. Legal
-review, real source rights and named production/operations acceptance remain open.
+Exact candidate `0ac288eed` subsequently passes all 17 hosted workflows,
+216 successful checks plus one tag-only skip, including 168 PostgreSQL cases.
+Normal protected PR #4 merge `9a7c5b7b4` preserves the candidate tree and
+canonical upstream history. This closes the fork-reconciliation technical
+delivery only; legal review, real source rights and named production/operations
+acceptance remain open. See
+[CFGRC-REC-20261003-04](../../../.notes/china_financial_grc/progress-archive/2026-10.md#cfgrc-rec-20261003-04).
 
 This slice does not claim WORM protection against privileged SQL or cryptographic
 authentication of source bytes; semantic SHA-256 is not a source signature.
